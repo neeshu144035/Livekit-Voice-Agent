@@ -1088,59 +1088,39 @@ export default function AgentDetailPage() {
                                                             {Object.entries(allBuiltinFunctions).map(([funcId, config]: [string, any]) => {
                                                                 const func = builtinFunctions.find(f => f.id === funcId);
                                                                 if (!func || !config?.enabled) return null;
-                                                                const speechMode = config?.speak_during_execution ? 'During execution' : 'After execution';
-                                                                const transferPhone = config?.config?.phone_number;
                                                                 return (
-                                                                    <div key={funcId} className="rounded-xl border border-gray-200 bg-white p-3 shadow-sm">
-                                                                        <div className="flex items-start justify-between gap-3">
-                                                                            <div className="flex items-center gap-3">
-                                                                                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-600 text-xs font-semibold text-white shadow-sm">
-                                                                                    BI
-                                                                                </div>
-                                                                                <div className="min-w-0">
-                                                                                    <p className="text-sm font-medium text-gray-900">
-                                                                                        {formatBuiltinFunctionName(func.name)}
-                                                                                    </p>
-                                                                                    <p className="mt-0.5 text-xs text-gray-500">
-                                                                                        {func.description || 'Built-in runtime tool'}
-                                                                                    </p>
-                                                                                </div>
+                                                                    <div key={funcId} className="flex items-center justify-between bg-gray-50 rounded-lg p-3">
+                                                                        <div className="flex items-center gap-3">
+                                                                            <div className="flex h-5 w-5 items-center justify-center rounded bg-blue-600 text-[9px] font-semibold text-white">
+                                                                                BI
                                                                             </div>
-                                                                            <div className="flex items-center gap-2">
-                                                                                <button
-                                                                                    onClick={() => openBuiltinConfigModal(funcId)}
-                                                                                    className="p-1.5 text-gray-400 hover:text-blue-600 transition-colors"
-                                                                                >
-                                                                                    <Edit3 className="w-4 h-4" />
-                                                                                </button>
-                                                                                <button
-                                                                                    onClick={() => {
-                                                                                        setAllBuiltinFunctions((prev: BuiltinFunctionsState) => {
-                                                                                            const next: BuiltinFunctionsState = {
-                                                                                                ...prev,
-                                                                                                [funcId]: { ...prev[funcId], enabled: false },
-                                                                                            };
-                                                                                            void handleSaveBuiltinFunctions(next, true);
-                                                                                            return next;
-                                                                                        });
-                                                                                        setBuiltinSaved(false);
-                                                                                    }}
-                                                                                    className="p-1.5 text-gray-400 hover:text-red-600 transition-colors"
-                                                                                >
-                                                                                    <Trash2 className="w-4 h-4" />
-                                                                                </button>
-                                                                            </div>
-                                                                        </div>
-
-                                                                        <div className="mt-3 flex flex-wrap gap-2">
-                                                                            <span className="inline-flex items-center rounded-full bg-blue-50 px-2.5 py-1 text-[11px] font-medium text-blue-700">
-                                                                                Speech: {speechMode}
+                                                                            <span className="text-sm font-medium text-gray-900">
+                                                                                {formatBuiltinFunctionName(func.name)}
                                                                             </span>
-                                                                            {(func.name === 'call_transfer' || func.name === 'transfer_call') && (
-                                                                                <span className="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-1 text-[11px] font-medium text-gray-700">
-                                                                                    Transfer: {transferPhone || 'Not set'}
-                                                                                </span>
-                                                                            )}
+                                                                        </div>
+                                                                        <div className="flex items-center gap-2">
+                                                                            <button
+                                                                                onClick={() => openBuiltinConfigModal(funcId)}
+                                                                                className="p-1.5 text-gray-400 hover:text-blue-600 transition-colors"
+                                                                            >
+                                                                                <Edit3 className="w-4 h-4" />
+                                                                            </button>
+                                                                            <button
+                                                                                onClick={() => {
+                                                                                    setAllBuiltinFunctions((prev: BuiltinFunctionsState) => {
+                                                                                        const next: BuiltinFunctionsState = {
+                                                                                            ...prev,
+                                                                                            [funcId]: { ...prev[funcId], enabled: false },
+                                                                                        };
+                                                                                        void handleSaveBuiltinFunctions(next, true);
+                                                                                        return next;
+                                                                                    });
+                                                                                    setBuiltinSaved(false);
+                                                                                }}
+                                                                                className="p-1.5 text-gray-400 hover:text-red-600 transition-colors"
+                                                                            >
+                                                                                <Trash2 className="w-4 h-4" />
+                                                                            </button>
                                                                         </div>
                                                                     </div>
                                                                 );
