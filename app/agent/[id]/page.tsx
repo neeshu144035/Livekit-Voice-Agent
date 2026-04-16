@@ -66,6 +66,14 @@ interface Function {
     updated_at: string;
 }
 
+interface BuiltinFunctionDefinition {
+    id: string;
+    name: string;
+    description?: string | null;
+    speak_during_execution?: boolean;
+    speak_after_execution?: boolean;
+}
+
 type BuiltinFunctionState = {
     enabled: boolean;
     config?: Record<string, any>;
@@ -216,13 +224,16 @@ export default function AgentDetailPage() {
     const [showVoiceCall, setShowVoiceCall] = useState(false);
     const [showTestChat, setShowTestChat] = useState(false);
     const [functions, setFunctions] = useState<Function[]>([]);
-    const [builtinFunctions, setBuiltinFunctions] = useState<any[]>([]);
+    const [builtinFunctions, setBuiltinFunctions] = useState<BuiltinFunctionDefinition[]>([]);
     const [allBuiltinFunctions, setAllBuiltinFunctions] = useState<BuiltinFunctionsState>({});
     const [builtinSaving, setBuiltinSaving] = useState(false);
     const [builtinSaved, setBuiltinSaved] = useState(false);
     const [showFunctionModal, setShowFunctionModal] = useState(false);
     const [selectedFunction, setSelectedFunction] = useState<Function | null>(null);
     const [showFunctionSelector, setShowFunctionSelector] = useState(false);
+    const [showBuiltinConfigModal, setShowBuiltinConfigModal] = useState(false);
+    const [selectedBuiltinFunctionId, setSelectedBuiltinFunctionId] = useState<string | null>(null);
+    const [builtinDraftConfig, setBuiltinDraftConfig] = useState<BuiltinFunctionState | null>(null);
 
     const agentId = params.id as string;
 
@@ -271,6 +282,38 @@ export default function AgentDetailPage() {
             };
         }
         return normalized;
+    };
+
+    const formatBuiltinFunctionName = (name?: string | null) => {
+        const cleaned = String(name || '')
+            .replace(/^builtin_/, '')
+            .replace(/_/g, ' ')
+            .trim();
+
+        if (!cleaned) return 'Built-in Function';
+
+        return cleaned.replace(/\b\w/g, (char) => char.toUpperCase());
+    };
+
+    const openBuiltinConfigModal = (funcId: string) => {
+        const func = builtinFunctions.find((entry) => entry.id === funcId);
+        const existing = allBuiltinFunctions[funcId] || {};
+        setSelectedBuiltinFunctionId(funcId);
+        setBuiltinDraftConfig({
+            enabled: existing.enabled ?? true,
+            config: existing.config && typeof existing.config === 'object' ? { ...existing.config } : {},
+            ...normalizeBuiltinSpeechFlags({
+                speak_during_execution: existing.speak_during_execution ?? func?.speak_during_execution,
+                speak_after_execution: existing.speak_after_execution ?? func?.speak_after_execution,
+            }),
+        });
+        setShowBuiltinConfigModal(true);
+    };
+
+    const closeBuiltinConfigModal = () => {
+        setShowBuiltinConfigModal(false);
+        setSelectedBuiltinFunctionId(null);
+        setBuiltinDraftConfig(null);
     };
 
     const fetchBuiltinFunctionsConfig = async () => {
@@ -484,6 +527,25 @@ export default function AgentDetailPage() {
         } catch (err) {
             showToast('Failed to delete function', 'error');
         }
+    };
+
+    const handleSaveBuiltinConfigModal = async () => {
+        if (!selectedBuiltinFunctionId || !builtinDraftConfig) return;
+
+        const next: BuiltinFunctionsState = {
+            ...allBuiltinFunctions,
+            [selectedBuiltinFunctionId]: {
+                enabled: true,
+                config: builtinDraftConfig.config && typeof builtinDraftConfig.config === 'object'
+                    ? builtinDraftConfig.config
+                    : {},
+                ...normalizeBuiltinSpeechFlags(builtinDraftConfig),
+            },
+        };
+
+        setAllBuiltinFunctions(next);
+        await handleSaveBuiltinFunctions(next);
+        closeBuiltinConfigModal();
     };
 
     const handleSave = async () => {
@@ -1026,87 +1088,58 @@ export default function AgentDetailPage() {
                                                             {Object.entries(allBuiltinFunctions).map(([funcId, config]: [string, any]) => {
                                                                 const func = builtinFunctions.find(f => f.id === funcId);
                                                                 if (!func || !config?.enabled) return null;
+                                                                const speechMode = config?.speak_during_execution ? 'During execution' : 'After execution';
+                                                                const transferPhone = config?.config?.phone_number;
                                                                 return (
-                                                                    <div key={funcId} className="bg-blue-50 rounded-lg p-3 border border-blue-100">
-                                                                        <div className="flex items-center justify-between mb-2">
+                                                                    <div key={funcId} className="rounded-xl border border-gray-200 bg-white p-3 shadow-sm">
+                                                                        <div className="flex items-start justify-between gap-3">
                                                                             <div className="flex items-center gap-3">
-                                                                                <div className="w-5 h-5 rounded-full bg-blue-500 flex items-center justify-center">
-                                                                                    <span className="text-white text-xs font-bold">S</span>
+                                                                                <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-600 text-xs font-semibold text-white shadow-sm">
+                                                                                    BI
                                                                                 </div>
-                                                                                <span className="text-sm font-medium text-gray-900">{func.name}</span>
+                                                                                <div className="min-w-0">
+                                                                                    <p className="text-sm font-medium text-gray-900">
+                                                                                        {formatBuiltinFunctionName(func.name)}
+                                                                                    </p>
+                                                                                    <p className="mt-0.5 text-xs text-gray-500">
+                                                                                        {func.description || 'Built-in runtime tool'}
+                                                                                    </p>
+                                                                                </div>
                                                                             </div>
-                                                                            <button
-                                                                onClick={() => {
-                                                                    setAllBuiltinFunctions((prev: BuiltinFunctionsState) => {
-                                                                        const next: BuiltinFunctionsState = {
-                                                                            ...prev,
-                                                                            [funcId]: { ...prev[funcId], enabled: false },
-                                                                        };
-                                                                        void handleSaveBuiltinFunctions(next, true);
-                                                                        return next;
-                                                                    });
-                                                                    setBuiltinSaved(false);
-                                                                }}
-                                                                                className="p-1.5 text-gray-400 hover:text-red-600 transition-colors"
-                                                                            >
-                                                                                <Trash2 className="w-4 h-4" />
-                                                                            </button>
-                                                                        </div>
-                                                                        <p className="text-xs text-gray-500 mb-2">{func.description}</p>
-
-                                                                        <div className="mt-2 p-2 bg-white rounded border border-blue-200 space-y-2">
-                                                                            <div>
-                                                                                <label className="text-xs font-medium text-gray-700 block mb-1">
-                                                                                    Tool Speech Mode
-                                                                                </label>
-                                                                                <select
-                                                                                    value={config?.speak_during_execution ? 'during' : 'after'}
-                                                                                    onChange={(e) => {
-                                                                                        const nextMode = e.target.value === 'during' ? 'during' : 'after';
-                                                                                        setAllBuiltinFunctions((prev: BuiltinFunctionsState) => ({
-                                                                                            ...prev,
-                                                                                            [funcId]: {
-                                                                                                ...prev[funcId],
-                                                                                                speak_during_execution: nextMode === 'during',
-                                                                                                speak_after_execution: nextMode === 'after',
-                                                                                            },
-                                                                                        }));
+                                                                            <div className="flex items-center gap-2">
+                                                                                <button
+                                                                                    onClick={() => openBuiltinConfigModal(funcId)}
+                                                                                    className="p-1.5 text-gray-400 hover:text-blue-600 transition-colors"
+                                                                                >
+                                                                                    <Edit3 className="w-4 h-4" />
+                                                                                </button>
+                                                                                <button
+                                                                                    onClick={() => {
+                                                                                        setAllBuiltinFunctions((prev: BuiltinFunctionsState) => {
+                                                                                            const next: BuiltinFunctionsState = {
+                                                                                                ...prev,
+                                                                                                [funcId]: { ...prev[funcId], enabled: false },
+                                                                                            };
+                                                                                            void handleSaveBuiltinFunctions(next, true);
+                                                                                            return next;
+                                                                                        });
                                                                                         setBuiltinSaved(false);
                                                                                     }}
-                                                                                    className="w-full text-sm px-2 py-1 border border-gray-200 rounded focus:outline-none focus:border-blue-400 bg-white"
+                                                                                    className="p-1.5 text-gray-400 hover:text-red-600 transition-colors"
                                                                                 >
-                                                                                    <option value="during">Speak During Execution</option>
-                                                                                    <option value="after">Speak After Execution</option>
-                                                                                </select>
+                                                                                    <Trash2 className="w-4 h-4" />
+                                                                                </button>
                                                                             </div>
+                                                                        </div>
 
-                                                                            {/* Configuration for transfer function */}
+                                                                        <div className="mt-3 flex flex-wrap gap-2">
+                                                                            <span className="inline-flex items-center rounded-full bg-blue-50 px-2.5 py-1 text-[11px] font-medium text-blue-700">
+                                                                                Speech: {speechMode}
+                                                                            </span>
                                                                             {(func.name === 'call_transfer' || func.name === 'transfer_call') && (
-                                                                                <div>
-                                                                                    <label className="text-xs font-medium text-gray-700 block mb-1">
-                                                                                        Transfer Phone Number
-                                                                                    </label>
-                                                                                    <input
-                                                                                        type="tel"
-                                                                                        inputMode="tel"
-                                                                                        autoComplete="off"
-                                                                                        placeholder="+1234567890"
-                                                                                        value={config.config?.phone_number || ''}
-                                                                                        onChange={(e) => {
-                                                                                            const nextValue = e.target.value;
-                                                                                            setAllBuiltinFunctions((prev: BuiltinFunctionsState) => ({
-                                                                                                ...prev,
-                                                                                                [funcId]: {
-                                                                                                    ...prev[funcId],
-                                                                                                    config: { ...prev[funcId]?.config, phone_number: nextValue },
-                                                                                                },
-                                                                                            }));
-                                                                                            setBuiltinSaved(false);
-                                                                                        }}
-                                                                                        className="w-full text-sm px-2 py-1 border border-gray-200 rounded focus:outline-none focus:border-blue-400"
-                                                                                    />
-                                                                                    <p className="text-[10px] text-gray-400 mt-1">Enter the phone number to transfer calls to (E.164 format)</p>
-                                                                                </div>
+                                                                                <span className="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-1 text-[11px] font-medium text-gray-700">
+                                                                                    Transfer: {transferPhone || 'Not set'}
+                                                                                </span>
                                                                             )}
                                                                         </div>
                                                                     </div>
@@ -1295,6 +1328,95 @@ export default function AgentDetailPage() {
                     functionData={selectedFunction}
                     onSuccess={fetchFunctions}
                 />
+
+                {showBuiltinConfigModal && selectedBuiltinFunctionId && builtinDraftConfig && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+                        <div className="mx-4 w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl">
+                            <div className="mb-5 flex items-start justify-between gap-4">
+                                <div>
+                                    <h3 className="text-lg font-semibold text-gray-900">
+                                        Configure {formatBuiltinFunctionName(builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name)}
+                                    </h3>
+                                    <p className="mt-1 text-sm text-gray-500">
+                                        Match the built-in function layout to the cleaner custom function editing flow.
+                                    </p>
+                                </div>
+                                <button
+                                    onClick={closeBuiltinConfigModal}
+                                    className="rounded-lg p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
+                                >
+                                    <X className="h-5 w-5" />
+                                </button>
+                            </div>
+
+                            <div className="space-y-4">
+                                <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                                    <label className="mb-2 block text-sm font-medium text-gray-700">
+                                        Tool Speech Mode
+                                    </label>
+                                    <select
+                                        value={builtinDraftConfig.speak_during_execution ? 'during' : 'after'}
+                                        onChange={(e) => {
+                                            const nextMode = e.target.value === 'during' ? 'during' : 'after';
+                                            setBuiltinDraftConfig((prev) => prev ? ({
+                                                ...prev,
+                                                speak_during_execution: nextMode === 'during',
+                                                speak_after_execution: nextMode === 'after',
+                                            }) : prev);
+                                        }}
+                                        className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
+                                    >
+                                        <option value="during">Speak During Execution</option>
+                                        <option value="after">Speak After Execution</option>
+                                    </select>
+                                </div>
+
+                                {(builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'call_transfer' ||
+                                    builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'transfer_call') && (
+                                    <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                                        <label className="mb-2 block text-sm font-medium text-gray-700">
+                                            Transfer Phone Number
+                                        </label>
+                                        <input
+                                            type="tel"
+                                            inputMode="tel"
+                                            autoComplete="off"
+                                            placeholder="+1234567890"
+                                            value={builtinDraftConfig.config?.phone_number || ''}
+                                            onChange={(e) => {
+                                                const nextValue = e.target.value;
+                                                setBuiltinDraftConfig((prev) => prev ? ({
+                                                    ...prev,
+                                                    config: { ...(prev.config || {}), phone_number: nextValue },
+                                                }) : prev);
+                                            }}
+                                            className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
+                                        />
+                                        <p className="mt-2 text-xs text-gray-500">
+                                            Enter the destination number in E.164 format.
+                                        </p>
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="mt-6 flex items-center justify-end gap-3">
+                                <button
+                                    onClick={closeBuiltinConfigModal}
+                                    className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={() => { void handleSaveBuiltinConfigModal(); }}
+                                    className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700"
+                                >
+                                    <Save className="h-4 w-4" />
+                                    Save Built-in Function
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
 
                 {/* Function Selector Modal */}
                 {showFunctionSelector && (
