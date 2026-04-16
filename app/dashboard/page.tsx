@@ -295,11 +295,11 @@ export default function Dashboard() {
     );
 
     return (
-        <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
+        <div className="min-h-screen bg-gray-50 flex" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
             <Sidebar />
 
             {/* Main Content */}
-            <main className="flex min-h-screen flex-col min-w-0 lg:ml-60">
+            <main className="flex-1 flex flex-col min-w-0">
                 {/* Mobile Header */}
                 <header className="lg:hidden bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
                     <button
