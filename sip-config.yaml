@@ -1,0 +1,27 @@
+api_key: devkey
+api_secret: secret12345678
+ws_url: ws://livekit-server:7880
+redis:
+  address: redis:6379
+sip_port: 5060
+sip_external_ip: 13.135.81.172
+rtp_port: 10000-10100
+
+# Authentication for Twilio SIP Trunk
+auth:
+  credentials:
+    - username: osteo-twilio
+      password: twilio123456
+    - username: twilio
+      password: twilio123456
+
+flood_protection:
+  enabled: false
+  invites_per_second: 1000
+  burst: 1000
+  rate_limits:
+    invites_per_minute: 1000
+    invites_burst: 1000
+
+logging:
+  level: debug

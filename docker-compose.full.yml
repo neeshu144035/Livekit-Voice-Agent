@@ -1,0 +1,149 @@
+services:
+  # Infrastructure
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - livekit-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=dashboard_db
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password123
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d dashboard_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - livekit-network
+
+  # LiveKit Server
+  livekit-server:
+    image: livekit/livekit-server:latest
+    container_name: livekit-server
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml
+      - recordings:/var/lib/livekit/recordings
+    command: --config /etc/livekit.yaml --node-ip=0.0.0.0
+    networks:
+      - livekit-network
+
+  livekit-sip:
+    image: livekit/sip:latest
+    container_name: livekit-sip
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit-server:
+        condition: service_started
+    volumes:
+      - ./sip-config.yaml:/sip/config.yaml
+    environment:
+      - LIVEKIT_URL=ws://localhost:7880
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=secret12345678
+      - SIP_PORT=5060
+
+  # Backend API (Retell-like)
+  backend-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: backend-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://admin:password123@postgres:5432/dashboard_db
+      - LIVEKIT_URL=ws://livekit-server:7880
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=secret12345678
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      livekit-server:
+        condition: service_started
+    volumes:
+      - recordings:/app/recordings
+    networks:
+      - livekit-network
+
+  # Voice Agent Workers
+  voice-agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile.agent
+    container_name: voice-agent
+    restart: unless-stopped
+    environment:
+      - LIVEKIT_URL=ws://livekit-server:7880
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=secret12345678
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MOONSHOT_API_KEY=${MOONSHOT_API_KEY}
+      - DASHBOARD_API_URL=http://backend-api:8000
+    depends_on:
+      - backend-api
+      - livekit-server
+    networks:
+      - livekit-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Recording storage
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - livekit-network
+
+volumes:
+  pgdata:
+  recordings:
+  minio_data:
+
+networks:
+  livekit-network:
+    driver: bridge

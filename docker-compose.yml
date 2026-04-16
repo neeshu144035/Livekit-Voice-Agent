@@ -1,0 +1,85 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  livekit-server:
+    image: livekit/livekit-server:latest
+    container_name: livekit-server
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml
+    command: --config /etc/livekit.yaml
+
+  livekit-sip:
+    image: livekit/sip:latest
+    container_name: livekit-sip
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit-server:
+        condition: service_started
+    volumes:
+      - ./sip-config.yaml:/sip/config.yaml
+    environment:
+      - LIVEKIT_URL=ws://localhost:7880
+      - LIVEKIT_API_KEY=devkey
+      - LIVEKIT_API_SECRET=secret12345678
+      - SIP_PORT=5060
+
+  voice-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: voice-agent
+    restart: unless-stopped
+    depends_on:
+      livekit-server:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - LIVEKIT_URL=ws://livekit-server:7880
+      - DASHBOARD_API_URL=http://host.docker.internal:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=dashboard_db
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password123
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d dashboard_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

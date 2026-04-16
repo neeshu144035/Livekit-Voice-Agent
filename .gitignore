@@ -1,0 +1,68 @@
+# Node / Next
+node_modules/
+.next/
+out/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Env / secrets
+.env
+.env.local
+.env.production
+.env.*
+!.env.example
+*.pem
+*.key
+cookie.txt
+login-ok.json
+me-no-cookie.json
+me-with-cookie.json
+
+# Logs / temp
+*.log
+*.out
+*.pid
+.dev.log
+.tmp*
+tmp*
+.deploy_tmp/
+.remote_snapshot/
+.tmp_pkg/
+
+# Build / archives
+*.tar
+*.tar.gz
+*.zip
+chunk-*.js
+live-*.js
+live*.js
+oyik-*.js
+build/
+
+# Local docs / generated artifacts
+tsconfig.tsbuildinfo
+phone_numbers_final.png
+verification_result.txt
+server_status.txt
+va_*.txt
+sip_*.txt
+api*.txt
+
+# Keep the repo focused on the active app/runtime only
+app-original/
+components-original/
+src/
+Microsoft/
+Images/
+plans/
+tmpdeploy_*/
+chat-widget-dashboard/
+kimi-chatbot-dashboard/
+Kimi_Agent_Free Hosting Clone Request/
+node_modules/

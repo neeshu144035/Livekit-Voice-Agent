@@ -1,0 +1,82 @@
+'old inline sidebar code from page.tsx
+
+// This was the old inline SIDEBAR_MENU and sidebar that was in page.tsx
+
+// Complete Sidebar Menu - ALL ITEMS
+const SIDEBAR_MENU = {
+    build: [
+        { icon: Bot, label: 'Agents', href: '/', active: true },
+        { icon: BookOpen, label: 'Knowledge Base', href: '/knowledge-base' },
+    ],
+    deploy: [
+        { icon: Phone, label: 'Phone Numbers', href: '/phone-numbers' },
+        { icon: PhoneCall, label: 'Batch Call', href: '/batch-call' },
+    ],
+    monitor: [
+        { icon: History, label: 'Call History', href: '/call-history' },
+        { icon: MessageSquare, label: 'Chat History', href: '/chat-history' },
+        { icon: BarChart3, label: 'Analytics', href: '/analytics' },
+    ],
+    settings: [
+        { icon: Settings, label: 'Settings', href: '/settings' },
+        { icon: Key, label: 'API Keys', href: '/api-keys' },
+    ]
+};
+
+// And the sidebar JSX that was in the return:
+<aside className={...}>
+    {/* Logo section */}
+    <div className="p-4 border-b border-gray-100">
+        <div className="flex items-center gap-2">
+            <div className="w-8 h-8 bg-gradient-to-br from-gray-700 to-gray-900 rounded-lg flex items-center justify-center">
+                <Sparkles className="w-4 h-4 text-white" />
+            </div>
+            <span className="text-sm font-bold text-gray-900">Retell AI</span>
+        </div>
+    </div>
+    
+    {/* Workspace selector */}
+    <div className="p-3 border-b border-gray-100">
+        <button onClick={() => setShowWorkspaceMenu(!showWorkspaceMenu)} ...>
+            <div className="flex items-center gap-2">
+                <div className="w-6 h-6 bg-blue-100 rounded flex items-center justify-center">
+                    <span className="text-xs font-medium text-blue-600">W</span>
+                </div>
+                <span className="text-sm font-medium text-gray-900">Workspace</span>
+            </div>
+            <ChevronDown className="w-4 h-4 text-gray-400" />
+        </button>
+        
+        {showWorkspaceMenu && (
+            <div className="mt-2 flex gap-1 p-1 bg-gray-100 rounded-lg">
+                <button onClick={() => { setWorkspaceType('voice'); setShowWorkspaceMenu(false); }} ...>
+                    <Phone className="w-3.5 h-3.5" />
+                    Voice
+                </button>
+                <button onClick={() => { setWorkspaceType('chat'); router.push('/chat'); }} ...>
+                    <MessageCircle className="w-3.5 h-3.5" />
+                    Chat
+                </button>
+            </div>
+        )}
+    </div>
+    
+    {/* Navigation */}
+    <nav className="p-3 space-y-6 overflow-y-auto h-[calc(100vh-140px)]">
+        {Object.entries(SIDEBAR_MENU).map(([section, items]) => (
+            <div key={section}>
+                <h3 className="px-3 text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
+                    {section}
+                </h3>
+                <div className="space-y-1">
+                    {items.map((item) => (
+                        <Link key={item.label} href={item.href} ...>
+                            <item.icon className="w-4 h-4" />
+                            {item.label}
+                        </Link>
+                    ))}
+                </div>
+            </div>
+        ))}
+    </nav>
+</aside>
