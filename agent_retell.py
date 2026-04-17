@@ -42,7 +42,7 @@ DASHBOARD_API_URL = os.getenv("DASHBOARD_API_URL", "http://host.docker.internal:
 DEFAULT_WORKER_DISPATCH_NAME = (os.getenv("LIVEKIT_WORKER_AGENT_NAME", "sarah") or "sarah").strip().lower()
 MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "1800"))
 DEFAULT_TTS_PROVIDER = "deepgram"
-DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+DEFAULT_ELEVENLABS_MODEL = "eleven_v3"
 DEFAULT_AGENT_LLM_TEMPERATURE = 0.2
 DEFAULT_AGENT_VOICE_SPEED = 1.0
 MIN_AGENT_LLM_TEMPERATURE = 0.0
@@ -1168,6 +1168,75 @@ def _room_has_participant_identity(room: Any, participant_identity: str) -> bool
     return False
 
 
+def _get_room_participant_by_identity(room: Any, participant_identity: str) -> Optional[Any]:
+    if not room or not participant_identity:
+        return None
+    try:
+        for participant in room.remote_participants.values():
+            if (getattr(participant, "identity", "") or "") == participant_identity:
+                return participant
+    except Exception:
+        return None
+    return None
+
+
+def _participant_has_audio_track(participant: Any) -> bool:
+    publications = getattr(participant, "track_publications", None)
+    if not publications:
+        return False
+
+    values = publications.values() if hasattr(publications, "values") else publications
+    for publication in values:
+        if getattr(publication, "track", None) is not None:
+            return True
+
+        kind = str(getattr(publication, "kind", "") or "").lower()
+        source = str(getattr(publication, "source", "") or "").lower()
+        name = str(getattr(publication, "name", "") or "").lower()
+        if "audio" in kind or "microphone" in source or "audio" in name:
+            return True
+    return False
+
+
+def _participant_sip_state(participant: Any) -> str:
+    attrs = getattr(participant, "attributes", None) or {}
+    for key in (
+        "sip.callStatus",
+        "sip.callState",
+        "sip.status",
+        "sip.state",
+        "lk_sip_call_status",
+        "lk_sip_call_state",
+    ):
+        value = str(attrs.get(key, "") or "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
+async def wait_for_transfer_established(
+    room: Any,
+    participant_identity: str,
+    timeout_sec: float = 20.0,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + max(timeout_sec, 0.5)
+    last_state = ""
+
+    while time.monotonic() < deadline:
+        participant = _get_room_participant_by_identity(room, participant_identity)
+        if participant:
+            sip_state = _participant_sip_state(participant)
+            if sip_state:
+                last_state = sip_state
+            if sip_state in {"active", "answered", "bridged", "connected", "confirmed", "complete", "completed", "in-progress", "in_progress"}:
+                return {"ready": True, "reason": f"sip_state:{sip_state}"}
+            if _participant_has_audio_track(participant):
+                return {"ready": True, "reason": "audio_track"}
+        await asyncio.sleep(0.25)
+
+    return {"ready": False, "reason": last_state or "timeout"}
+
+
 async def resolve_transfer_outbound_trunk_id(
     call_id: Optional[str],
     default_trunk_id: str,
@@ -1272,7 +1341,6 @@ async def start_sip_transfer(
                         "participant_identity": participant_identity,
                     }
 
-                await asyncio.sleep(1.0)
                 if not _room_has_participant_identity(room, participant_identity):
                     return {
                         "success": False,
@@ -1285,14 +1353,30 @@ async def start_sip_transfer(
                         "participant_identity": participant_identity,
                     }
 
+                established = await wait_for_transfer_established(room, participant_identity)
+                if not established.get("ready"):
+                    return {
+                        "success": True,
+                        "action": "transfer_call",
+                        "phone_number": phone_number,
+                        "status": "dialing",
+                        "trunk_id": trunk_id,
+                        "trunk_source": trunk_source,
+                        "participant_identity": participant_identity,
+                        "transfer_established": False,
+                        "establishment_reason": established.get("reason") or "pending",
+                    }
+
             return {
                 "success": True,
                 "action": "transfer_call",
                 "phone_number": phone_number,
-                "status": "dialing",
+                "status": "connected" if room else "dialing",
                 "trunk_id": trunk_id,
                 "trunk_source": trunk_source,
                 "participant_identity": participant_identity,
+                "transfer_established": True if room else False,
+                "establishment_reason": "room_not_provided" if not room else "connected",
             }
         finally:
             await lk_api.aclose()
@@ -1339,6 +1423,13 @@ async def run_transfer_handoff(
 
     transfer_result = await start_sip_transfer(room.name, target_phone, call_id, room)
     if not transfer_result.get("success"):
+        return transfer_result
+    if not transfer_result.get("transfer_established"):
+        transfer_result["agent_removed"] = {
+            "success": False,
+            "skipped": True,
+            "error": "Transfer leg has not fully established yet; keeping agent connected to the caller.",
+        }
         return transfer_result
 
     agent_identity = ""
@@ -1656,6 +1747,22 @@ def get_sip_phone_numbers(participant):
     return from_number, to_number
 
 
+async def wait_for_inbound_sip_participant(room: Any, timeout_sec: float = 8.0):
+    deadline = time.monotonic() + max(timeout_sec, 0.5)
+    last_participant = None
+
+    while time.monotonic() < deadline:
+        participant = detect_sip_participant(room)
+        if participant:
+            last_participant = participant
+            from_number, to_number = get_sip_phone_numbers(participant)
+            if from_number or to_number or _participant_sip_state(participant):
+                return participant
+        await asyncio.sleep(0.25)
+
+    return last_participant
+
+
 # ==================== Transcript Collector ====================
 
 class TranscriptCollector:
@@ -1802,61 +1909,62 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     if direction == "inbound":
-        await asyncio.sleep(1)
-        sip_participant = detect_sip_participant(ctx.room)
+        phone_agent = None
+        sip_participant = await wait_for_inbound_sip_participant(ctx.room)
         if sip_participant:
             from_number, to_number = get_sip_phone_numbers(sip_participant)
             logger.info(f"Inbound from: {from_number} to: {to_number}")
-            
+
             # Try to find agent by phone number - try both to_number and from_number
-            phone_agent = None
             if to_number:
                 phone_agent = await fetch_agent_by_phone(to_number)
                 if phone_agent:
                     logger.info(f"Found agent by to_number {to_number}: agent_id={phone_agent.get('agent_id')}")
-            
+
             # If not found, try from_number
             if not phone_agent and from_number:
                 phone_agent = await fetch_agent_by_phone(from_number)
                 if phone_agent:
                     logger.info(f"Found agent by from_number {from_number}: agent_id={phone_agent.get('agent_id')}")
+        else:
+            logger.warning("Inbound call did not expose SIP participant metadata within wait window for room %s", ctx.room.name)
 
-            # If SIP numbers are missing/unreliable, resolve by dispatch worker name hint.
-            if (
-                USE_DISPATCH_NAME_INBOUND_FALLBACK
-                and not phone_agent
-                and dispatch_name_hint
-                and dispatch_name_hint.lower() != DEFAULT_WORKER_DISPATCH_NAME
-            ):
-                dispatch_agent = await fetch_agent_by_dispatch_name(dispatch_name_hint)
-                if dispatch_agent:
-                    phone_agent = dispatch_agent
-                    logger.info(
-                        "Found agent by dispatch name %s: agent_id=%s",
-                        dispatch_name_hint,
-                        dispatch_agent.get("agent_id"),
-                    )
-            
-            if phone_agent:
-                new_agent_id = phone_agent.get("agent_id", agent_id)
-                if new_agent_id != agent_id:
-                    logger.info(f"Updating agent_id from {agent_id} to {new_agent_id} based on inbound routing")
-                    agent_id = new_agent_id
+        # If SIP numbers are missing/unreliable, resolve by dispatch worker name hint.
+        if (
+            not phone_agent
+            and dispatch_name_hint
+            and dispatch_name_hint.lower() != DEFAULT_WORKER_DISPATCH_NAME
+        ):
+            dispatch_agent = await fetch_agent_by_dispatch_name(dispatch_name_hint)
+            if dispatch_agent:
+                phone_agent = dispatch_agent
+                logger.info(
+                    "Found agent by dispatch name %s: agent_id=%s",
+                    dispatch_name_hint,
+                    dispatch_agent.get("agent_id"),
+                )
+
+        if phone_agent:
+            new_agent_id = phone_agent.get("agent_id", agent_id)
+            if new_agent_id != agent_id:
+                logger.info(f"Updating agent_id from {agent_id} to {new_agent_id} based on inbound routing")
+                agent_id = new_agent_id
+        else:
+            single_inbound_agent = await fetch_single_inbound_agent_id()
+            if single_inbound_agent and single_inbound_agent != agent_id:
+                logger.info(
+                    "Using single inbound phone mapping fallback, agent_id=%s",
+                    single_inbound_agent,
+                )
+                agent_id = single_inbound_agent
             else:
-                single_inbound_agent = await fetch_single_inbound_agent_id()
-                if single_inbound_agent and single_inbound_agent != agent_id:
-                    logger.info(
-                        "Using single inbound phone mapping fallback, agent_id=%s",
-                        single_inbound_agent,
-                    )
-                    agent_id = single_inbound_agent
-                else:
-                    logger.warning(
-                        "No agent found for inbound routing - from: %s, to: %s, dispatch_hint: %s",
-                        from_number,
-                        to_number,
-                        dispatch_name_hint,
-                    )
+                logger.warning(
+                    "No agent found for inbound routing - from: %s, to: %s, dispatch_hint: %s, dispatch_fallback_enabled: %s",
+                    from_number,
+                    to_number,
+                    dispatch_name_hint,
+                    USE_DISPATCH_NAME_INBOUND_FALLBACK,
+                )
 
     # Create call record
     call_id, resolved_agent_id, call_metadata = await create_call_record(

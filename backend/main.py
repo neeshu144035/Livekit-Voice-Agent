@@ -298,7 +298,7 @@ VALID_LANGUAGES = [
 
 VALID_TTS_PROVIDERS = ["deepgram", "elevenlabs"]
 DEFAULT_TTS_PROVIDER = "deepgram"
-DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+DEFAULT_ELEVENLABS_MODEL = "eleven_v3"
 VALID_CALL_DIRECTIONS = {"inbound", "outbound"}
 DEFAULT_CALL_DIRECTION = "outbound"
 ACTIVE_CALL_STATUSES = ("pending", "in-progress", "initiating", "dialing")
@@ -313,6 +313,7 @@ MIN_AGENT_VOICE_SPEED = 0.8
 MAX_AGENT_VOICE_SPEED = 1.2
 FALLBACK_ELEVENLABS_TTS_RATE_PER_1K_CHARS = {
     # Fallback only, real billed cost should come from ElevenLabs usage API.
+    "eleven_v3": 0.10,
     "eleven_flash_v2_5": 0.015,
     "eleven_turbo_v2_5": 0.030,
     "eleven_multilingual_v2": 0.030,
@@ -381,6 +382,125 @@ def resolve_display_name(name: Optional[str], display_name: Optional[str]) -> st
     if not normalized:
         raise HTTPException(status_code=400, detail="name/display_name must not be empty")
     return normalized
+
+
+def normalize_phone_lookup(phone_number: Optional[str]) -> Optional[str]:
+    candidate = str(phone_number or "").strip()
+    if not candidate:
+        return None
+
+    candidate = re.sub(r"(?i)^phone\s+", "", candidate)
+    candidate = re.sub(r"(?i)^(sip:|tel:)", "", candidate)
+    candidate = candidate.split(";", 1)[0].split("?", 1)[0]
+    if "@" in candidate:
+        candidate = candidate.split("@", 1)[0]
+
+    candidate = candidate.strip()
+    if candidate.startswith("00"):
+        candidate = f"+{candidate[2:]}"
+
+    if candidate.startswith("+"):
+        digits = re.sub(r"\D", "", candidate[1:])
+        normalized = f"+{digits}" if digits else ""
+    else:
+        digits = re.sub(r"\D", "", candidate)
+        normalized = f"+{digits}" if digits else ""
+
+    return normalized or None
+
+
+def find_phone_record_by_number(db: Session, phone_number: Optional[str]) -> tuple[Optional["PhoneNumberModel"], Optional[str]]:
+    normalized_phone = normalize_phone_lookup(phone_number)
+    if not normalized_phone:
+        return None, None
+
+    exact_match = (
+        db.query(PhoneNumberModel)
+        .filter(PhoneNumberModel.phone_number == normalized_phone)
+        .first()
+    )
+    if exact_match:
+        return exact_match, normalized_phone
+
+    for row in db.query(PhoneNumberModel).all():
+        if normalize_phone_lookup(row.phone_number) == normalized_phone:
+            return row, normalized_phone
+
+    return None, normalized_phone
+
+
+def resolve_inbound_agent_id(
+    db: Session,
+    *,
+    called_number: Optional[str] = None,
+    sip_trunk_id: Optional[str] = None,
+    room_name: Optional[str] = None,
+    fallback_agent_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    agent_id: Optional[int] = None
+    source = ""
+    phone_record: Optional["PhoneNumberModel"] = None
+    normalized_called_number = normalize_phone_lookup(called_number)
+    normalized_trunk_id = str(sip_trunk_id or "").strip()
+
+    if normalized_called_number:
+        phone_record, normalized_called_number = find_phone_record_by_number(db, normalized_called_number)
+        if phone_record and phone_record.enable_inbound and phone_record.inbound_agent_id:
+            agent_id = int(phone_record.inbound_agent_id)
+            source = "phone_number"
+
+    if not agent_id and normalized_trunk_id:
+        phone_record = (
+            db.query(PhoneNumberModel)
+            .filter(PhoneNumberModel.livekit_inbound_trunk_id == normalized_trunk_id)
+            .first()
+        )
+        if phone_record and phone_record.enable_inbound and phone_record.inbound_agent_id:
+            agent_id = int(phone_record.inbound_agent_id)
+            source = "inbound_trunk"
+
+    if not agent_id:
+        inbound_candidates = (
+            db.query(PhoneNumberModel)
+            .filter(
+                PhoneNumberModel.enable_inbound == True,  # noqa: E712
+                PhoneNumberModel.inbound_agent_id.isnot(None),
+            )
+            .all()
+        )
+        unique_candidates = sorted({int(row.inbound_agent_id) for row in inbound_candidates if row.inbound_agent_id is not None})
+        if len(unique_candidates) == 1:
+            agent_id = unique_candidates[0]
+            source = "single_inbound_mapping"
+
+    if not agent_id and room_name:
+        try:
+            parts = str(room_name).replace("-", "_").split("_")
+            if len(parts) >= 2 and parts[1].isdigit():
+                agent_id = int(parts[1])
+                source = "room_name"
+        except Exception:
+            pass
+
+    if not agent_id and fallback_agent_id:
+        try:
+            agent_id = int(fallback_agent_id)
+            source = "fallback_agent"
+        except Exception:
+            pass
+
+    if not agent_id:
+        default_agent = db.query(AgentModel).first()
+        agent_id = default_agent.id if default_agent else 1
+        source = "default_first_agent"
+
+    return {
+        "agent_id": agent_id,
+        "source": source,
+        "phone_record": phone_record,
+        "normalized_called_number": normalized_called_number,
+        "normalized_trunk_id": normalized_trunk_id or None,
+    }
 
 
 def normalize_call_direction_for_row(call: "CallModel") -> str:
@@ -3353,32 +3473,20 @@ async def create_dispatch_rule(phone_id: int, agent_name: str = "sarah", db: Ses
         dispatch_req = livekit_api.CreateSIPDispatchRuleRequest(
             name=f"{dispatch_agent_name}-inbound",
             trunk_ids=[phone.livekit_inbound_trunk_id],
+            room_config=livekit_api.RoomConfiguration(
+                agents=[livekit_api.RoomAgentDispatch(agent_name=dispatch_agent_name)]
+            ),
             rule=livekit_api.SIPDispatchRule(
                 dispatch_rule_individual=livekit_api.SIPDispatchRuleIndividual(
                     room_prefix="call"
                 )
             )
         )
-        
+
         result = await lk_api.sip.create_sip_dispatch_rule(dispatch_req)
-        dispatch_rule_id = result.dispatch_rule.sip_dispatch_rule_id
-        
-        # Update the dispatch rule to add the agent
-        dispatch_rules = await lk_api.sip.list_sip_dispatch_rule(livekit_api.ListSIPDispatchRuleRequest())
-        for rule in dispatch_rules.items:
-            if rule.sip_dispatch_rule_id == dispatch_rule_id:
-                update_req = livekit_api.UpdateSIPDispatchRuleRequest(
-                    sip_dispatch_rule_id=dispatch_rule_id,
-                    room_config=livekit_api.RoomConfiguration(
-                        agents=[livekit_api.RoomAgentDispatch(agent_name=dispatch_agent_name)]
-                    )
-                )
-                try:
-                    await lk_api.sip.update_sip_dispatch_rule(update_req)
-                    logger.info(f"Updated dispatch rule {dispatch_rule_id} with agent {dispatch_agent_name}")
-                except Exception as update_err:
-                    logger.warning(f"Could not update dispatch rule with agent: {update_err}")
-                break
+        dispatch_rule_id = str(getattr(result, "sip_dispatch_rule_id", "") or "").strip()
+        if not dispatch_rule_id:
+            raise RuntimeError(f"Unable to read created dispatch rule id from LiveKit response: {result}")
         
         await lk_api.aclose()
         
@@ -3679,11 +3787,15 @@ async def livekit_webhook(request_body: dict = None, db: Session = Depends(get_d
         
         if is_sip:
             # This is an inbound phone call
-            caller_number = attributes.get("sip.callerNumber", "") or \
-                           attributes.get("sip.from", "") or \
-                           participant_name
-            called_number = attributes.get("sip.calledNumber", "") or \
-                           attributes.get("sip.to", "")
+            caller_number = normalize_phone_lookup(
+                attributes.get("sip.callerNumber", "")
+                or attributes.get("sip.from", "")
+                or participant_name
+            )
+            called_number = normalize_phone_lookup(
+                attributes.get("sip.calledNumber", "")
+                or attributes.get("sip.to", "")
+            )
             sip_call_id = attributes.get("sip.callID", "")
             sip_trunk_id = (
                 attributes.get("sip.trunkID", "")
@@ -3714,52 +3826,13 @@ async def livekit_webhook(request_body: dict = None, db: Session = Depends(get_d
                     logger.info(f"Call already exists for room {room_name}")
                     return {"status": "ok"}
             
-            # Find agent assigned to this phone number
-            agent_id = None
-            phone_record = None
-            if called_number:
-                phone_record = db.query(PhoneNumberModel).filter(
-                    PhoneNumberModel.phone_number == called_number
-                ).first()
-                if phone_record and phone_record.inbound_agent_id:
-                    agent_id = phone_record.inbound_agent_id
-
-            # Fallback: map by inbound trunk id when number metadata is missing.
-            if not agent_id and sip_trunk_id:
-                phone_record = db.query(PhoneNumberModel).filter(
-                    PhoneNumberModel.livekit_inbound_trunk_id == sip_trunk_id
-                ).first()
-                if phone_record and phone_record.inbound_agent_id:
-                    agent_id = phone_record.inbound_agent_id
-                    logger.info(f"Resolved inbound agent via trunk {sip_trunk_id}: {agent_id}")
-
-            # Fallback: if only one inbound mapping exists, use it.
-            if not agent_id:
-                inbound_candidates = (
-                    db.query(PhoneNumberModel)
-                    .filter(
-                        PhoneNumberModel.enable_inbound == True,  # noqa: E712
-                        PhoneNumberModel.inbound_agent_id.isnot(None),
-                    )
-                    .all()
-                )
-                if len(inbound_candidates) == 1:
-                    agent_id = inbound_candidates[0].inbound_agent_id
-                    logger.info("Resolved inbound agent via single configured inbound mapping: %s", agent_id)
-            
-            # Fallback: try to extract from room name
-            if not agent_id:
-                try:
-                    parts = room_name.replace("-", "_").split("_")
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        agent_id = int(parts[1])
-                except:
-                    pass
-            
-            # Fallback to default agent
-            if not agent_id:
-                default_agent = db.query(AgentModel).first()
-                agent_id = default_agent.id if default_agent else 1
+            routing = resolve_inbound_agent_id(
+                db,
+                called_number=called_number,
+                sip_trunk_id=sip_trunk_id,
+                room_name=room_name,
+            )
+            agent_id = routing["agent_id"]
             
             # Create inbound call record
             call_id = f"inbound_{uuid.uuid4().hex[:12]}"
@@ -3778,6 +3851,8 @@ async def livekit_webhook(request_body: dict = None, db: Session = Depends(get_d
                     "sip_attributes": attributes,
                     "participant_identity": identity,
                     "sip_trunk_id": sip_trunk_id,
+                    "inbound_routing_source": routing.get("source"),
+                    "resolved_called_number": routing.get("normalized_called_number"),
                 }
             )
             db.add(db_call)
@@ -3864,21 +3939,11 @@ async def get_agent_by_dispatch_name(dispatch_name: str, db: Session = Depends(g
 @app.get("/api/agents/by-phone/{phone_number:path}")
 async def get_agent_by_phone(phone_number: str, db: Session = Depends(get_database)):
     """Get agent configuration for a phone number (used by voice agent for inbound calls)"""
-    # Normalize phone number (handles values like "Phone +447...").
-    normalized_phone = str(phone_number or "").strip()
-    normalized_phone = re.sub(r"(?i)^phone\s+", "", normalized_phone)
-    normalized_phone = re.sub(r"\s+", "", normalized_phone)
-    if normalized_phone and not normalized_phone.startswith("+"):
-        normalized_phone = "+" + normalized_phone
-
+    phone_record, normalized_phone = find_phone_record_by_number(db, phone_number)
     if not normalized_phone:
         raise HTTPException(status_code=400, detail="phone_number is required")
-    
-    phone_record = db.query(PhoneNumberModel).filter(
-        PhoneNumberModel.phone_number == normalized_phone
-    ).first()
-    
-    if not phone_record or not phone_record.inbound_agent_id:
+
+    if not phone_record or not phone_record.enable_inbound or not phone_record.inbound_agent_id:
         raise HTTPException(status_code=404, detail="No agent configured for this phone number")
     
     agent = db.query(AgentModel).filter(AgentModel.id == phone_record.inbound_agent_id).first()
@@ -4188,6 +4253,19 @@ class AgentCallCreate(BaseModel):
 async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depends(get_database)):
     """Create a call record from the voice agent (used for inbound calls)"""
     normalized_direction = normalize_call_direction(call_data.direction, default="inbound")
+    normalized_from_number = normalize_phone_lookup(call_data.from_number)
+    normalized_to_number = normalize_phone_lookup(call_data.to_number)
+    inbound_routing = None
+    resolved_agent_id = call_data.agent_id
+
+    if normalized_direction == "inbound":
+        inbound_routing = resolve_inbound_agent_id(
+            db,
+            called_number=normalized_to_number,
+            room_name=call_data.room_name,
+            fallback_agent_id=call_data.agent_id,
+        )
+        resolved_agent_id = inbound_routing["agent_id"]
 
     # Reuse only active call rows for this room; create a fresh row for ended/failed calls.
     existing = (
@@ -4208,6 +4286,31 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
                 existing.duration_seconds = int((existing.ended_at - existing.started_at).total_seconds())
             db.commit()
         else:
+            metadata = ensure_custom_params(existing.call_metadata)
+            changed = False
+
+            if normalized_from_number and existing.from_number != normalized_from_number:
+                existing.from_number = normalized_from_number
+                metadata["from_number"] = normalized_from_number
+                changed = True
+            if normalized_to_number and existing.to_number != normalized_to_number:
+                existing.to_number = normalized_to_number
+                metadata["to_number"] = normalized_to_number
+                changed = True
+            if resolved_agent_id and existing.agent_id != resolved_agent_id:
+                existing.agent_id = resolved_agent_id
+                changed = True
+            if inbound_routing and inbound_routing.get("source"):
+                metadata["inbound_routing_source"] = inbound_routing["source"]
+                if inbound_routing.get("normalized_called_number"):
+                    metadata["resolved_called_number"] = inbound_routing["normalized_called_number"]
+                changed = True
+
+            if changed:
+                existing.call_metadata = metadata
+                flag_modified(existing, "call_metadata")
+                db.commit()
+
             return {
                 "call_id": existing.call_id,
                 "agent_id": existing.agent_id,
@@ -4216,16 +4319,27 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
             }
     
     call_id = f"{normalized_direction}_{uuid.uuid4().hex[:12]}"
+    call_metadata = {}
+    if normalized_from_number:
+        call_metadata["from_number"] = normalized_from_number
+    if normalized_to_number:
+        call_metadata["to_number"] = normalized_to_number
+    if inbound_routing and inbound_routing.get("source"):
+        call_metadata["inbound_routing_source"] = inbound_routing["source"]
+        if inbound_routing.get("normalized_called_number"):
+            call_metadata["resolved_called_number"] = inbound_routing["normalized_called_number"]
+
     db_call = CallModel(
         call_id=call_id,
-        agent_id=call_data.agent_id,
+        agent_id=resolved_agent_id,
         room_name=call_data.room_name,
         call_type=call_data.call_type,
         direction=normalized_direction,
         status="in-progress",
-        from_number=call_data.from_number,
-        to_number=call_data.to_number,
-        started_at=datetime.utcnow()
+        from_number=normalized_from_number,
+        to_number=normalized_to_number,
+        started_at=datetime.utcnow(),
+        call_metadata=call_metadata,
     )
     db.add(db_call)
     db.commit()
