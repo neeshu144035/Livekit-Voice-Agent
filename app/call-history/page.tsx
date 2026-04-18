@@ -40,6 +40,9 @@ interface CallRecord {
     tts_characters: number;
     tts_provider?: string | null;
     tts_model_used?: string | null;
+    tts_fallback_used?: boolean;
+    tts_original_model?: string | null;
+    tts_actual_model?: string | null;
     transcript_count: number;
     transcript_summary: string | null;
     error_message: string | null;
@@ -773,6 +776,7 @@ export default function CallHistoryPage() {
                                                     <p className="text-[10px] text-gray-400 mt-0.5">
                                                         TTS: {call.tts_provider === 'elevenlabs' ? 'ElevenLabs' : 'Deepgram'}
                                                         {call.tts_model_used ? ` • ${call.tts_model_used}` : ''}
+                                                        {call.tts_fallback_used ? <span className="text-amber-600 ml-1">(fallback)</span> : ''}
                                                     </p>
                                                 </div>
                                             </td>

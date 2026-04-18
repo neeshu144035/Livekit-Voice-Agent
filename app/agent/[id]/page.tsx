@@ -165,6 +165,8 @@ const LANGUAGE_OPTIONS = [
     { value: 'fr', label: 'French', flag: '🇫🇷' },
     { value: 'de', label: 'German', flag: '🇩🇪' },
     { value: 'it', label: 'Italian', flag: '🇮🇹' },
+    { value: 'hi', label: 'Hindi', flag: '🇮🇳' },
+    { value: 'ml', label: 'Malayalam', flag: '🇮🇳' },
 ];
 
 const WELCOME_OPTIONS = [

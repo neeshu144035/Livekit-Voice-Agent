@@ -600,6 +600,8 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                                     <option value="de">German</option>
                                     <option value="it">Italian</option>
                                     <option value="pt">Portuguese</option>
+                                    <option value="hi">Hindi</option>
+                                    <option value="ml">Malayalam</option>
                                 </select>
                             </div>
                         </div>

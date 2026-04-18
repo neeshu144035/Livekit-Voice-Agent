@@ -293,7 +293,7 @@ VALID_VOICES = [
 ]
 
 VALID_LANGUAGES = [
-    'en', 'en-US', 'en-GB', 'en-AU', 'en-IN', 'es', 'fr', 'de', 'it',
+    'en', 'en-US', 'en-GB', 'en-AU', 'en-IN', 'es', 'fr', 'de', 'it', 'hi', 'hi-IN', 'ml', 'ml-IN'
 ]
 
 VALID_TTS_PROVIDERS = ["deepgram", "elevenlabs"]
