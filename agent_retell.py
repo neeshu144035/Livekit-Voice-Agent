@@ -2128,6 +2128,7 @@ async def entrypoint(ctx: JobContext):
             "voice_id": selected_voice,
             "model": selected_tts_model,
             "api_key": eleven_key,
+            "enable_ssml_parsing": True,
             "enable_logging": True,
         }
         if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
