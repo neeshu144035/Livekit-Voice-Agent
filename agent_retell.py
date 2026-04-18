@@ -2119,58 +2119,38 @@ async def entrypoint(ctx: JobContext):
         if not eleven_key:
             raise RuntimeError("ElevenLabs selected but ELEVEN_API_KEY / ELEVENLABS_API_KEY is not set")
 
-        # livekit-plugins-elevenlabs >=1.4.2 defaults to websocket multi-stream-input.
-        # However, ElevenLabs explicitly disables websockets for eleven_v3, forcing an HTTP fallback.
-        if "v3" in selected_tts_model.lower() and "flash" not in selected_tts_model.lower():
-            logger.info("Using custom HTTP TTS fallback for ElevenLabs v3 model.")
-            import livekit.agents.tts as livekit_tts
-            class ElevenLabsV3HTTPFallback(livekit_tts.TTS):
-                def __init__(self, api_key: str, model: str, voice_id: str):
-                    super().__init__(capabilities=livekit_tts.TTSCapabilities(streaming=False), sample_rate=24000, num_channels=1)
-                    self.api_key = api_key
-                    self.model = model
-                    self.voice_id = voice_id
+        # ElevenLabs v3 doesn't support the websocket multi-stream-input endpoint.
+        # Use native LiveKit tts.StreamAdapter to force HTTP mode for v3 models.
+        # For v2/v2.5, use the standard plugin with websocket streaming for low latency.
+        is_v3_model = "v3" in selected_tts_model.lower() and "flash" not in selected_tts_model.lower()
+        
+        eleven_kwargs: Dict[str, Any] = {
+            "voice_id": selected_voice,
+            "model": selected_tts_model,
+            "api_key": eleven_key,
+            "enable_logging": True,
+        }
+        if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
+            voice_settings = build_elevenlabs_voice_settings(config, voice_speed)
+            if voice_settings is not None:
+                eleven_kwargs["voice_settings"] = voice_settings
+        if not is_v3_model and _callable_supports_kwarg(elevenlabs.TTS, "streaming_latency"):
+            eleven_kwargs["streaming_latency"] = _coerce_setting_int(ELEVENLABS_STREAMING_LATENCY, default=2, min_value=0, max_value=4)
+        if not is_v3_model and _callable_supports_kwarg(elevenlabs.TTS, "auto_mode"):
+            eleven_kwargs["auto_mode"] = ELEVENLABS_AUTO_MODE
 
-                def synthesize(self, text: str) -> livekit_tts.ChunkedStream:
-                    class _Stream(livekit_tts.ChunkedStream):
-                        def __init__(self, tts_model, text):
-                            super().__init__(tts_model, text)
-                            self.tts_model = tts_model
-                            
-                        async def _main_task(self):
-                            url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.tts_model.voice_id}?model_id={self.tts_model.model}&output_format=pcm_24000"
-                            headers = {"xi-api-key": self.tts_model.api_key, "Content-Type": "application/json"}
-                            import aiohttp
-                            from livekit.rtc import AudioFrame
-                            async with aiohttp.ClientSession() as session:
-                                async with session.post(url, headers=headers, json={"text": self._text}) as resp:
-                                    if resp.status != 200:
-                                        logger.error(f"ElevenLabs HTTP TTS failed: {resp.status}")
-                                        return
-                                    async for chunk in resp.content.iter_chunked(4096):
-                                        frame = AudioFrame(chunk, 24000, 1, len(chunk)//2)
-                                        self._event_ch.send_nowait(livekit_tts.SynthesizedAudio(request_id=self.request_id, frame=frame))
-                    return _Stream(self, text)
-                    
-            tts_engine = ElevenLabsV3HTTPFallback(api_key=eleven_key, model=selected_tts_model, voice_id=selected_voice)
-            resolved_voice_id = selected_voice
+        if is_v3_model:
+            # eleven_v3 doens't support websocket streaming; use LiveKit's native StreamAdapter
+            # which wraps the TTS plugin in HTTP (non-streaming) mode.
+            logger.info("ElevenLabs v3 detected: using tts.StreamAdapter (HTTP mode) for voice synthesis.")
+            from livekit.agents import tts as lk_tts
+            from livekit.agents import tokenize as lk_tokenize
+            base_tts = elevenlabs.TTS(**eleven_kwargs)
+            tts_engine = lk_tts.StreamAdapter(tts=base_tts, sentence_tokenizer=lk_tokenize.basic.SentenceTokenizer())
         else:
-            eleven_kwargs: Dict[str, Any] = {
-                "voice_id": selected_voice,
-                "model": selected_tts_model,
-                "api_key": eleven_key,
-                "enable_logging": True,
-            }
-            if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
-                voice_settings = build_elevenlabs_voice_settings(config, voice_speed)
-                if voice_settings is not None:
-                    eleven_kwargs["voice_settings"] = voice_settings
-            if _callable_supports_kwarg(elevenlabs.TTS, "streaming_latency"):
-                eleven_kwargs["streaming_latency"] = _coerce_setting_int(ELEVENLABS_STREAMING_LATENCY, default=2, min_value=0, max_value=4)
-            if _callable_supports_kwarg(elevenlabs.TTS, "auto_mode"):
-                eleven_kwargs["auto_mode"] = ELEVENLABS_AUTO_MODE
             tts_engine = elevenlabs.TTS(**eleven_kwargs)
-            resolved_voice_id = selected_voice
+        resolved_voice_id = selected_voice
+
 
         logger.info(
             "TTS initialized: provider=elevenlabs, model=%s, voice=%s",
