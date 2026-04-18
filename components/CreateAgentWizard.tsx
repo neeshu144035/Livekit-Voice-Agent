@@ -56,6 +56,9 @@ interface TTSVoiceOption {
 interface TTSModelOption {
     id: string;
     name: string;
+    is_v3?: boolean;
+    streaming_type?: string;
+    languages_count?: number;
 }
 
 const DEEPGRAM_VOICE_OPTIONS: TTSVoiceOption[] = [
@@ -164,6 +167,22 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
     const [testMessages, setTestMessages] = useState<any[]>([]);
     const [testInput, setTestInput] = useState('');
 
+    const loadTtsVoicesForModel = async (provider: string, modelId?: string) => {
+        const normalized = provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
+        if (normalized !== 'elevenlabs') return;
+        setTtsLoading(true);
+        try {
+            const modelParam = modelId ? `&model=${encodeURIComponent(modelId)}` : '';
+            const voicesData = await fetch(`${API_URL}/tts/voices?provider=${normalized}${modelParam}`).then((r) => r.json());
+            const voices = (voicesData?.voices || []) as TTSVoiceOption[];
+            setTtsVoices(voices);
+        } catch (e) {
+            // Keep existing voices on error
+        } finally {
+            setTtsLoading(false);
+        }
+    };
+
     const loadTtsOptions = async (provider: string) => {
         const normalized = provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
         setTtsLoading(true);
@@ -211,6 +230,12 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
         if (!isOpen) return;
         loadTtsOptions(selectedTtsProvider);
     }, [isOpen, selectedTtsProvider]);
+
+    // Re-fetch voices when ElevenLabs model changes (v3 shows all voices, v2.5 filters by compatibility)
+    useEffect(() => {
+        if (!isOpen || selectedTtsProvider !== 'elevenlabs' || !selectedTtsModel) return;
+        loadTtsVoicesForModel('elevenlabs', selectedTtsModel);
+    }, [selectedTtsModel]);
 
     useEffect(() => {
         if (!ttsVoices.find((voice) => voice.id === selectedVoice) && ttsVoices.length > 0) {
@@ -516,6 +541,18 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                                                 </option>
                                             ))}
                                         </select>
+                                        {selectedTtsModel && selectedTtsModel.includes('v3') && (
+                                            <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-50 border border-emerald-200 rounded-lg">
+                                                <span className="w-2 h-2 bg-emerald-500 rounded-full" />
+                                                <span className="text-xs text-emerald-700 font-medium">v3 Universal — All voices are compatible</span>
+                                            </div>
+                                        )}
+                                        {selectedTtsModel && !selectedTtsModel.includes('v3') && ttsVoices.length > 0 && (
+                                            <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
+                                                <span className="w-2 h-2 bg-amber-500 rounded-full" />
+                                                <span className="text-xs text-amber-700 font-medium">Showing {ttsVoices.length} voices compatible with {selectedTtsModel}</span>
+                                            </div>
+                                        )}
                                         <div className="flex items-center gap-2">
                                             <input
                                                 type="text"

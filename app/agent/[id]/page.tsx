@@ -125,11 +125,16 @@ interface TTSVoiceOption {
     accent?: string | null;
     gender?: string | null;
     provider?: string;
+    category?: string;
 }
 
 interface TTSModelOption {
     id: string;
     name: string;
+    is_v3?: boolean;
+    streaming_type?: string;
+    supports_fallback?: string;
+    languages_count?: number;
 }
 
 // Voices available for Deepgram TTS
@@ -326,6 +331,22 @@ export default function AgentDetailPage() {
         setAllBuiltinFunctions(normalized);
     };
 
+    const loadTtsVoicesForModel = async (provider: string, modelId?: string) => {
+        const normalized = provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
+        if (normalized !== 'elevenlabs') return;
+        setTtsLoading(true);
+        try {
+            const modelParam = modelId ? { provider: normalized, model: modelId } : { provider: normalized };
+            const voicesRes = await axios.get(`${API_URL}tts/voices`, { params: modelParam });
+            const voices = (voicesRes.data?.voices || []) as TTSVoiceOption[];
+            setTtsVoices(voices);
+        } catch (e) {
+            // Keep existing voices on error
+        } finally {
+            setTtsLoading(false);
+        }
+    };
+
     const loadTtsOptions = async (provider: string) => {
         const normalizedProvider = provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
         setTtsLoading(true);
@@ -380,6 +401,12 @@ export default function AgentDetailPage() {
     useEffect(() => {
         loadTtsOptions(selectedTtsProvider);
     }, [selectedTtsProvider]);
+
+    // Re-fetch voices when ElevenLabs model changes (v3 shows all voices, v2.5 filters by compatibility)
+    useEffect(() => {
+        if (selectedTtsProvider !== 'elevenlabs' || !selectedTtsModel) return;
+        loadTtsVoicesForModel('elevenlabs', selectedTtsModel);
+    }, [selectedTtsModel]);
 
     useEffect(() => {
         if (!ttsVoices.find(v => v.id === selectedVoice) && ttsVoices.length > 0) {
@@ -853,11 +880,12 @@ export default function AgentDetailPage() {
                                         disabled={ttsLoading}
                                         className="w-full appearance-none px-3 py-2 pr-8 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200 focus:outline-none cursor-pointer"
                                     >
-                                        {ttsVoices.map(voice => (
-                                            <option key={voice.id} value={voice.id}>
-                                                {voice.label}{voice.accent ? ` (${voice.accent})` : ''}
-                                            </option>
-                                        ))}
+{ttsVoices.map(voice => (
+                                                <option key={voice.id} value={voice.id}>
+                                                    {voice.label}
+                                                    {voice.category ? ` [${voice.category}]` : ''}
+                                                </option>
+                                            ))}
                                         {selectedTtsProvider === 'elevenlabs' && (
                                             <option value={CUSTOM_ELEVEN_VOICE_OPTION_ID}>
                                                 + Add custom voice ID
@@ -879,10 +907,24 @@ export default function AgentDetailPage() {
                                             {ttsModels.map(model => (
                                                 <option key={model.id} value={model.id}>
                                                     {model.name}
+                                                    {model.is_v3 ? ' (v3)' : model.streaming_type === 'http' ? ' (HTTP)' : ' (WS)'}
                                                 </option>
                                             ))}
                                         </select>
                                         <ChevronDown className="absolute right-2 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-500 pointer-events-none" />
+                                    </div>
+                                )}
+
+                                {selectedTtsProvider === 'elevenlabs' && selectedTtsModel && selectedTtsModel.includes('v3') && (
+                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-emerald-50 border border-emerald-200 rounded-lg">
+                                        <span className="w-2 h-2 bg-emerald-500 rounded-full" />
+                                        <span className="text-xs text-emerald-700 font-medium">v3 Universal (All voices compatible)</span>
+                                    </div>
+                                )}
+                                {selectedTtsProvider === 'elevenlabs' && selectedTtsModel && !selectedTtsModel.includes('v3') && ttsVoices.length > 0 && (
+                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
+                                        <span className="w-2 h-2 bg-amber-500 rounded-full" />
+                                        <span className="text-xs text-amber-700 font-medium">Showing {ttsVoices.length} voices for {selectedTtsModel}</span>
                                     </div>
                                 )}
 

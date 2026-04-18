@@ -1,4 +1,4 @@
-﻿import os
+import os
 from pathlib import Path
 
 # Load .env file
@@ -1586,7 +1586,7 @@ async def get_tts_models(provider: str = DEFAULT_TTS_PROVIDER):
 
 
 @app.get("/api/tts/voices")
-async def get_tts_voices(provider: str = DEFAULT_TTS_PROVIDER):
+async def get_tts_voices(provider: str = DEFAULT_TTS_PROVIDER, model: Optional[str] = None):
     provider = normalize_tts_provider(provider, None)
     if provider == "deepgram":
         options = []
@@ -1653,12 +1653,26 @@ async def get_tts_voices(provider: str = DEFAULT_TTS_PROVIDER):
         logger.error(f"Failed to fetch ElevenLabs voices: {e}")
         raise HTTPException(status_code=502, detail="Failed to fetch ElevenLabs voices")
 
+    # Determine if the requested model is v3 (universal — works with all voices)
+    model_lower = (model or "").strip().lower()
+    is_v3_model = "v3" in model_lower if model_lower else False
+
     normalized = []
     for voice in voices:
         voice_id = voice.get("voice_id")
         if not voice_id:
             continue
         labels = voice.get("labels") or {}
+        supported_models = voice.get("high_quality_base_model_ids") or []
+
+        # Model-based filtering:
+        # - v3 is universal (works with ALL voices) → no filtering
+        # - v2/v2.5 models → only show voices that list the model in high_quality_base_model_ids
+        # - Cloned voices (empty supported_models) are always included
+        if model_lower and not is_v3_model and supported_models:
+            if model_lower not in [m.lower() for m in supported_models]:
+                continue
+
         normalized.append(
             {
                 "id": voice_id,
@@ -1668,11 +1682,19 @@ async def get_tts_voices(provider: str = DEFAULT_TTS_PROVIDER):
                 "gender": labels.get("gender") or None,
                 "category": voice.get("category"),
                 "provider": "elevenlabs",
+                "supported_models": supported_models,
             }
         )
 
     normalized.sort(key=lambda item: item["label"].lower())
-    return {"provider": "elevenlabs", "available": True, "missing_env": [], "voices": normalized}
+    return {
+        "provider": "elevenlabs",
+        "available": True,
+        "missing_env": [],
+        "voices": normalized,
+        "model_filter": model or None,
+        "is_v3_universal": is_v3_model,
+    }
 
 
 @app.get("/api/tts/voices/lookup")
