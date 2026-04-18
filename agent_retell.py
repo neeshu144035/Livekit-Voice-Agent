@@ -42,7 +42,7 @@ DASHBOARD_API_URL = os.getenv("DASHBOARD_API_URL", "http://host.docker.internal:
 DEFAULT_WORKER_DISPATCH_NAME = (os.getenv("LIVEKIT_WORKER_AGENT_NAME", "sarah") or "sarah").strip().lower()
 MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "1800"))
 DEFAULT_TTS_PROVIDER = "deepgram"
-DEFAULT_ELEVENLABS_MODEL = "eleven_v3"
+DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
 DEFAULT_AGENT_LLM_TEMPERATURE = 0.2
 DEFAULT_AGENT_VOICE_SPEED = 1.0
 MIN_AGENT_LLM_TEMPERATURE = 0.0
@@ -95,6 +95,15 @@ DEEPGRAM_VOICE_MAP = {
     "michael": "aura-perseus-en",
     "emma": "aura-hera-en",
     "james": "aura-zeus-en",
+}
+
+ELEVENLABS_VOICE_MAP = {
+    "jessica": "EXAVITQu4vr4xnSDxMaL",  # Bella
+    "mark": "TxGEqnHWrfWFTfGW9XjX",  # Josh
+    "sarah": "oWAxZDx7w5VEj9dCyTpo",  # Grace
+    "michael": "NMWYbVa3kjyX8aT8TtW9",  # Dominic
+    "emma": "MF3mGyEYCl7XYWbV9V6O",  # Elli
+    "james": "VR6AewLTigWG4xSOukaG",  # Arnold
 }
 DOUBLE_TEMPLATE_VAR_PATTERN = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 SINGLE_TEMPLATE_VAR_PATTERN = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})")
@@ -2077,6 +2086,8 @@ async def entrypoint(ctx: JobContext):
     # Voice / TTS provider config
     selected_voice = config.get("voice", "jessica")
     tts_provider = normalize_tts_provider(config)
+    if tts_provider == "elevenlabs":
+        selected_voice = ELEVENLABS_VOICE_MAP.get(selected_voice.lower(), selected_voice)
     selected_tts_model = (
         config.get("tts_model")
         or (config.get("custom_params") or {}).get("tts_model")
@@ -2108,23 +2119,64 @@ async def entrypoint(ctx: JobContext):
         if not eleven_key:
             raise RuntimeError("ElevenLabs selected but ELEVEN_API_KEY / ELEVENLABS_API_KEY is not set")
 
-        eleven_kwargs: Dict[str, Any] = {
-            "voice_id": selected_voice,
-            "model": selected_tts_model,
-            "api_key": eleven_key,
-            "enable_logging": True,
-        }
-        if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
-            voice_settings = build_elevenlabs_voice_settings(config, voice_speed)
-            if voice_settings is not None:
-                eleven_kwargs["voice_settings"] = voice_settings
-        if _callable_supports_kwarg(elevenlabs.TTS, "streaming_latency"):
-            eleven_kwargs["streaming_latency"] = _coerce_setting_int(ELEVENLABS_STREAMING_LATENCY, default=2, min_value=0, max_value=4)
-        if _callable_supports_kwarg(elevenlabs.TTS, "auto_mode"):
-            eleven_kwargs["auto_mode"] = ELEVENLABS_AUTO_MODE
+        # livekit-plugins-elevenlabs >=1.4.2 defaults to websocket multi-stream-input.
+        # However, ElevenLabs explicitly disables websockets for eleven_v3, forcing an HTTP fallback.
+        if "v3" in selected_tts_model.lower() and "flash" not in selected_tts_model.lower():
+            logger.info("Using custom HTTP TTS fallback for ElevenLabs v3 model.")
+            import livekit.agents.tts as livekit_tts
+            class ElevenLabsV3HTTPFallback(livekit_tts.TTS):
+                def __init__(self, api_key: str, model: str, voice_id: str):
+                    super().__init__(capabilities=livekit_tts.TTSCapabilities(streaming=False), sample_rate=24000, num_channels=1)
+                    self.api_key = api_key
+                    self.model = model
+                    self.voice_id = voice_id
 
-        tts_engine = elevenlabs.TTS(**eleven_kwargs)
-        resolved_voice_id = selected_voice
+                def synthesize(self, text: str) -> livekit_tts.ChunkedStream:
+                    class _Stream(livekit_tts.ChunkedStream):
+                        def __init__(self, tts_model, text):
+                            super().__init__(tts_model, text)
+                            self.tts_model = tts_model
+                            
+                        async def _main_task(self):
+                            url = f"https://api.elevenlabs.io/v1/text-to-speech/{self.tts_model.voice_id}?model_id={self.tts_model.model}&output_format=pcm_24000"
+                            headers = {"xi-api-key": self.tts_model.api_key, "Content-Type": "application/json"}
+                            import aiohttp
+                            from livekit.rtc import AudioFrame
+                            async with aiohttp.ClientSession() as session:
+                                async with session.post(url, headers=headers, json={"text": self._text}) as resp:
+                                    if resp.status != 200:
+                                        logger.error(f"ElevenLabs HTTP TTS failed: {resp.status}")
+                                        return
+                                    async for chunk in resp.content.iter_chunked(4096):
+                                        frame = AudioFrame(chunk, 24000, 1, len(chunk)//2)
+                                        self._event_ch.send_nowait(livekit_tts.SynthesizedAudio(request_id=self.request_id, frame=frame))
+                    return _Stream(self, text)
+                    
+            tts_engine = ElevenLabsV3HTTPFallback(api_key=eleven_key, model=selected_tts_model, voice_id=selected_voice)
+            resolved_voice_id = selected_voice
+        else:
+            eleven_kwargs: Dict[str, Any] = {
+                "voice_id": selected_voice,
+                "model": selected_tts_model,
+                "api_key": eleven_key,
+                "enable_logging": True,
+            }
+            if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
+                voice_settings = build_elevenlabs_voice_settings(config, voice_speed)
+                if voice_settings is not None:
+                    eleven_kwargs["voice_settings"] = voice_settings
+            if _callable_supports_kwarg(elevenlabs.TTS, "streaming_latency"):
+                eleven_kwargs["streaming_latency"] = _coerce_setting_int(ELEVENLABS_STREAMING_LATENCY, default=2, min_value=0, max_value=4)
+            if _callable_supports_kwarg(elevenlabs.TTS, "auto_mode"):
+                eleven_kwargs["auto_mode"] = ELEVENLABS_AUTO_MODE
+            tts_engine = elevenlabs.TTS(**eleven_kwargs)
+            resolved_voice_id = selected_voice
+
+        logger.info(
+            "TTS initialized: provider=elevenlabs, model=%s, voice=%s",
+            selected_tts_model,
+            selected_voice,
+        )
 
     if tts_provider == "deepgram":
         mapped_voice = DEEPGRAM_VOICE_MAP.get(str(selected_voice).lower(), selected_voice)
