@@ -2124,17 +2124,17 @@ async def entrypoint(ctx: JobContext):
         # For v2/v2.5, use the standard plugin with websocket streaming for low latency.
         is_v3_model = "v3" in selected_tts_model.lower() and "flash" not in selected_tts_model.lower()
         
+        eleven_voice = elevenlabs.Voice(id=selected_voice, name="", category="generated")
+        if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
+            eleven_voice.settings = build_elevenlabs_voice_settings(config, voice_speed)
+            
         eleven_kwargs: Dict[str, Any] = {
-            "voice_id": selected_voice,
-            "model": selected_tts_model,
+            "voice": eleven_voice,
+            "model_id": selected_tts_model,
             "api_key": eleven_key,
             "enable_ssml_parsing": True,
             "enable_logging": True,
         }
-        if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
-            voice_settings = build_elevenlabs_voice_settings(config, voice_speed)
-            if voice_settings is not None:
-                eleven_kwargs["voice_settings"] = voice_settings
         if not is_v3_model and _callable_supports_kwarg(elevenlabs.TTS, "streaming_latency"):
             eleven_kwargs["streaming_latency"] = _coerce_setting_int(ELEVENLABS_STREAMING_LATENCY, default=2, min_value=0, max_value=4)
         if not is_v3_model and _callable_supports_kwarg(elevenlabs.TTS, "auto_mode"):
