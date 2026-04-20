@@ -77,8 +77,8 @@ OPENAI_REALTIME_SILENCE_DURATION_MS = int(os.getenv("OPENAI_REALTIME_SILENCE_DUR
 INITIAL_GREETING_WAIT_FOR_PARTICIPANT_SEC = float(os.getenv("INITIAL_GREETING_WAIT_FOR_PARTICIPANT_SEC", "20"))
 STRICT_PROMPT_TOOL_FILTER = os.getenv("STRICT_PROMPT_TOOL_FILTER", "1").strip().lower() not in {"0", "false", "no", "off"}
 USE_DISPATCH_NAME_INBOUND_FALLBACK = os.getenv("USE_DISPATCH_NAME_INBOUND_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}
-DEEPGRAM_STT_PHONE_MODEL = (os.getenv("DEEPGRAM_STT_PHONE_MODEL", "nova-3") or "nova-3").strip()
-DEEPGRAM_STT_WEB_MODEL = (os.getenv("DEEPGRAM_STT_WEB_MODEL", "nova-3") or "nova-3").strip()
+DEEPGRAM_STT_PHONE_MODEL = (os.getenv("DEEPGRAM_STT_PHONE_MODEL", "nova-2") or "nova-2").strip()
+DEEPGRAM_STT_WEB_MODEL = (os.getenv("DEEPGRAM_STT_WEB_MODEL", "nova-2") or "nova-2").strip()
 
 _dashboard_api_client: Optional[httpx.AsyncClient] = None
 
