@@ -106,7 +106,9 @@ const SUPPORTED_LANGUAGE_OPTIONS = [
     ...LANGUAGE_OPTIONS,
     { value: 'en-IN', label: 'English (India)', flag: '' },
     { value: 'hi', label: 'Hindi', flag: '' },
+    { value: 'hi-IN', label: 'Hindi (India)', flag: '' },
     { value: 'ml', label: 'Malayalam', flag: '' },
+    { value: 'ml-IN', label: 'Malayalam (India)', flag: '' },
     { value: 'multi', label: 'Multilingual (Auto)', flag: '' },
 ];
 

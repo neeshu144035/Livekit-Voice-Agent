@@ -91,7 +91,9 @@ const SUPPORTED_LANGUAGE_OPTIONS = [
     { value: 'de', label: 'German' },
     { value: 'it', label: 'Italian' },
     { value: 'hi', label: 'Hindi' },
+    { value: 'hi-IN', label: 'Hindi (India)' },
     { value: 'ml', label: 'Malayalam' },
+    { value: 'ml-IN', label: 'Malayalam (India)' },
     { value: 'multi', label: 'Multilingual (Auto)' },
 ];
 

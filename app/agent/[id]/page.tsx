@@ -168,7 +168,9 @@ const LANGUAGE_OPTIONS = [
     { value: 'de', label: 'German', flag: '🇩🇪' },
     { value: 'it', label: 'Italian', flag: '🇮🇹' },
     { value: 'hi', label: 'Hindi', flag: '🇮🇳' },
+    { value: 'hi-IN', label: 'Hindi (India)', flag: '🇮🇳' },
     { value: 'ml', label: 'Malayalam', flag: '🇮🇳' },
+    { value: 'ml-IN', label: 'Malayalam (India)', flag: '🇮🇳' },
 ];
 
 const SUPPORTED_LANGUAGE_OPTIONS = [
