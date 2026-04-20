@@ -665,16 +665,27 @@ The frontend is built on Windows and only the `.next` artifact is pushed to the 
 This deploy requires [`livekit-company-key.pem`](livekit-company-key.pem).
 
 ```powershell
+# Step 1: Clean and rebuild locally
 cd C:\LiveKit-Project
 Remove-Item -Recurse -Force .next -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force C:\Temp\next-deploy -ErrorAction SilentlyContinue
 npm run build
-# If Turbopack panics on Windows, fallback:
-# npx next build --webpack
-Copy-Item -Recurse .next C:\Temp\next-deploy
-tar -czf C:\Temp\next-deploy.tar.gz -C C:\Temp next-deploy
-scp -i "C:\LiveKit-Project\livekit-company-key.pem" C:\Temp\next-deploy.tar.gz ubuntu@13.135.81.172:/tmp/
-ssh -i "C:\LiveKit-Project\livekit-company-key.pem" ubuntu@13.135.81.172 "cd /var/www/html && sudo rm -rf .next && sudo mkdir .next && cd .next && sudo tar -xzf /tmp/next-deploy.tar.gz && sudo mv next-deploy/* . && sudo rm -rf next-deploy && sudo chown -R www-data:www-data . && sudo pm2 restart nextjs"
+
+# Step 2: Copy .next to temp and create tar (using /tmp for Linux path)
+Remove-Item -Recurse -Force C:\Temp\next-deploy -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path C:\Temp\next-deploy -Force
+Copy-Item -Path .next\* -Destination C:\Temp\next-deploy\ -Recurse -Force
+
+# Step 3: Create tar.gz in /tmp (Linux)
+cd /tmp && rm -f next-deploy.tar.gz && tar -czf next-deploy.tar.gz next-deploy
+
+# Step 4: Upload to VPS
+scp -i C:\LiveKit-Project\livekit-company-key.pem /tmp/next-deploy.tar.gz ubuntu@13.135.81.172:/tmp/
+
+# Step 5: Extract on VPS (critical: ensure fresh .next folder)
+ssh -i C:\LiveKit-Project\livekit-company-key.pem ubuntu@13.135.81.172 "cd /var/www/html && sudo rm -rf .next && sudo mkdir .next && cd .next && sudo tar -xzf /tmp/next-deploy.tar.gz && sudo mv next-deploy/* . && sudo rm -rf next-deploy && sudo chown -R www-data:www-data . && sudo pm2 restart nextjs"
+
+# Step 6: Verify (check BUILD_ID matches local)
+ssh -i C:\LiveKit-Project\livekit-company-key.pem ubuntu@13.135.81.172 "cat /var/www/html/.next/BUILD_ID"
 ```
 
 **Verification:**
@@ -861,16 +872,25 @@ redis-cli KEYS "agent:*"
 
 #### Frontend (`.next` artifact only)
 ```powershell
+# Clean and rebuild locally
 cd C:\LiveKit-Project
 Remove-Item -Recurse -Force .next -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force C:\Temp\next-deploy -ErrorAction SilentlyContinue
 npm run build
-# If Turbopack panics on Windows, fallback:
-# npx next build --webpack
-Copy-Item -Recurse .next C:\Temp\next-deploy
-tar -czf C:\Temp\next-deploy.tar.gz -C C:\Temp next-deploy
-scp -i "C:\LiveKit-Project\livekit-company-key.pem" C:\Temp\next-deploy.tar.gz ubuntu@13.135.81.172:/tmp/
-ssh -i "C:\LiveKit-Project\livekit-company-key.pem" ubuntu@13.135.81.172 "cd /var/www/html && sudo rm -rf .next && sudo mkdir .next && cd .next && sudo tar -xzf /tmp/next-deploy.tar.gz && sudo mv next-deploy/* . && sudo rm -rf next-deploy && sudo chown -R www-data:www-data . && sudo pm2 restart nextjs"
+
+# Copy to temp and create tar (Linux path /tmp)
+Remove-Item -Recurse -Force C:\Temp\next-deploy -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path C:\Temp\next-deploy -Force
+Copy-Item -Path .next\* -Destination C:\Temp\next-deploy\ -Recurse -Force
+
+# Create tar.gz in /tmp
+cd /tmp && rm -f next-deploy.tar.gz && tar -czf next-deploy.tar.gz next-deploy
+
+# Upload and deploy
+scp -i C:\LiveKit-Project\livekit-company-key.pem /tmp/next-deploy.tar.gz ubuntu@13.135.81.172:/tmp/
+ssh -i C:\LiveKit-Project\livekit-company-key.pem ubuntu@13.135.81.172 "cd /var/www/html && sudo rm -rf .next && sudo mkdir .next && cd .next && sudo tar -xzf /tmp/next-deploy.tar.gz && sudo mv next-deploy/* . && sudo rm -rf next-deploy && sudo chown -R www-data:www-data . && sudo pm2 restart nextjs"
+
+# Verify
+ssh -i C:\LiveKit-Project\livekit-company-key.pem ubuntu@13.135.81.172 "cat /var/www/html/.next/BUILD_ID"
 ```
 
 #### Voice Agent (`agent_retell.py`)
