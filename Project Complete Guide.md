@@ -12,6 +12,8 @@
 9. [Deployment Guide](#deployment-guide)
 10. [Common Issues & Debugging](#common-issues--debugging)
 11. [Latest Production Updates (March 2026)](#latest-production-updates-march-2026)
+12. [Explicit Runtime Control (April 2026)](#explicit-runtime-control-april-2026)
+13. [Project State Summary (April 2026)](#project-state-summary-april-2026)
 
 ---
 
@@ -598,82 +600,170 @@ async def entrypoint(ctx: JobContext):
 
 ## Deployment Guide
 
-### Docker Compose
+### Deployment Topology Used In This Repo
 
-```yaml
-version: '3.8'
-services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: pass
-      POSTGRES_DB: voiceai
-    volumes:
-      - pgdata:/var/lib/postgresql/data
+This repository does **not** use one single deployment method for every component. The current production layout is:
 
-  redis:
-    image: redis:7-alpine
+1. **Frontend dashboard (Next.js)**  
+   - Built locally with `npm run build`
+   - Only the `.next` build artifact is uploaded to the VPS
+   - The VPS serves/restarts the frontend with **PM2** (`nextjs` process)
 
-  livekit:
-    image: livekit/livekit-server
-    ports:
-      - "7880:7880"
-      - "7881:7881"
-      - "50000-50100:50000-50100/udp"
-    volumes:
-      - ./livekit.yaml:/etc/livekit.yaml
-    command: --config /etc/livekit.yaml
+2. **Backend API (FastAPI)**  
+   - Source file is synced to the VPS under `~/livekit-dashboard-api/`
+   - Process is restarted with **PM2** (`api` process)
 
-  backend:
-    build: ./backend
-    ports:
-      - "8000:8000"
-    depends_on:
-      - postgres
-      - redis
-    environment:
-      - DATABASE_URL=postgresql://user:pass@postgres:5432/voiceai
-      - REDIS_URL=redis://redis:6379
+3. **Voice agent runtime (`agent_retell.py`)**  
+   - Source file is synced to the VPS under `~/livekit-agent/`
+   - Container is rebuilt/restarted with **Docker Compose**
 
-  agent:
-    build: ./agent
-    deploy:
-      replicas: 10
-    environment:
-      - LIVEKIT_URL=ws://livekit:7880
-      - DATABASE_URL=postgresql://user:pass@postgres:5432/voiceai
+4. **LiveKit / SIP / supporting infra**  
+   - Containerized with Docker Compose
+   - Repo contains both [`docker-compose.yml`](docker-compose.yml) and [`docker-compose.production.yml`](docker-compose.production.yml)
 
-volumes:
-  pgdata:
+The important point is that production is a **hybrid deployment**: PM2 for frontend/backend app processes, Docker Compose for the voice/media stack.
+
+### Compose Files In The Repo
+
+#### Local / simpler stack: `docker-compose.yml`
+
+[`docker-compose.yml`](docker-compose.yml) is the smaller stack used for local/self-hosted bring-up. It includes:
+
+- `redis`
+- `livekit-server`
+- `livekit-sip`
+- `voice-agent`
+- `postgres`
+
+This file is useful for local testing and single-host setup, especially when the backend is reachable from the agent via:
+
+```env
+DASHBOARD_API_URL=http://host.docker.internal:8000
 ```
 
-### Build & Deploy
+#### Production-oriented stack: `docker-compose.production.yml`
 
-```bash
-# Build all images
-docker-compose build
+[`docker-compose.production.yml`](docker-compose.production.yml) is the closer representation of the VPS/container deployment. It adds production-specific details such as:
 
-# Start services
-docker-compose up -d
+- health checks
+- explicit container names
+- `backend-api` service wiring
+- multiple voice agent containers (`voice-agent-1`, `voice-agent-2`, `voice-agent-3`)
+- `minio` for recordings
+- `livekit-server` launched with `--node-ip=13.135.81.172`
 
-# Scale agents
-docker-compose up -d --scale agent=20
-```
+This is the better reference when documenting infra topology, but the current day-to-day deploy flow below is still the authoritative operational workflow.
 
-### Frontend Deployment
+### Current Production Deploy Flow
 
-```bash
-# Build Next.js
+Before running any of the VPS deploy commands below, make sure the SSH private key file [`livekit-company-key.pem`](livekit-company-key.pem) is available locally. This key is used by `scp` and `ssh` to authenticate to the production server.
+
+#### 1. Frontend Dashboard (Next.js via PM2)
+
+The frontend is built on Windows and only the `.next` artifact is pushed to the VPS.
+
+This deploy requires [`livekit-company-key.pem`](livekit-company-key.pem).
+
+```powershell
+cd C:\LiveKit-Project
+Remove-Item -Recurse -Force .next -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force C:\Temp\next-deploy -ErrorAction SilentlyContinue
 npm run build
-
-# Deploy to server
-scp -r .next user@server:/var/www/html/
-
-# Or use Docker for frontend
-docker build -t frontend .
-docker run -d -p 3000:3000 -v /var/www/html/.next:/app/.next frontend
+# If Turbopack panics on Windows, fallback:
+# npx next build --webpack
+Copy-Item -Recurse .next C:\Temp\next-deploy
+tar -czf C:\Temp\next-deploy.tar.gz -C C:\Temp next-deploy
+scp -i "C:\LiveKit-Project\livekit-company-key.pem" C:\Temp\next-deploy.tar.gz ubuntu@13.135.81.172:/tmp/
+ssh -i "C:\LiveKit-Project\livekit-company-key.pem" ubuntu@13.135.81.172 "cd /var/www/html && sudo rm -rf .next && sudo mkdir .next && cd .next && sudo tar -xzf /tmp/next-deploy.tar.gz && sudo mv next-deploy/* . && sudo rm -rf next-deploy && sudo chown -R www-data:www-data . && sudo pm2 restart nextjs"
 ```
+
+**Verification:**
+- confirm build completed locally
+- confirm `.next` exists on VPS under `/var/www/html/.next`
+- confirm PM2 restart succeeds for `nextjs`
+
+#### 2. Voice Agent Runtime (`agent_retell.py`)
+
+The production voice agent entrypoint is currently [`agent_retell.py`](agent_retell.py). The deploy flow is file sync + container rebuild:
+
+This deploy requires [`livekit-company-key.pem`](livekit-company-key.pem).
+
+```bash
+scp -i livekit-company-key.pem agent_retell.py ubuntu@13.135.81.172:~/livekit-agent/agent_retell.py
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "cd ~/livekit-agent && docker compose up -d --build voice-agent"
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "docker logs --tail 80 voice-agent"
+```
+
+**What this does:**
+- uploads the latest runtime logic
+- rebuilds the `voice-agent` container
+- tails recent logs for smoke validation
+
+#### 3. Backend API (`backend/main.py`)
+
+The current operational backend deploy is a targeted sync of [`backend/main.py`](backend/main.py) followed by PM2 restart:
+
+This deploy requires [`livekit-company-key.pem`](livekit-company-key.pem).
+
+```bash
+scp -i livekit-company-key.pem backend/main.py ubuntu@13.135.81.172:~/livekit-dashboard-api/main.py
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "sudo pm2 restart api --update-env"
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "curl -s http://127.0.0.1:8000/health"
+```
+
+**Verification:**
+- PM2 process `api` restarts cleanly
+- local VPS health endpoint returns success on `127.0.0.1:8000/health`
+
+### Runtime Environment Notes
+
+The current agent runtime relies on environment tuning like:
+
+```env
+STRICT_PROTOOL_FILTER=1
+DISCONNECT_GRACE_SEC=20
+CHAT_REPLY_TIMEOUT_SEC=40
+END_CALL_DISCONNECT_DELAY_SEC=1.0
+TRANSFER_HANDOFF_DELAY_SEC=2.5
+SILENCE_REPROMPT_SEC=20
+STT_ENDPOINTING_PHONE_MS=120
+STT_ENDPOINTING_WEB_MS=80
+VAD_MIN_SPEECH_DURATION=0.04
+VAD_MIN_SILENCE_DURATION=0.30
+VAD_PREFIX_PADDING_DURATION=0.35
+ELEVENLABS_STREAMING_LATENCY=2
+ELEVENLABS_AUTO_MODE=1
+OPENAI_REASONING_EFFORT=low
+OPENAI_VERBOSITY=low
+OPENAI_MAX_COMPLETION_TOKENS=220
+```
+
+These values are particularly relevant to [`agent_retell.py`](agent_retell.py), where latency, silence handling, greeting behavior, and OpenAI/ElevenLabs runtime tuning are applied.
+
+### Recommended Post-Deploy Smoke Checks
+
+After any production deploy, run the checks that match the component you changed:
+
+```bash
+# Backend health
+curl -s http://127.0.0.1:8000/health
+
+# Voice agent logs
+docker logs --tail 80 voice-agent
+
+# PM2 status
+pm2 status
+```
+
+For frontend deploys, also verify the dashboard loads and key pages render without a blank screen.  
+For backend deploys, validate agent list / call history endpoints.  
+For voice-agent deploys, place at least one web or phone test call and confirm transcript + cost data continue to populate.
+
+### Practical Notes
+
+- Treat the PM2 + targeted file sync flow as the **authoritative production runbook** right now.
+- Treat the compose files as the **infrastructure reference** for service topology and local/containerized environments.
+- Do not assume the generic idea of "docker-compose up everything" matches the current VPS rollout, because frontend and backend are not currently deployed that way.
 
 ---
 
@@ -845,7 +935,165 @@ OPENAI_MAX_COMPLETION_TOKENS=220
     - **Frontend**: Dashboard built locally, zipped, and deployed to VPS `/var/www/html/` with `.next` replacement.
     - **Agent**: Docker container rebuilt with updated prompt logic and restarted.
 
+---
+
+### Explicit Runtime Control (April 20, 2026)
+
+#### Backend/Runtime Behavior Changes
+- **Agent settings now drive runtime behavior**: The backend and voice agent runtime now follow only what the app saves, eliminating hidden defaults:
+  - [`agent_retell.py:279`](agent_retell.py) - `voice_runtime_mode` is resolved from saved config only, no longer forced by env/defaults
+  - [`agent_retell.py:287`](agent_retell.py) - `voice_realtime_model` is read from saved config only
+  - ElevenLabs models are no longer auto-swapped; the app's explicit selection is honored
+  - Greeting path no longer invents a fallback script - uses what's saved
+
+- **Safe latency optimizations retained** (do not rewrite config):
+  - [`agent_retell.py:269`](agent_retell.py) - Pooled dashboard HTTP clients for faster API calls
+  - [`agent_retell.py:2144`](agent_retell.py) - Parallel config/function fetches at call start
+
+- **Explicit ElevenLabs model required**:
+  - [`backend/main.py:1276`](backend/main.py) - Create/update now require an explicit ElevenLabs `tts_model`
+  - API no longer advertises a default ElevenLabs model
+  - Backend validates: `tts_model must be explicitly selected in the app when tts_provider=elevenlabs`
+
+- **LLM defaults reverted to Moonshot**:
+  - [`backend/main.py:87`](backend/main.py) - `llm_model` defaults to `moonshot-v1-8k`
+  - [`CreateAgentWizard.tsx:227`](components/CreateAgentWizard.tsx) - Default LLM is `moonshot-v1-8k`
+  - [`app/agent/[id]/page.tsx:269`](app/agent/[id]/page.tsx) - Default LLM is `moonshot-v1-8k`
+
+#### Frontend/UI Changes
+- **Voice Runtime mode explicitly exposed**:
+  - [`CreateAgentModal.tsx:541`](components/CreateAgentModal.tsx) - Voice Runtime dropdown (Pipeline / Realtime text + TTS)
+  - [`CreateAgentWizard.tsx:678`](components/CreateAgentWizard.tsx) - Voice Runtime dropdown
+  - [`app/agent/[id]/page.tsx:1116`](app/agent/[id]/page.tsx) - Voice Runtime dropdown
+
+- **Explicit ElevenLabs model/voice selection**:
+  - Users must explicitly select ElevenLabs TTS model and voice
+  - No more auto-switching provider/model behind the user's back
+  - Warning displayed when `eleven_v3` is selected (slower HTTP path vs WebSocket)
+
+#### Important Constraint
+- If the user explicitly selects `eleven_v3`, the backend will honor it, but live latency will still be higher because ElevenLabs v3 uses the slower HTTP/non-WebSocket path.
+
+#### Current Docs Checked (April 20, 2026)
+- LiveKit Realtime plugin
+- OpenAI Realtime VAD
+- ElevenLabs models
+- ElevenLabs WebSockets
+
+---
+
 ### Future Roadmap
 - [ ] Implement Tamil, Telugu, and Kannada regional support.
 - [ ] Validate ElevenLabs V3 expressive voices for non-English dialects.
 - [ ] Add latency benchmarks for Indian subcontinent API routing.
+
+---
+
+## Project State Summary (April 20, 2026)
+
+### Chat Summary
+- The main goal of the latest work was to make sure the app's selected settings actually control backend/runtime behavior for real-time calls and webcalls, instead of the runtime silently using older defaults.
+- The focus areas were:
+  - deployment documentation cleanup
+  - explicit use of `livekit-company-key.pem` in deploy steps
+  - ElevenLabs v3 verification
+  - multilingual language support
+  - Malayalam support
+  - command-based verification without relying on browser testing
+
+### What Was Updated In Code
+- [`backend/main.py`](backend/main.py)
+  - Call metadata is now populated from the saved agent configuration at call creation time.
+  - Webcalls now persist selected values such as `tts_provider`, `tts_model`, `language`, `voice`, `voice_speed`, and `llm_temperature` immediately.
+  - Usage updates were extended so later syncs can also store effective `language` and `tts_voice_id_used`.
+  - **NEW**: Create/update now require explicit ElevenLabs `tts_model`; no default advertised
+  - **NEW**: LLM default reverted to `moonshot-v1-8k`
+- [`agent_retell.py`](agent_retell.py)
+  - ElevenLabs `eleven_v3` is now the preferred multilingual/expressive TTS path.
+  - Added `multi` language support for multilingual mode.
+  - Added stronger language enforcement so the assistant answers in the chosen language.
+  - Malayalam now falls back through multilingual STT mode rather than staying on a weaker unsupported path.
+  - Added runtime protections to prevent speech output from reading unresolved placeholders like `{{name}}` or raw tags like `<break ...>`.
+  - Reduced forced low-token phone behavior unless explicitly enabled, which should help speech feel less clipped.
+  - **NEW**: `voice_runtime_mode` and `voice_realtime_model` read from saved config only
+  - **NEW**: No auto-swapping of ElevenLabs models - app selection is honored
+  - **NEW**: Greeting uses saved script, no fallback invention
+  - **RETAINED**: Pooled HTTP clients and parallel config/function fetches (latency wins)
+- Frontend/editor-side updates were also made in:
+  - [`app/agent/[id]/page.tsx`](app/agent/[id]/page.tsx)
+  - [`components/CreateAgentWizard.tsx`](components/CreateAgentWizard.tsx)
+  - [`components/CreateAgentModal.tsx`](components/CreateAgentModal.tsx)
+  - [`components/VoiceCallModal.tsx`](components/VoiceCallModal.tsx)
+  - **NEW**: Voice Runtime mode (Pipeline / Realtime text + TTS) explicitly exposed
+  - **NEW**: Explicit ElevenLabs model/voice selection required
+  - **NEW**: Warning shown for `eleven_v3` (slower HTTP path)
+- Language options now include a multilingual selection similar to Retell-style language switching:
+  - `Multilingual (Auto)`
+  - plus UK English, Hindi, Malayalam, and the other existing locale choices
+
+### Deployment And VPS Update
+- The deployment guide was updated to reflect the real hybrid production model:
+  - frontend/backend managed on the VPS with PM2
+  - voice/media stack managed with Docker Compose
+- The deployment section now explicitly mentions the SSH key:
+  - [`livekit-company-key.pem`](livekit-company-key.pem)
+- Backend and worker code were synced to the VPS and restarted successfully during verification.
+
+### Verification Completed With Commands
+- Local verification completed successfully:
+  - `python -m py_compile backend/main.py agent_retell.py`
+  - `npx tsc --noEmit`
+- Remote/VPS verification completed with command-line checks:
+  - `curl http://127.0.0.1:8000/api/agents/21`
+  - `curl http://127.0.0.1:8000/api/token/21`
+  - `curl http://127.0.0.1:8000/api/call-history/<call_id>/details`
+  - `docker compose up -d --build voice-agent`
+
+### Last Webcall Verification
+- Recent agent `21` webcalls on April 20, 2026 were verified to use ElevenLabs v3, not v2.5:
+  - `call_21_733f3ec74135435f`
+  - `call_21_a83d9a8012b840ba`
+- An earlier call on the same date still showed `deepgram`, which confirms pre-fix mixed behavior:
+  - `call_21_275da76623d046ff`
+- A fresh token-generated webcall on April 20, 2026 created `call_21_ff7428538e294260`, and its metadata immediately showed:
+  - `tts_provider=elevenlabs`
+  - `tts_model=eleven_v3`
+  - `language=hi`
+  - `voice_speed=1.0`
+  - `llm_temperature=0.85`
+
+### Current Limitation
+- Malayalam TTS is supported with ElevenLabs v3.
+- Malayalam live understanding is still limited by the current real-time STT path.
+- The runtime now falls back to multilingual STT mode for Malayalam, which is better than the old behavior, but it is not yet equal to strong native Malayalam real-time recognition.
+
+### Best Next Improvements
+- Clean saved agent prompts so they use natural spoken punctuation instead of literal tags or placeholder-heavy formatting.
+- Improve multilingual STT if Malayalam understanding needs to be production-grade.
+- Add per-language prompt and pacing presets for more human-sounding delivery.
+
+### Suggested Prompt For A New Chat
+```text
+Continue from the April 20, 2026 LiveKit project state in C:\LiveKit-Project.
+
+Current known state after latest deploy:
+- backend/main.py and agent_retell.py updated so app-selected settings control runtime (voice_runtime_mode, voice_realtime_model, ElevenLabs model, greeting)
+- explicit ElevenLabs tts_model required on create/update; no auto-swapping
+- LLM default reverted to moonshot-v1-8k
+- frontend (CreateAgentModal, CreateAgentWizard, agent page) exposes Voice Runtime mode explicitly
+- safe latency wins retained: pooled HTTP clients, parallel config/function fetches
+- Voice agent container rebuilt and restarted
+- PM2 frontend/backend restarted
+- curl health check passed
+
+Prior verified state:
+- agent 21 webcalls use ElevenLabs eleven_v3
+- multilingual mode, Hindi, Malayalam, UK English supported
+- deployment is hybrid: PM2 for frontend/backend, Docker Compose for voice-agent
+
+Please verify with commands:
+- python -m py_compile backend/main.py agent_retell.py
+- npx tsc --noEmit
+- curl http://127.0.0.1:8000/health
+- docker logs --tail 20 voice-agent
+```

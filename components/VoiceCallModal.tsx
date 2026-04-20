@@ -28,6 +28,7 @@ interface VoiceCallModalProps {
 
 export default function VoiceCallModal({ isOpen, onClose, agentId, agentName }: VoiceCallModalProps) {
   const [token, setToken] = useState<string | null>(null);
+  const [livekitUrl, setLivekitUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isCallActive, setIsCallActive] = useState(false);
@@ -68,6 +69,7 @@ export default function VoiceCallModal({ isOpen, onClose, agentId, agentName }: 
     try {
       const res = await axios.get(`${API_URL}token/${agentId}`);
       setToken(res.data.token);
+      setLivekitUrl(res.data.livekit_url || null);
     } catch (err: any) {
       console.error('Error fetching token:', err);
       setError(err.response?.data?.detail || 'Failed to fetch call token. Please try again.');
@@ -84,7 +86,7 @@ export default function VoiceCallModal({ isOpen, onClose, agentId, agentName }: 
     setError(null);
 
     try {
-      const LIVEKIT_URL = process.env.NEXT_PUBLIC_LIVEKIT_URL || 'wss://13.135.81.172:7880';
+      const LIVEKIT_URL = livekitUrl || process.env.NEXT_PUBLIC_LIVEKIT_URL || 'wss://13.135.81.172:7880';
 
       const room = new Room({
         audioCaptureDefaults: {

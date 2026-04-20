@@ -68,17 +68,19 @@ ELEVENLABS_AUTO_MODE = os.getenv("ELEVENLABS_AUTO_MODE", "1").strip().lower() in
 DEFAULT_OPENAI_REASONING_EFFORT = (os.getenv("OPENAI_REASONING_EFFORT", "low") or "low").strip().lower()
 DEFAULT_OPENAI_VERBOSITY = (os.getenv("OPENAI_VERBOSITY", "low") or "low").strip().lower()
 DEFAULT_OPENAI_MAX_COMPLETION_TOKENS = int(os.getenv("OPENAI_MAX_COMPLETION_TOKENS", "220"))
-PHONE_LOW_LATENCY_LLM_ENABLED = os.getenv("PHONE_LOW_LATENCY_LLM_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
-PHONE_LOW_LATENCY_LLM_MODEL = (os.getenv("PHONE_LOW_LATENCY_LLM_MODEL", "gpt-4o-mini") or "gpt-4o-mini").strip()
 PHONE_LOW_LATENCY_MAX_TOKENS = int(os.getenv("PHONE_LOW_LATENCY_MAX_TOKENS", "80"))
-PHONE_LOW_LATENCY_LLM_OVERRIDE_ENABLED = os.getenv("PHONE_LOW_LATENCY_LLM_OVERRIDE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-PHONE_LOW_LATENCY_TTS_OVERRIDE_ENABLED = os.getenv("PHONE_LOW_LATENCY_TTS_OVERRIDE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-PHONE_LOW_LATENCY_TTS_MODEL = (os.getenv("PHONE_LOW_LATENCY_TTS_MODEL", DEFAULT_ELEVENLABS_MODEL) or DEFAULT_ELEVENLABS_MODEL).strip()
+OPENAI_REALTIME_TURN_MODE = (os.getenv("OPENAI_REALTIME_TURN_MODE", "server_vad") or "server_vad").strip().lower()
+OPENAI_REALTIME_SEMANTIC_EAGERNESS = (os.getenv("OPENAI_REALTIME_SEMANTIC_EAGERNESS", "high") or "high").strip().lower()
+OPENAI_REALTIME_VAD_THRESHOLD = float(os.getenv("OPENAI_REALTIME_VAD_THRESHOLD", "0.45"))
+OPENAI_REALTIME_PREFIX_PADDING_MS = int(os.getenv("OPENAI_REALTIME_PREFIX_PADDING_MS", "150"))
+OPENAI_REALTIME_SILENCE_DURATION_MS = int(os.getenv("OPENAI_REALTIME_SILENCE_DURATION_MS", "200"))
 INITIAL_GREETING_WAIT_FOR_PARTICIPANT_SEC = float(os.getenv("INITIAL_GREETING_WAIT_FOR_PARTICIPANT_SEC", "20"))
 STRICT_PROMPT_TOOL_FILTER = os.getenv("STRICT_PROMPT_TOOL_FILTER", "1").strip().lower() not in {"0", "false", "no", "off"}
 USE_DISPATCH_NAME_INBOUND_FALLBACK = os.getenv("USE_DISPATCH_NAME_INBOUND_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}
 DEEPGRAM_STT_PHONE_MODEL = (os.getenv("DEEPGRAM_STT_PHONE_MODEL", "nova-3") or "nova-3").strip()
 DEEPGRAM_STT_WEB_MODEL = (os.getenv("DEEPGRAM_STT_WEB_MODEL", "nova-3") or "nova-3").strip()
+
+_dashboard_api_client: Optional[httpx.AsyncClient] = None
 
 EMAIL_SPELLING_POLICY = (
     "STRICT SPELLING RULES:\n"
@@ -108,9 +110,107 @@ ELEVENLABS_VOICE_MAP = {
 DOUBLE_TEMPLATE_VAR_PATTERN = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 SINGLE_TEMPLATE_VAR_PATTERN = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})")
 
+ELEVENLABS_V3_REQUIRED_LANGUAGES = {"ml", "ml-IN", "multi"}
+LANGUAGE_NAME_MAP = {
+    "en": "English",
+    "en-US": "English (US)",
+    "en-GB": "English (UK)",
+    "en-AU": "English (Australia)",
+    "en-IN": "English (India)",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "hi": "Hindi",
+    "hi-IN": "Hindi",
+    "ml": "Malayalam",
+    "ml-IN": "Malayalam",
+    "multi": "Multilingual",
+}
+
 
 def get_elevenlabs_api_key() -> str:
     return (os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY") or "").strip()
+
+
+def normalize_agent_language(language: Any, default: str = "en-GB") -> str:
+    candidate = str(language or "").strip()
+    return candidate or default
+
+
+def is_elevenlabs_v3_model(model_id: Any) -> bool:
+    candidate = str(model_id or "").strip().lower()
+    return "v3" in candidate and "flash" not in candidate
+
+
+def resolve_elevenlabs_tts_model_for_language(model_id: Any, language: Any) -> str:
+    requested_model = str(model_id or "").strip()
+    if requested_model:
+        return requested_model
+    raise RuntimeError(
+        f"ElevenLabs selected but no tts_model was saved in the app for language={normalize_agent_language(language)}"
+    )
+
+
+def resolve_stt_language(language: Any) -> str:
+    normalized_language = normalize_agent_language(language)
+    if normalized_language == "multi":
+        return "multi"
+    if normalized_language in {"ml", "ml-IN"}:
+        logger.warning(
+            "Malayalam selected, but the current Deepgram streaming STT path does not natively support Malayalam. "
+            "Using language=multi as the safest real-time fallback while ElevenLabs v3 handles multilingual TTS."
+        )
+        return "multi"
+    return normalized_language
+
+
+def build_language_enforcement_instruction(language: Any) -> str:
+    normalized_language = normalize_agent_language(language, default="")
+    if normalized_language in {"hi", "hi-IN"}:
+        return (
+            "CRITICAL SYSTEM INSTRUCTION: You must strictly speak and respond ONLY in Hindi natively. "
+            "Do not use English unless strictly necessary for names or technical terms."
+        )
+    if normalized_language in {"ml", "ml-IN"}:
+        return (
+            "CRITICAL SYSTEM INSTRUCTION: You must strictly speak and respond ONLY in Malayalam natively. "
+            "Do not use English unless strictly necessary for names or technical terms."
+        )
+    if normalized_language == "en-GB":
+        return (
+            "CRITICAL SYSTEM INSTRUCTION: Speak and respond in natural UK English. "
+            "Prefer UK wording and spelling where appropriate."
+        )
+    if normalized_language == "en-IN":
+        return (
+            "CRITICAL SYSTEM INSTRUCTION: Speak and respond in natural Indian English. "
+            "Keep the wording clear, friendly, and locally natural."
+        )
+    if normalized_language == "multi":
+        return (
+            "CRITICAL SYSTEM INSTRUCTION: This agent must operate multilingually. "
+            "Mirror the caller's language naturally. If they speak English, reply in English. "
+            "If they speak Hindi, reply in Hindi. If they speak Malayalam, reply in Malayalam. "
+            "If they code-switch, you may code-switch naturally when it helps the conversation."
+        )
+    if normalized_language in {"es", "fr", "de", "it"}:
+        language_name = LANGUAGE_NAME_MAP.get(normalized_language, normalized_language)
+        return f"CRITICAL SYSTEM INSTRUCTION: You must strictly speak and respond ONLY in {language_name}."
+    return ""
+
+
+def build_tts_output_safety_instruction(tts_provider: str, tts_model: str) -> str:
+    if str(tts_provider or "").strip().lower() != "elevenlabs":
+        return ""
+    if not is_elevenlabs_v3_model(tts_model):
+        return ""
+    return (
+        "CRITICAL TTS OUTPUT RULES: Do not output raw SSML, XML, HTML, or angle-bracket tags such as <break>. "
+        "Do not output asterisk actions like *smiles* or bracketed emotion tags like [warmly]. "
+        "Do not speak unresolved template variables like {{name}}. "
+        "Speak naturally using plain words and punctuation only."
+    )
 
 
 def normalize_tts_provider(config: Dict[str, Any]) -> str:
@@ -164,6 +264,50 @@ def _coerce_setting_bool(value: Any, default: bool) -> bool:
         if normalized in {"0", "false", "no", "off"}:
             return False
     return default
+
+
+def get_dashboard_api_client() -> httpx.AsyncClient:
+    global _dashboard_api_client
+    if _dashboard_api_client is None:
+        _dashboard_api_client = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+        )
+    return _dashboard_api_client
+
+
+def resolve_voice_runtime_mode(config: Dict[str, Any]) -> str:
+    custom_params = config.get("custom_params") or {}
+    raw = str(custom_params.get("voice_runtime_mode") or "").strip().lower()
+    if raw in {"pipeline", "realtime_text_tts"}:
+        return raw
+    return "pipeline"
+
+
+def resolve_voice_realtime_model(config: Dict[str, Any]) -> str:
+    custom_params = config.get("custom_params") or {}
+    return str(custom_params.get("voice_realtime_model") or "").strip()
+
+
+def _build_openai_realtime_turn_detection() -> Any:
+    if OPENAI_REALTIME_TURN_MODE == "semantic_vad":
+        payload: Dict[str, Any] = {
+            "type": "semantic_vad",
+            "eagerness": OPENAI_REALTIME_SEMANTIC_EAGERNESS,
+        }
+    else:
+        payload = {
+            "type": "server_vad",
+            "threshold": _coerce_setting_float(OPENAI_REALTIME_VAD_THRESHOLD, default=0.45, min_value=0.1, max_value=0.9),
+            "prefix_padding_ms": _coerce_setting_int(OPENAI_REALTIME_PREFIX_PADDING_MS, default=150, min_value=50, max_value=500),
+            "silence_duration_ms": _coerce_setting_int(OPENAI_REALTIME_SILENCE_DURATION_MS, default=200, min_value=80, max_value=800),
+        }
+    try:
+        from openai.types.beta.realtime.session import TurnDetection
+
+        return TurnDetection(**payload)
+    except Exception:
+        return payload
 
 
 def resolve_llm_temperature(config: Dict[str, Any]) -> float:
@@ -220,7 +364,12 @@ def resolve_openai_max_completion_tokens(config: Dict[str, Any]) -> int:
     )
 
 
-def build_elevenlabs_voice_settings(config: Dict[str, Any], voice_speed: float):
+def build_elevenlabs_voice_settings(
+    config: Dict[str, Any],
+    voice_speed: float,
+    *,
+    include_extended_settings: bool = True,
+):
     if ElevenVoiceSettings is None:
         return None
     custom_params = config.get("custom_params") or {}
@@ -230,9 +379,9 @@ def build_elevenlabs_voice_settings(config: Dict[str, Any], voice_speed: float):
     similarity_boost = _coerce_setting_float(raw_settings.get("similarity_boost"), default=0.75, min_value=0.0, max_value=1.0)
     speed = _coerce_setting_float(voice_speed, default=DEFAULT_AGENT_VOICE_SPEED, min_value=MIN_AGENT_VOICE_SPEED, max_value=MAX_AGENT_VOICE_SPEED)
     kwargs: Dict[str, Any] = {"speed": speed}
-    if "style" in raw_settings:
+    if include_extended_settings and "style" in raw_settings:
         kwargs["style"] = _coerce_setting_float(raw_settings.get("style"), default=0.0, min_value=0.0, max_value=1.0)
-    if "use_speaker_boost" in raw_settings:
+    if include_extended_settings and "use_speaker_boost" in raw_settings:
         kwargs["use_speaker_boost"] = bool(raw_settings.get("use_speaker_boost"))
     try:
         return ElevenVoiceSettings(
@@ -321,15 +470,18 @@ def normalize_runtime_vars(data: Optional[Dict[str, Any]]) -> Dict[str, str]:
 
 
 def apply_runtime_template(value: str, runtime_vars: Dict[str, str]) -> str:
-    if not value or not runtime_vars:
+    if not value:
         return value
+    safe_runtime_vars = runtime_vars or {}
 
     def _resolve(match: re.Match[str]) -> str:
         key = match.group(1)
-        return runtime_vars.get(key, match.group(0))
+        return safe_runtime_vars.get(key, "")
 
     rendered = DOUBLE_TEMPLATE_VAR_PATTERN.sub(_resolve, value)
     rendered = SINGLE_TEMPLATE_VAR_PATTERN.sub(_resolve, rendered)
+    rendered = re.sub(r"[ \t]{2,}", " ", rendered)
+    rendered = re.sub(r"[ \t]+([?.!,;:])", r"\1", rendered)
     return rendered
 
 
@@ -340,31 +492,6 @@ def _resolve_time_of_day_label() -> str:
     if hour < 18:
         return "afternoon"
     return "evening"
-
-
-def build_low_latency_default_greeting(
-    config: Dict[str, Any],
-    runtime_vars: Dict[str, str],
-    direction: str,
-    is_phone_call: bool,
-) -> str:
-    if not is_phone_call:
-        return ""
-    agent_label = str(config.get("name") or "our team").strip() or "our team"
-    company = str(
-        runtime_vars.get("company_name")
-        or runtime_vars.get("company")
-        or "Ariya Property Services"
-    ).strip()
-    caller_name = str(runtime_vars.get("name") or "").strip()
-    if direction == "outbound":
-        if caller_name:
-            return (
-                f"Hi, is that {caller_name}? It's {agent_label} calling from {company}. "
-                "Is now a good time to talk?"
-            )
-        return f"Hi, it's {agent_label} calling from {company}. Is now a good time to talk?"
-    return f"Good {_resolve_time_of_day_label()}, {company}. How can I help today?"
 
 
 def _strip_wrapping_quotes(text: str) -> str:
@@ -601,6 +728,7 @@ class UsageTracker:
         self.tts_voice_id = ""
         self.llm_temperature = DEFAULT_AGENT_LLM_TEMPERATURE
         self.voice_speed = DEFAULT_AGENT_VOICE_SPEED
+        self.language = ""
         self.call_start_unix_ms = int(time.time() * 1000)
         self.transcript_entries = []
         self.assistant_texts = []
@@ -658,8 +786,10 @@ def _send_usage_sync(call_id, tracker):
         "actual_tts_characters": tracker.tts_characters,
         "tts_provider": tracker.tts_provider,
         "tts_model_used": tracker.tts_model,
+        "tts_voice_id_used": tracker.tts_voice_id,
         "llm_temperature": tracker.llm_temperature,
         "voice_speed": tracker.voice_speed,
+        "language": tracker.language,
         "transcript_summary": tracker.get_transcript_summary(),
         "actual_duration_seconds": tracker.get_call_duration(),
     }
@@ -711,11 +841,11 @@ async def send_transcript_to_api(call_id, role, content):
     if not call_id:
         return
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(
-                f"{DASHBOARD_API_URL}/api/calls/{call_id}/transcript",
-                json={"role": role, "content": content, "is_final": True}
-            )
+        await get_dashboard_api_client().post(
+            f"{DASHBOARD_API_URL}/api/calls/{call_id}/transcript",
+            json={"role": role, "content": content, "is_final": True},
+            timeout=5.0,
+        )
     except Exception as e:
         logger.error(f"Error sending transcript: {e}")
 
@@ -737,8 +867,10 @@ async def send_usage_to_api(call_id, tracker):
         "actual_tts_characters": tracker.tts_characters,
         "tts_provider": tracker.tts_provider,
         "tts_model_used": tracker.tts_model,
+        "tts_voice_id_used": tracker.tts_voice_id,
         "llm_temperature": tracker.llm_temperature,
         "voice_speed": tracker.voice_speed,
+        "language": tracker.language,
         "transcript_summary": tracker.get_transcript_summary(),
         "actual_duration_seconds": tracker.get_call_duration(),
     }
@@ -833,12 +965,12 @@ async def send_usage_to_api(call_id, tracker):
     sent = False
     for attempt in range(1, 4):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{DASHBOARD_API_URL}/api/calls/{call_id}/usage",
-                    json=payload,
-                )
-                resp.raise_for_status()
+            resp = await get_dashboard_api_client().post(
+                f"{DASHBOARD_API_URL}/api/calls/{call_id}/usage",
+                json=payload,
+                timeout=10.0,
+            )
+            resp.raise_for_status()
             sent = True
             tracker.usage_sent = True
             logger.info(
@@ -859,27 +991,27 @@ async def send_usage_to_api(call_id, tracker):
 async def create_call_record(room_name, agent_id, direction="outbound",
                               from_number=None, to_number=None):
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                f"{DASHBOARD_API_URL}/api/calls/create-from-agent",
-                json={
-                    "room_name": room_name,
-                    "agent_id": agent_id,
-                    "direction": direction,
-                    "call_type": "phone" if direction == "inbound" or from_number or to_number else "web",
-                    "from_number": from_number,
-                    "to_number": to_number,
-                }
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            resolved_agent_id = data.get("agent_id")
-            try:
-                resolved_agent_id = int(resolved_agent_id) if resolved_agent_id is not None else None
-            except Exception:
-                resolved_agent_id = None
-            metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-            return data.get("call_id", ""), resolved_agent_id, metadata
+        resp = await get_dashboard_api_client().post(
+            f"{DASHBOARD_API_URL}/api/calls/create-from-agent",
+            json={
+                "room_name": room_name,
+                "agent_id": agent_id,
+                "direction": direction,
+                "call_type": "phone" if direction == "inbound" or from_number or to_number else "web",
+                "from_number": from_number,
+                "to_number": to_number,
+            },
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        resolved_agent_id = data.get("agent_id")
+        try:
+            resolved_agent_id = int(resolved_agent_id) if resolved_agent_id is not None else None
+        except Exception:
+            resolved_agent_id = None
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        return data.get("call_id", ""), resolved_agent_id, metadata
     except Exception as e:
         logger.error(f"Error creating call record: {e}")
         return "", None, {}
@@ -887,8 +1019,7 @@ async def create_call_record(room_name, agent_id, direction="outbound",
 
 async def end_call_record(call_id):
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(f"{DASHBOARD_API_URL}/api/calls/{call_id}/end")
+        await get_dashboard_api_client().post(f"{DASHBOARD_API_URL}/api/calls/{call_id}/end", timeout=5.0)
     except Exception as e:
         logger.error(f"Error ending call: {e}")
 
@@ -913,13 +1044,12 @@ async def fetch_agent_config(agent_id):
     last_error = None
     for attempt in range(3):
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                payload = resp.json()
-                if not isinstance(payload, dict) or not str(payload.get("system_prompt", "")).strip():
-                    raise RuntimeError("Agent config missing system_prompt")
-                return payload
+            resp = await get_dashboard_api_client().get(url, timeout=5.0)
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, dict) or not str(payload.get("system_prompt", "")).strip():
+                raise RuntimeError("Agent config missing system_prompt")
+            return payload
         except Exception as e:
             last_error = e
             logger.error(f"Error fetching agent config (attempt {attempt + 1}/3): {e}")
@@ -931,10 +1061,9 @@ async def fetch_agent_config(agent_id):
 async def fetch_agent_by_phone(phone_number):
     url = f"{DASHBOARD_API_URL}/api/agents/by-phone/{phone_number}"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                return resp.json()
+        resp = await get_dashboard_api_client().get(url, timeout=5.0)
+        if resp.status_code == 200:
+            return resp.json()
     except Exception as e:
         logger.error(f"Error fetching agent by phone: {e}")
     return None
@@ -943,10 +1072,9 @@ async def fetch_agent_by_phone(phone_number):
 async def fetch_agent_by_dispatch_name(dispatch_name):
     url = f"{DASHBOARD_API_URL}/api/agents/by-dispatch-name/{dispatch_name}"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                return resp.json()
+        resp = await get_dashboard_api_client().get(url, timeout=5.0)
+        if resp.status_code == 200:
+            return resp.json()
     except Exception as e:
         logger.error(f"Error fetching agent by dispatch name: {e}")
     return None
@@ -955,11 +1083,10 @@ async def fetch_agent_by_dispatch_name(dispatch_name):
 async def fetch_single_inbound_agent_id() -> Optional[int]:
     url = f"{DASHBOARD_API_URL}/api/phone-numbers/"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            payload = resp.json()
-            rows = payload if isinstance(payload, list) else []
+        resp = await get_dashboard_api_client().get(url, timeout=5.0)
+        resp.raise_for_status()
+        payload = resp.json()
+        rows = payload if isinstance(payload, list) else []
     except Exception as e:
         logger.error(f"Error fetching phone numbers for inbound fallback: {e}")
         return None
@@ -986,10 +1113,9 @@ async def fetch_single_inbound_agent_id() -> Optional[int]:
 async def fetch_agent_functions(agent_id):
     url = f"{DASHBOARD_API_URL}/api/agents/{agent_id}/functions"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.json()
+        resp = await get_dashboard_api_client().get(url, timeout=10.0)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         logger.error(f"Error fetching functions: {e}")
         return []
@@ -1000,11 +1126,11 @@ async def report_builtin_action(call_id: str, action: str, parameters: Dict[str,
     if not call_id:
         return {"success": False, "error": "Missing call_id"}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{DASHBOARD_API_URL}/api/calls/{call_id}/builtin-action",
-                json={"action": action, "parameters": parameters},
-            )
+        resp = await get_dashboard_api_client().post(
+            f"{DASHBOARD_API_URL}/api/calls/{call_id}/builtin-action",
+            json={"action": action, "parameters": parameters},
+            timeout=10.0,
+        )
         if resp.status_code == 200:
             try:
                 return resp.json()
@@ -2014,9 +2140,11 @@ async def entrypoint(ctx: JobContext):
     _active_call_id = call_id
     _active_usage = usage
 
-    # Fetch config
-    config = await fetch_agent_config(agent_id)
-    functions = await fetch_agent_functions(agent_id)
+    # Fetch config and function metadata in parallel so the worker can start speaking sooner.
+    config, functions = await asyncio.gather(
+        fetch_agent_config(agent_id),
+        fetch_agent_functions(agent_id),
+    )
     
     # Add builtin functions from custom_params
     custom_params = config.get('custom_params', {})
@@ -2082,6 +2210,7 @@ async def entrypoint(ctx: JobContext):
         or str(call_id or "").startswith(("inbound_", "outbound_"))
         or direction == "inbound"
     )
+    agent_lang = normalize_agent_language(config.get("language", "en-GB"))
 
     # Voice / TTS provider config
     selected_voice = config.get("voice", "jessica")
@@ -2097,25 +2226,17 @@ async def entrypoint(ctx: JobContext):
     reasoning_effort = resolve_openai_reasoning_effort(config)
     verbosity = resolve_openai_verbosity(config)
     max_completion_tokens = resolve_openai_max_completion_tokens(config)
+    voice_runtime_mode = resolve_voice_runtime_mode(config)
+    voice_realtime_model = resolve_voice_realtime_model(config)
 
     tts_engine = None
     resolved_voice_id = selected_voice
     if tts_provider == "elevenlabs":
         eleven_key = get_elevenlabs_api_key()
-        selected_tts_model = selected_tts_model or DEFAULT_ELEVENLABS_MODEL
-        enable_phone_tts_override = _coerce_setting_bool(
-            custom_params.get("force_phone_tts_model_override"),
-            PHONE_LOW_LATENCY_TTS_OVERRIDE_ENABLED,
+        selected_tts_model = resolve_elevenlabs_tts_model_for_language(
+            selected_tts_model,
+            agent_lang,
         )
-        if is_phone_call and enable_phone_tts_override:
-            target_tts_model = str(PHONE_LOW_LATENCY_TTS_MODEL or DEFAULT_ELEVENLABS_MODEL).strip()
-            if target_tts_model and str(selected_tts_model or "").strip().lower() != target_tts_model.lower():
-                logger.info(
-                    "Applying phone low-latency TTS model override: %s -> %s",
-                    selected_tts_model,
-                    target_tts_model,
-                )
-                selected_tts_model = target_tts_model
         if not eleven_key:
             raise RuntimeError("ElevenLabs selected but ELEVEN_API_KEY / ELEVENLABS_API_KEY is not set")
 
@@ -2123,18 +2244,26 @@ async def entrypoint(ctx: JobContext):
         # Use native LiveKit tts.StreamAdapter to force HTTP mode for v3 models.
         # For v2/v2.5, use the standard plugin with websocket streaming for low latency.
         is_v3_model = "v3" in selected_tts_model.lower() and "flash" not in selected_tts_model.lower()
+        enable_ssml_parsing = _coerce_setting_bool(
+            custom_params.get("elevenlabs_enable_ssml_parsing"),
+            not is_v3_model,
+        )
         
-        eleven_voice = elevenlabs.Voice(id=selected_voice, name="", category="generated")
-        if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
-            eleven_voice.settings = build_elevenlabs_voice_settings(config, voice_speed)
-            
         eleven_kwargs: Dict[str, Any] = {
-            "voice": eleven_voice,
-            "model_id": selected_tts_model,
+            "voice_id": selected_voice,
+            "model": selected_tts_model,
             "api_key": eleven_key,
-            "enable_ssml_parsing": True,
+            "enable_ssml_parsing": enable_ssml_parsing,
             "enable_logging": True,
         }
+        if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
+            voice_settings = build_elevenlabs_voice_settings(
+                config,
+                voice_speed,
+                include_extended_settings=not is_v3_model,
+            )
+            if voice_settings is not None:
+                eleven_kwargs["voice_settings"] = voice_settings
         if not is_v3_model and _callable_supports_kwarg(elevenlabs.TTS, "streaming_latency"):
             eleven_kwargs["streaming_latency"] = _coerce_setting_int(ELEVENLABS_STREAMING_LATENCY, default=2, min_value=0, max_value=4)
         if not is_v3_model and _callable_supports_kwarg(elevenlabs.TTS, "auto_mode"):
@@ -2170,9 +2299,9 @@ async def entrypoint(ctx: JobContext):
     is_phone_call_for_llm = is_phone_call
     enable_phone_model_override = _coerce_setting_bool(
         custom_params.get("force_phone_llm_model_override"),
-        PHONE_LOW_LATENCY_LLM_OVERRIDE_ENABLED,
+        False,
     )
-    if is_phone_call_for_llm and PHONE_LOW_LATENCY_LLM_ENABLED and enable_phone_model_override:
+    if is_phone_call_for_llm and enable_phone_model_override:
         requested_model = str(llm_model or "").strip().lower()
         target_model = str(custom_params.get("phone_llm_model") or "").strip()
         if target_model and requested_model != target_model.lower():
@@ -2183,7 +2312,11 @@ async def entrypoint(ctx: JobContext):
             )
             llm_model = target_model
 
-    if is_phone_call_for_llm:
+    enable_phone_token_cap = _coerce_setting_bool(
+        custom_params.get("force_phone_llm_token_cap"),
+        False,
+    )
+    if is_phone_call_for_llm and enable_phone_token_cap:
         capped_tokens = min(max_completion_tokens, PHONE_LOW_LATENCY_MAX_TOKENS)
         if capped_tokens != max_completion_tokens:
             logger.info(
@@ -2193,6 +2326,7 @@ async def entrypoint(ctx: JobContext):
                 capped_tokens,
             )
             max_completion_tokens = capped_tokens
+    runtime_llm_model = llm_model
     is_moonshot = "moonshot" in llm_model.lower() or "kimi" in llm_model.lower() or "moonlight" in llm_model.lower()
     is_gpt5_family = str(llm_model or "").strip().lower().startswith("gpt-5")
     supports_custom_temperature = model_supports_custom_temperature(llm_model)
@@ -2203,13 +2337,44 @@ async def entrypoint(ctx: JobContext):
     api_key = raw_key.strip() if raw_key else ""
     if not api_key:
         api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+
+    llm = None
+    use_realtime_text_tts = False
+    if (
+        voice_runtime_mode == "realtime_text_tts"
+        and voice_realtime_model
+        and tts_engine is not None
+        and openai_api_key
+        and hasattr(openai, "realtime")
+        and hasattr(openai.realtime, "RealtimeModel")
+    ):
+        realtime_kwargs: Dict[str, Any] = {
+            "model": voice_realtime_model,
+            "api_key": openai_api_key,
+            "modalities": ["text"],
+        }
+        turn_detection = _build_openai_realtime_turn_detection()
+        if turn_detection is not None:
+            realtime_kwargs["turn_detection"] = turn_detection
+        try:
+            llm = openai.realtime.RealtimeModel(**realtime_kwargs)
+            runtime_llm_model = voice_realtime_model
+            use_realtime_text_tts = True
+        except Exception as realtime_err:
+            logger.warning("OpenAI Realtime voice path unavailable; falling back to pipeline LLM: %s", realtime_err)
+    elif voice_runtime_mode == "realtime_text_tts" and not voice_realtime_model:
+        logger.warning(
+            "voice_runtime_mode=realtime_text_tts was requested, but no voice_realtime_model was saved in the app. Falling back to pipeline."
+        )
 
     logger.info(
-        "Using tts_provider=%s, voice=%s, tts_model=%s, llm_model=%s, base_url=%s, llm_temperature=%.2f, voice_speed=%.2f, reasoning=%s, verbosity=%s, max_tokens=%s",
+        "Using tts_provider=%s, voice=%s, tts_model=%s, llm_model=%s, runtime_mode=%s, base_url=%s, llm_temperature=%.2f, voice_speed=%.2f, reasoning=%s, verbosity=%s, max_tokens=%s",
         tts_provider,
         resolved_voice_id,
         selected_tts_model,
-        llm_model,
+        runtime_llm_model,
+        voice_runtime_mode,
         base_url,
         effective_llm_temperature,
         voice_speed,
@@ -2217,34 +2382,36 @@ async def entrypoint(ctx: JobContext):
         verbosity,
         max_completion_tokens,
     )
-    usage.llm_model = llm_model
+    usage.llm_model = runtime_llm_model
     usage.tts_provider = tts_provider
     usage.tts_model = selected_tts_model or ""
     usage.tts_voice_id = selected_voice if tts_provider == "elevenlabs" else resolved_voice_id
     usage.llm_temperature = effective_llm_temperature
     usage.voice_speed = voice_speed
+    usage.language = agent_lang
 
-    llm_kwargs: Dict[str, Any] = {"api_key": api_key, "base_url": base_url, "model": llm_model}
-    if _callable_supports_kwarg(openai.LLM, "temperature") and supports_custom_temperature:
-        llm_kwargs["temperature"] = effective_llm_temperature
-    elif not supports_custom_temperature:
-        logger.info(
-            "Skipping temperature override for model=%s; provider currently enforces default temperature.",
-            llm_model,
-        )
-    if not is_moonshot:
-        if is_gpt5_family and _callable_supports_kwarg(openai.LLM, "reasoning_effort"):
-            llm_kwargs["reasoning_effort"] = reasoning_effort
-        if is_gpt5_family and _callable_supports_kwarg(openai.LLM, "verbosity"):
-            llm_kwargs["verbosity"] = verbosity
-        if _callable_supports_kwarg(openai.LLM, "max_completion_tokens"):
-            llm_kwargs["max_completion_tokens"] = max_completion_tokens
-    llm = openai.LLM(**llm_kwargs)
-    if supports_custom_temperature and "temperature" not in llm_kwargs and hasattr(llm, "temperature"):
-        try:
-            setattr(llm, "temperature", effective_llm_temperature)
-        except Exception:
-            pass
+    if llm is None:
+        llm_kwargs: Dict[str, Any] = {"api_key": api_key, "base_url": base_url, "model": llm_model}
+        if _callable_supports_kwarg(openai.LLM, "temperature") and supports_custom_temperature:
+            llm_kwargs["temperature"] = effective_llm_temperature
+        elif not supports_custom_temperature:
+            logger.info(
+                "Skipping temperature override for model=%s; provider currently enforces default temperature.",
+                llm_model,
+            )
+        if not is_moonshot:
+            if is_gpt5_family and _callable_supports_kwarg(openai.LLM, "reasoning_effort"):
+                llm_kwargs["reasoning_effort"] = reasoning_effort
+            if is_gpt5_family and _callable_supports_kwarg(openai.LLM, "verbosity"):
+                llm_kwargs["verbosity"] = verbosity
+            if _callable_supports_kwarg(openai.LLM, "max_completion_tokens"):
+                llm_kwargs["max_completion_tokens"] = max_completion_tokens
+        llm = openai.LLM(**llm_kwargs)
+        if supports_custom_temperature and "temperature" not in llm_kwargs and hasattr(llm, "temperature"):
+            try:
+                setattr(llm, "temperature", effective_llm_temperature)
+            except Exception:
+                pass
 
     # Build system prompt - DO NOT MODIFY based on welcome settings
     welcome_type = config.get("welcome_message_type", "user_speaks_first")
@@ -2260,6 +2427,13 @@ async def entrypoint(ctx: JobContext):
         config.get("system_prompt", "You are a helpful voice assistant."),
         runtime_vars,
     )
+    
+    language_instruction = build_language_enforcement_instruction(agent_lang)
+    if language_instruction:
+        sys_prompt += f"\n\n{language_instruction}"
+    tts_safety_instruction = build_tts_output_safety_instruction(tts_provider, selected_tts_model or "")
+    if tts_safety_instruction:
+        sys_prompt += f"\n\n{tts_safety_instruction}"
     logger.info(
         "Loaded system prompt (len=%s): %s",
         len(sys_prompt or ""),
@@ -2297,39 +2471,45 @@ async def entrypoint(ctx: JobContext):
         or str(call_id or "").startswith(("inbound_", "outbound_"))
         or direction == "inbound"
     )
-    stt_model = DEEPGRAM_STT_PHONE_MODEL if is_phone_call else DEEPGRAM_STT_WEB_MODEL
-    stt_kwargs: Dict[str, Any] = {
-        "language": config.get("language", "en-GB"),
-        "model": stt_model,
+    session_kwargs: Dict[str, Any] = {
+        "llm": llm,
+        "tts": tts_engine,
+        "min_endpointing_delay": max(0.05, SESSION_MIN_ENDPOINTING_DELAY),
+        "max_endpointing_delay": max(max(0.05, SESSION_MIN_ENDPOINTING_DELAY), SESSION_MAX_ENDPOINTING_DELAY),
+        "preemptive_generation": SESSION_PREEMPTIVE_GENERATION,
     }
-    if _callable_supports_kwarg(deepgram.STT, "interim_results"):
-        stt_kwargs["interim_results"] = True
-    if _callable_supports_kwarg(deepgram.STT, "smart_format"):
-        stt_kwargs["smart_format"] = True
-    if _callable_supports_kwarg(deepgram.STT, "punctuate"):
-        stt_kwargs["punctuate"] = True
-    if _callable_supports_kwarg(deepgram.STT, "endpointing_ms"):
-        raw_endpointing = STT_ENDPOINTING_PHONE_MS if is_phone_call else STT_ENDPOINTING_WEB_MS
-        stt_kwargs["endpointing_ms"] = _coerce_setting_int(raw_endpointing, default=120 if is_phone_call else 80, min_value=25, max_value=1500)
-    if _callable_supports_kwarg(deepgram.STT, "no_delay"):
-        stt_kwargs["no_delay"] = True
-    logger.info("STT config: model=%s language=%s endpointing_ms=%s", stt_model, stt_kwargs.get("language"), stt_kwargs.get("endpointing_ms"))
+    stt_model = "openai-realtime-native"
+    if not use_realtime_text_tts:
+        stt_model = DEEPGRAM_STT_PHONE_MODEL if is_phone_call else DEEPGRAM_STT_WEB_MODEL
+        stt_language = resolve_stt_language(agent_lang)
+        stt_kwargs: Dict[str, Any] = {
+            "language": stt_language,
+            "model": stt_model,
+        }
+        if _callable_supports_kwarg(deepgram.STT, "interim_results"):
+            stt_kwargs["interim_results"] = True
+        if _callable_supports_kwarg(deepgram.STT, "smart_format"):
+            stt_kwargs["smart_format"] = True
+        if _callable_supports_kwarg(deepgram.STT, "punctuate"):
+            stt_kwargs["punctuate"] = True
+        if _callable_supports_kwarg(deepgram.STT, "endpointing_ms"):
+            raw_endpointing = STT_ENDPOINTING_PHONE_MS if is_phone_call else STT_ENDPOINTING_WEB_MS
+            stt_kwargs["endpointing_ms"] = _coerce_setting_int(raw_endpointing, default=120 if is_phone_call else 80, min_value=25, max_value=1500)
+        if _callable_supports_kwarg(deepgram.STT, "no_delay"):
+            stt_kwargs["no_delay"] = True
+        logger.info("STT config: model=%s language=%s endpointing_ms=%s", stt_model, stt_kwargs.get("language"), stt_kwargs.get("endpointing_ms"))
+        session_kwargs["vad"] = ctx.proc.userdata["vad"]
+        session_kwargs["stt"] = deepgram.STT(**stt_kwargs)
+    else:
+        logger.info("Realtime voice path enabled: using OpenAI Realtime for speech understanding and turn detection")
 
-    session = AgentSession(
-        vad=ctx.proc.userdata["vad"],
-        stt=deepgram.STT(**stt_kwargs),
-        llm=llm,
-        tts=tts_engine,
-        min_endpointing_delay=max(0.05, SESSION_MIN_ENDPOINTING_DELAY),
-        max_endpointing_delay=max(max(0.05, SESSION_MIN_ENDPOINTING_DELAY), SESSION_MAX_ENDPOINTING_DELAY),
-        preemptive_generation=SESSION_PREEMPTIVE_GENERATION,
-    )
-    
-    # Set STT model on tracker for accurate cost calculation
+    session = AgentSession(**session_kwargs)
+
+    # Track the active speech-input path for usage and post-call diagnostics.
     usage.stt_model = stt_model
-    
+
     # Track transcripts using session events
-    transcript_tracker = TranscriptCollector(call_id, usage, llm_model)
+    transcript_tracker = TranscriptCollector(call_id, usage, runtime_llm_model)
     conversation_event_seen = False
     last_activity_ts = time.time()
     silence_prompt_count = 0
@@ -2389,7 +2569,7 @@ async def entrypoint(ctx: JobContext):
                 word_count = len(content.split())
                 est_duration = int((word_count / 150.0) * 60 * 1000)
                 usage.add_stt_duration(est_duration)
-                usage.add_llm_usage(tokens_in=len(content) // 4, model=llm_model)
+                usage.add_llm_usage(tokens_in=len(content) // 4, model=runtime_llm_model)
                 usage.add_transcript("user", content)
                 asyncio.ensure_future(send_transcript_to_api(call_id, "user", content))
                 try:
@@ -2405,7 +2585,7 @@ async def entrypoint(ctx: JobContext):
             elif role == 'assistant':
                 last_activity_ts = time.time()
                 usage.add_tts_characters(len(content))
-                usage.add_llm_usage(tokens_out=len(content) // 4, model=llm_model)
+                usage.add_llm_usage(tokens_out=len(content) // 4, model=runtime_llm_model)
                 usage.add_transcript("agent", content)
                 asyncio.ensure_future(send_transcript_to_api(call_id, "agent", content))
                 try:
@@ -2629,14 +2809,19 @@ async def entrypoint(ctx: JobContext):
                     logger.info("Sending configured greeting via direct TTS (%s)", source)
                     session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
                 else:
-                    logger.info("Generating dynamic greeting from system prompt (%s)", source)
-                    await session.generate_reply(
-                        instructions=(
-                            "Start the conversation with one short natural greeting that matches "
-                            "the configured persona and language. Do not mention tools or internal logic. "
-                            "Never repeat prompt instructions verbatim."
+                    greeting_text = extract_prompt_greeting(sys_prompt)
+                    if greeting_text:
+                        logger.info("Sending prompt-authored greeting via direct TTS (%s)", source)
+                        session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
+                    else:
+                        logger.info("Generating dynamic greeting from system prompt (%s)", source)
+                        await session.generate_reply(
+                            instructions=(
+                                "Start the conversation with one short natural greeting that matches "
+                                "the configured persona and language. Do not mention tools or internal logic. "
+                                "Never repeat prompt instructions verbatim."
+                            )
                         )
-                    )
                 logger.info("Greeting queued successfully (%s)", source)
                 greeting_sent_ts = time.time()
                 last_activity_ts = greeting_sent_ts

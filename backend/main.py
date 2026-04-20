@@ -175,7 +175,7 @@ class ChatAgentModel(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), nullable=False)
     system_prompt = Column(Text, nullable=False)
-    llm_model = Column(String(50), default="gpt-4o-mini")
+    llm_model = Column(String(50), default="moonshot-v1-8k")
     language = Column(String(10), default="en")
     custom_params = Column(JSON, default={})
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -293,12 +293,12 @@ VALID_VOICES = [
 ]
 
 VALID_LANGUAGES = [
-    'en', 'en-US', 'en-GB', 'en-AU', 'en-IN', 'es', 'fr', 'de', 'it', 'hi', 'hi-IN', 'ml', 'ml-IN'
+    'en', 'en-US', 'en-GB', 'en-AU', 'en-IN', 'es', 'fr', 'de', 'it', 'hi', 'hi-IN', 'ml', 'ml-IN', 'multi'
 ]
 
 VALID_TTS_PROVIDERS = ["deepgram", "elevenlabs"]
 DEFAULT_TTS_PROVIDER = "deepgram"
-DEFAULT_ELEVENLABS_MODEL = "eleven_v3"
+DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
 VALID_CALL_DIRECTIONS = {"inbound", "outbound"}
 DEFAULT_CALL_DIRECTION = "outbound"
 ACTIVE_CALL_STATUSES = ("pending", "in-progress", "initiating", "dialing")
@@ -337,9 +337,21 @@ DEEPGRAM_VOICE_ALIASES = {
     "james": "aura-zeus-en",
 }
 
+ELEVENLABS_V3_REQUIRED_LANGUAGES = {"ml", "ml-IN", "multi"}
+
 
 def get_elevenlabs_api_key() -> Optional[str]:
     return os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
+
+
+def normalize_agent_language(language: Optional[str], default: str = "en") -> str:
+    candidate = str(language or "").strip()
+    return candidate or default
+
+
+def is_elevenlabs_v3_model(model_id: Optional[str]) -> bool:
+    candidate = str(model_id or "").strip().lower()
+    return "v3" in candidate and "flash" not in candidate
 
 
 def normalize_tts_provider(provider: Optional[str], voice: Optional[str]) -> str:
@@ -718,8 +730,6 @@ def extract_agent_tts_settings(agent: AgentModel) -> Dict[str, Optional[str]]:
     custom_params = ensure_custom_params(agent.custom_params)
     provider = normalize_tts_provider(custom_params.get("tts_provider"), agent.voice)
     model = custom_params.get("tts_model")
-    if provider == "elevenlabs" and not model:
-        model = DEFAULT_ELEVENLABS_MODEL
     return {"tts_provider": provider, "tts_model": model}
 
 
@@ -749,6 +759,27 @@ def serialize_agent(agent: AgentModel) -> Dict[str, Any]:
         "llm_temperature": resolve_agent_llm_temperature_from_params(custom_params),
         "voice_speed": resolve_agent_voice_speed_from_params(custom_params),
     }
+
+
+def build_call_metadata_from_agent(agent: AgentModel) -> Dict[str, Any]:
+    custom_params = ensure_custom_params(agent.custom_params)
+    tts = extract_agent_tts_settings(agent)
+    metadata = {
+        "voice": agent.voice,
+        "language": normalize_agent_language(agent.language),
+        "llm_model": agent.llm_model,
+        "tts_provider": tts["tts_provider"],
+        "tts_model": tts["tts_model"],
+        "llm_temperature": resolve_agent_llm_temperature_from_params(custom_params),
+        "voice_speed": resolve_agent_voice_speed_from_params(custom_params),
+    }
+    return {key: value for key, value in metadata.items() if value not in (None, "")}
+
+
+def merge_call_metadata_with_agent(agent: AgentModel, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    merged = ensure_custom_params(metadata)
+    merged.update(build_call_metadata_from_agent(agent))
+    return merged
 
 
 class AgentCreate(BaseModel):
@@ -1240,7 +1271,10 @@ async def create_agent(agent: AgentCreate, db: Session = Depends(get_database)):
     custom_params = ensure_custom_params(agent.custom_params)
     custom_params["tts_provider"] = provider
     if provider == "elevenlabs":
-        custom_params["tts_model"] = agent.tts_model or custom_params.get("tts_model") or DEFAULT_ELEVENLABS_MODEL
+        resolved_tts_model = agent.tts_model or custom_params.get("tts_model")
+        if not resolved_tts_model:
+            raise HTTPException(status_code=400, detail="tts_model must be explicitly selected in the app when tts_provider=elevenlabs")
+        custom_params["tts_model"] = resolved_tts_model
     elif agent.tts_model:
         custom_params["tts_model"] = agent.tts_model
     else:
@@ -1343,9 +1377,14 @@ async def update_agent(agent_id: int, agent_update: AgentUpdate, db: Session = D
 
     resolved_tts_model = agent_update.tts_model
     if resolved_tts_model is None and new_provider == "elevenlabs":
-        resolved_tts_model = current_tts.get("tts_model") or custom_params.get("tts_model") or DEFAULT_ELEVENLABS_MODEL
+        resolved_tts_model = current_tts.get("tts_model") or custom_params.get("tts_model")
     if resolved_tts_model:
-        custom_params["tts_model"] = resolved_tts_model
+        if new_provider == "elevenlabs":
+            custom_params["tts_model"] = resolved_tts_model
+        else:
+            custom_params["tts_model"] = resolved_tts_model
+    elif new_provider == "elevenlabs":
+        raise HTTPException(status_code=400, detail="tts_model must be explicitly selected in the app when tts_provider=elevenlabs")
     elif new_provider == "deepgram":
         custom_params.pop("tts_model", None)
 
@@ -1543,7 +1582,7 @@ async def get_tts_models(provider: str = DEFAULT_TTS_PROVIDER):
             "provider": "elevenlabs",
             "available": False,
             "missing_env": ["ELEVEN_API_KEY or ELEVENLABS_API_KEY"],
-            "default_model": DEFAULT_ELEVENLABS_MODEL,
+            "default_model": None,
             "models": [],
         }
 
@@ -1564,23 +1603,34 @@ async def get_tts_models(provider: str = DEFAULT_TTS_PROVIDER):
         if not row.get("can_do_text_to_speech"):
             continue
         langs = row.get("languages") or []
+        model_id = row.get("model_id")
+        language_ids = [
+            lang.get("language_id")
+            for lang in langs
+            if isinstance(lang, dict) and lang.get("language_id")
+        ]
+        is_v3 = is_elevenlabs_v3_model(model_id)
         models.append(
             {
-                "id": row.get("model_id"),
-                "name": row.get("name") or row.get("model_id"),
+                "id": model_id,
+                "name": row.get("name") or model_id,
                 "description": row.get("description"),
                 "character_cost_multiplier": (row.get("model_rates") or {}).get("character_cost_multiplier"),
-                "languages": [lang.get("language_id") for lang in langs if isinstance(lang, dict) and lang.get("language_id")],
+                "languages": language_ids,
+                "languages_count": len(language_ids),
+                "is_v3": is_v3,
+                "supports_multilingual": is_v3 or len(language_ids) > 1,
+                "streaming_type": "http" if is_v3 else "ws",
             }
         )
 
     models = [m for m in models if m.get("id")]
-    models.sort(key=lambda m: m["name"].lower())
+    models.sort(key=lambda m: (0 if m.get("is_v3") else 1, m["name"].lower()))
     return {
         "provider": "elevenlabs",
         "available": True,
         "missing_env": [],
-        "default_model": DEFAULT_ELEVENLABS_MODEL,
+        "default_model": None,
         "models": models,
     }
 
@@ -1780,7 +1830,7 @@ class ChatAgentResponse(BaseModel):
 class ChatAgentCreate(BaseModel):
     name: str
     system_prompt: str = ""
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "moonshot-v1-8k"
     language: str = "en"
     custom_params: dict = {}
 
@@ -2203,10 +2253,10 @@ async def _execute_agent_runtime_tool(func_cfg: Dict[str, Any], args: Dict[str, 
 
 async def _generate_dynamic_welcome_text(agent: AgentModel, system_prompt: str) -> str:
     try:
-        client = _resolve_openai_client_for_agent_model(agent.llm_model or "gpt-4o-mini")
+        client = _resolve_openai_client_for_agent_model(agent.llm_model or "moonshot-v1-8k")
         response = _safe_chat_completion_create(
             client,
-            model=agent.llm_model or "gpt-4o-mini",
+            model=agent.llm_model or "moonshot-v1-8k",
             messages=[
                 {"role": "system", "content": (system_prompt or "").strip()},
                 {
@@ -2385,7 +2435,7 @@ async def test_chat_with_voice_agent(agent_id: int, payload: AgentTestChatReques
         non_system_messages = [m for m in messages if m.get("role") != "system"]
         messages = system_messages + non_system_messages[-max_history_messages:]
 
-    client = _resolve_openai_client_for_agent_model(agent.llm_model or "gpt-4o-mini")
+    client = _resolve_openai_client_for_agent_model(agent.llm_model or "moonshot-v1-8k")
     llm_temperature = resolve_agent_llm_temperature(agent)
     events: List[Dict[str, Any]] = []
     final_reply = ""
@@ -2393,7 +2443,7 @@ async def test_chat_with_voice_agent(agent_id: int, payload: AgentTestChatReques
     for _ in range(2):
         response = _safe_chat_completion_create(
             client,
-            model=agent.llm_model or "gpt-4o-mini",
+            model=agent.llm_model or "moonshot-v1-8k",
             messages=messages,
             tools=tool_defs or None,
             tool_choice="auto" if tool_defs else None,
@@ -2479,7 +2529,7 @@ async def create_call(call_data: CallCreate, background_tasks: BackgroundTasks, 
         status="pending",
         from_number=call_data.from_number,
         to_number=call_data.to_number,
-        call_metadata=call_data.metadata
+        call_metadata=merge_call_metadata_with_agent(agent, call_data.metadata),
     )
     db.add(db_call)
     db.commit()
@@ -2615,7 +2665,8 @@ async def get_token(agent_id: int, db: Session = Depends(get_database)):
         room_name=room_name,
         call_type="web",
         direction="outbound",
-        status="pending"
+        status="pending",
+        call_metadata=merge_call_metadata_with_agent(agent, {"user_identity": user_identity}),
     )
     db.add(db_call)
     db.commit()
@@ -3559,6 +3610,7 @@ async def make_outbound_call(phone_id: int, call_request: OutboundCallRequest, d
         "to_number": to_number,
         "runtime_vars": runtime_vars,
     }
+    call_metadata = merge_call_metadata_with_agent(agent, call_metadata)
     
     call = CallModel(
         call_id=call_id,
@@ -4111,6 +4163,8 @@ class CallUsageUpdate(BaseModel):
     tts_cost_source: Optional[str] = None
     llm_temperature: Optional[float] = None
     voice_speed: Optional[float] = None
+    language: Optional[str] = None
+    tts_voice_id_used: Optional[str] = None
 
 
 @app.post("/api/calls/{call_id}/usage")
@@ -4165,6 +4219,10 @@ async def update_call_usage(call_id: str, usage: CallUsageUpdate, db: Session = 
             min_value=MIN_AGENT_VOICE_SPEED,
             max_value=MAX_AGENT_VOICE_SPEED,
         )
+    if usage.language:
+        metadata["language"] = normalize_agent_language(usage.language)
+    if usage.tts_voice_id_used:
+        metadata["voice"] = usage.tts_voice_id_used
     call.call_metadata = metadata
 
     if _looks_like_missing_usage(call):
@@ -4288,6 +4346,7 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
             fallback_agent_id=call_data.agent_id,
         )
         resolved_agent_id = inbound_routing["agent_id"]
+    resolved_agent = db.query(AgentModel).filter(AgentModel.id == resolved_agent_id).first()
 
     # Reuse only active call rows for this room; create a fresh row for ended/failed calls.
     existing = (
@@ -4327,6 +4386,11 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
                 if inbound_routing.get("normalized_called_number"):
                     metadata["resolved_called_number"] = inbound_routing["normalized_called_number"]
                 changed = True
+            if resolved_agent:
+                merged_metadata = merge_call_metadata_with_agent(resolved_agent, metadata)
+                if merged_metadata != metadata:
+                    metadata = merged_metadata
+                    changed = True
 
             if changed:
                 existing.call_metadata = metadata
@@ -4350,6 +4414,8 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
         call_metadata["inbound_routing_source"] = inbound_routing["source"]
         if inbound_routing.get("normalized_called_number"):
             call_metadata["resolved_called_number"] = inbound_routing["normalized_called_number"]
+    if resolved_agent:
+        call_metadata = merge_call_metadata_with_agent(resolved_agent, call_metadata)
 
     db_call = CallModel(
         call_id=call_id,

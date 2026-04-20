@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import axios from 'axios';
-import { X, Bot, Loader2, Check, ChevronDown, Settings, Sparkles, Volume2, Globe, Cpu, Zap } from 'lucide-react';
+import { X, Bot, Loader2, Check, ChevronDown, Settings, Sparkles, Volume2, Cpu, Zap } from 'lucide-react';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || '/api/';
 
@@ -25,6 +25,21 @@ interface VoiceOption {
     accent: string;
     gender: string;
     provider?: string;
+}
+
+interface TTSVoiceOption {
+    id: string;
+    label: string;
+    accent?: string;
+    gender?: string;
+    category?: string;
+}
+
+interface TTSModelOption {
+    id: string;
+    name: string;
+    is_v3?: boolean;
+    supports_multilingual?: boolean;
 }
 
 const MODEL_OPTIONS: ModelOption[] = [
@@ -68,6 +83,8 @@ const VOICE_OPTIONS: VoiceOption[] = [
     { value: 'mark', label: 'Mark (Legacy)', accent: 'US', gender: 'Male', provider: 'deepgram' },
 ];
 
+const DEEPGRAM_VOICE_IDS = new Set(VOICE_OPTIONS.map((voice) => voice.value));
+
 const TTS_PROVIDERS = [
     { value: 'deepgram', label: 'Deepgram', description: 'Fast & affordable' },
     { value: 'elevenlabs', label: 'ElevenLabs', description: 'High quality voices' },
@@ -85,6 +102,26 @@ const LANGUAGE_OPTIONS = [
 
 type TabType = 'llm' | 'voice' | 'tts';
 
+const SUPPORTED_LANGUAGE_OPTIONS = [
+    ...LANGUAGE_OPTIONS,
+    { value: 'en-IN', label: 'English (India)', flag: '' },
+    { value: 'hi', label: 'Hindi', flag: '' },
+    { value: 'ml', label: 'Malayalam', flag: '' },
+    { value: 'multi', label: 'Multilingual (Auto)', flag: '' },
+];
+
+const DEEPGRAM_TTS_SUPPORTED_LANGUAGES = new Set([
+    'en',
+    'en-US',
+    'en-GB',
+    'en-AU',
+    'en-IN',
+    'es',
+    'fr',
+    'de',
+    'it',
+]);
+
 export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateAgentModalProps) {
     const [activeTab, setActiveTab] = useState<TabType>('llm');
     const [name, setName] = useState('');
@@ -93,10 +130,71 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
     const [selectedModel, setSelectedModel] = useState('kimi-k2.5');
     const [selectedTtsProvider, setSelectedTtsProvider] = useState('deepgram');
     const [selectedVoice, setSelectedVoice] = useState('aura-asteria-en');
+    const [selectedTtsModel, setSelectedTtsModel] = useState('');
     const [selectedLanguage, setSelectedLanguage] = useState('en-US');
+    const [voiceRuntimeMode, setVoiceRuntimeMode] = useState('pipeline');
+    const [voiceRealtimeModel, setVoiceRealtimeModel] = useState('');
+    const [ttsVoices, setTtsVoices] = useState<TTSVoiceOption[]>([]);
+    const [ttsModels, setTtsModels] = useState<TTSModelOption[]>([]);
+    const [ttsLoading, setTtsLoading] = useState(false);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [created, setCreated] = useState(false);
+
+    const loadElevenLabsVoices = async (modelId?: string) => {
+        setTtsLoading(true);
+        try {
+            const params = modelId
+                ? { provider: 'elevenlabs', model: modelId }
+                : { provider: 'elevenlabs' };
+            const response = await axios.get(`${API_URL}tts/voices`, { params });
+            setTtsVoices(response.data?.voices || []);
+        } catch (fetchError) {
+            setTtsVoices([]);
+        } finally {
+            setTtsLoading(false);
+        }
+    };
+
+    const loadTtsOptions = async (provider: string) => {
+        if (provider !== 'elevenlabs') {
+            setTtsVoices([]);
+            setTtsModels([]);
+            setSelectedTtsModel('');
+            return;
+        }
+
+        setTtsLoading(true);
+        try {
+            const [voicesResponse, modelsResponse] = await Promise.all([
+                axios.get(`${API_URL}tts/voices`, { params: { provider: 'elevenlabs' } }),
+                axios.get(`${API_URL}tts/models`, { params: { provider: 'elevenlabs' } }),
+            ]);
+            setTtsVoices(voicesResponse.data?.voices || []);
+            setTtsModels(modelsResponse.data?.models || []);
+        } catch (fetchError) {
+            setTtsVoices([]);
+            setTtsModels([]);
+        } finally {
+            setTtsLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        if (!isOpen) return;
+        void loadTtsOptions(selectedTtsProvider);
+    }, [isOpen, selectedTtsProvider]);
+
+    useEffect(() => {
+        if (!isOpen || selectedTtsProvider !== 'elevenlabs' || !selectedTtsModel) return;
+        void loadElevenLabsVoices(selectedTtsModel);
+    }, [isOpen, selectedTtsProvider, selectedTtsModel]);
+
+    useEffect(() => {
+        if (selectedTtsProvider !== 'elevenlabs') return;
+        if (!DEEPGRAM_VOICE_IDS.has(selectedVoice)) return;
+        setSelectedVoice('');
+    }, [selectedTtsProvider, selectedVoice]);
 
     const tabs = [
         { id: 'llm' as TabType, label: 'LLM', icon: Cpu, description: 'Language Model' },
@@ -113,6 +211,22 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
             setError('Agent name is required');
             return;
         }
+        if (selectedTtsProvider === 'deepgram' && !DEEPGRAM_TTS_SUPPORTED_LANGUAGES.has(selectedLanguage)) {
+            setError('Use ElevenLabs for Hindi, Malayalam, or multilingual output.');
+            return;
+        }
+        if (!selectedVoice) {
+            setError(`Select a ${selectedTtsProvider === 'elevenlabs' ? 'voice ID' : 'voice'}.`);
+            return;
+        }
+        if (selectedTtsProvider === 'elevenlabs' && !selectedTtsModel) {
+            setError('Select an ElevenLabs model.');
+            return;
+        }
+        if (voiceRuntimeMode === 'realtime_text_tts' && !voiceRealtimeModel.trim()) {
+            setError('Enter the realtime model you want this agent to use.');
+            return;
+        }
 
         setLoading(true);
         setError(null);
@@ -125,8 +239,15 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                 llm_model: selectedModel,
                 voice: selectedVoice,
                 tts_provider: selectedTtsProvider,
+                tts_model: selectedTtsProvider === 'elevenlabs' ? selectedTtsModel : null,
                 language: selectedLanguage,
-                twilio_number: null
+                twilio_number: null,
+                custom_params: voiceRuntimeMode === 'realtime_text_tts'
+                    ? {
+                        voice_runtime_mode: 'realtime_text_tts',
+                        voice_realtime_model: voiceRealtimeModel.trim(),
+                    }
+                    : {}
             });
 
             setCreated(true);
@@ -139,7 +260,10 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                 setSelectedModel('kimi-k2.5');
                 setSelectedTtsProvider('deepgram');
                 setSelectedVoice('aura-asteria-en');
+                setSelectedTtsModel('');
                 setSelectedLanguage('en-US');
+                setVoiceRuntimeMode('pipeline');
+                setVoiceRealtimeModel('');
                 setCreated(false);
             }, 1500);
         } catch (err) {
@@ -290,40 +414,62 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                 onChange={(e) => setSelectedLanguage(e.target.value)}
                                                 className="px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-green-500"
                                             >
-                                                {LANGUAGE_OPTIONS.map((lang) => (
+                                                {SUPPORTED_LANGUAGE_OPTIONS.map((lang) => (
                                                     <option key={lang.value} value={lang.value}>
                                                         {lang.flag} {lang.label}
                                                     </option>
                                                 ))}
                                             </select>
                                         </div>
-                                        <div className="grid grid-cols-2 gap-3">
-                                            {VOICE_OPTIONS.map((voice) => (
-                                                <button
-                                                    key={voice.value}
-                                                    type="button"
-                                                    onClick={() => setSelectedVoice(voice.value)}
-                                                    className={`flex items-center gap-3 p-3 rounded-xl border-2 transition-all ${
-                                                        selectedVoice === voice.value
-                                                            ? 'border-green-500 bg-white shadow-md'
-                                                            : 'border-gray-100 hover:border-gray-200 bg-white'
-                                                    }`}
+                                        {selectedTtsProvider === 'deepgram' ? (
+                                            <div className="grid grid-cols-2 gap-3">
+                                                {VOICE_OPTIONS.map((voice) => (
+                                                    <button
+                                                        key={voice.value}
+                                                        type="button"
+                                                        onClick={() => setSelectedVoice(voice.value)}
+                                                        className={`flex items-center gap-3 p-3 rounded-xl border-2 transition-all ${
+                                                            selectedVoice === voice.value
+                                                                ? 'border-green-500 bg-white shadow-md'
+                                                                : 'border-gray-100 hover:border-gray-200 bg-white'
+                                                        }`}
+                                                    >
+                                                        <div className={`w-10 h-10 rounded-full flex items-center justify-center ${
+                                                            voice.gender === 'Female' ? 'bg-pink-100' : 'bg-blue-100'
+                                                        }`}>
+                                                            <Volume2 className={`w-5 h-5 ${voice.gender === 'Female' ? 'text-pink-500' : 'text-blue-500'}`} />
+                                                        </div>
+                                                        <div className="text-left flex-1">
+                                                            <p className="font-medium text-gray-900 text-sm">{voice.label}</p>
+                                                            <p className="text-xs text-gray-500">{voice.accent} • {voice.gender}</p>
+                                                        </div>
+                                                        {selectedVoice === voice.value && (
+                                                            <Check className="w-5 h-5 text-green-500" />
+                                                        )}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-3">
+                                                <select
+                                                    value={selectedVoice}
+                                                    onChange={(e) => setSelectedVoice(e.target.value)}
+                                                    disabled={ttsLoading}
+                                                    className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
                                                 >
-                                                    <div className={`w-10 h-10 rounded-full flex items-center justify-center ${
-                                                        voice.gender === 'Female' ? 'bg-pink-100' : 'bg-blue-100'
-                                                    }`}>
-                                                        <Volume2 className={`w-5 h-5 ${voice.gender === 'Female' ? 'text-pink-500' : 'text-blue-500'}`} />
-                                                    </div>
-                                                    <div className="text-left flex-1">
-                                                        <p className="font-medium text-gray-900 text-sm">{voice.label}</p>
-                                                        <p className="text-xs text-gray-500">{voice.accent} • {voice.gender}</p>
-                                                    </div>
-                                                    {selectedVoice === voice.value && (
-                                                        <Check className="w-5 h-5 text-green-500" />
-                                                    )}
-                                                </button>
-                                            ))}
-                                        </div>
+                                                    <option value="">Select an ElevenLabs voice</option>
+                                                    {ttsVoices.map((voice) => (
+                                                        <option key={voice.id} value={voice.id}>
+                                                            {voice.label}
+                                                            {voice.category ? ` [${voice.category}]` : ''}
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                                <p className="text-xs text-gray-500">
+                                                    Voice IDs come directly from the backend&apos;s ElevenLabs integration. Nothing is auto-picked.
+                                                </p>
+                                            </div>
+                                        )}
                                     </div>
                                 )}
 
@@ -360,6 +506,66 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                     )}
                                                 </button>
                                             ))}
+                                        </div>
+                                        {selectedTtsProvider === 'elevenlabs' && (
+                                            <div className="space-y-3">
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                        ElevenLabs Model
+                                                    </label>
+                                                    <select
+                                                        value={selectedTtsModel}
+                                                        onChange={(e) => setSelectedTtsModel(e.target.value)}
+                                                        disabled={ttsLoading}
+                                                        className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                                    >
+                                                        <option value="">Select an ElevenLabs model</option>
+                                                        {ttsModels.map((model) => (
+                                                            <option key={model.id} value={model.id}>
+                                                                {model.name}
+                                                                {model.is_v3 ? ' (v3)' : model.supports_multilingual ? ' (Multilingual)' : ''}
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                                {selectedTtsModel && selectedTtsModel.includes('v3') && (
+                                                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                                                        `eleven_v3` stays available when you choose it, but it is the slower HTTP path for live synthesis.
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                        <div className="space-y-3">
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                    Voice Runtime
+                                                </label>
+                                                <select
+                                                    value={voiceRuntimeMode}
+                                                    onChange={(e) => setVoiceRuntimeMode(e.target.value)}
+                                                    className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                                >
+                                                    <option value="pipeline">Pipeline</option>
+                                                    <option value="realtime_text_tts">Realtime text + TTS</option>
+                                                </select>
+                                            </div>
+                                            {voiceRuntimeMode === 'realtime_text_tts' && (
+                                                <div>
+                                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                                        Realtime Model
+                                                    </label>
+                                                    <input
+                                                        type="text"
+                                                        value={voiceRealtimeModel}
+                                                        onChange={(e) => setVoiceRealtimeModel(e.target.value)}
+                                                        placeholder="e.g. gpt-realtime"
+                                                        className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                                    />
+                                                    <p className="mt-2 text-xs text-gray-500">
+                                                        This is saved only when you explicitly choose realtime here.
+                                                    </p>
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
                                 )}
