@@ -8,7 +8,7 @@ if env_path.exists():
     load_dotenv(env_path)
     
 # Default LiveKit settings
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
+LIVEKIT_URL = os.getenv("LIVEKIT_URL", "wss://oyik.info/rtc")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "secret12345678")
 import json
@@ -2715,7 +2715,7 @@ async def get_token(agent_id: int, db: Session = Depends(get_database)):
         "room_name": room_name,
         "call_id": call_id,
         "user_identity": user_identity,
-        "livekit_url": os.getenv("LIVEKIT_WS_URL", "wss://13.135.81.172:7880"),
+        "livekit_url": os.getenv("LIVEKIT_WS_URL", "wss://oyik.info/rtc"),
         "agent": {
             "id": agent.id,
             "name": agent.name,
