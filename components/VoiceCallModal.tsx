@@ -86,7 +86,7 @@ export default function VoiceCallModal({ isOpen, onClose, agentId, agentName }: 
     setError(null);
 
     try {
-      const LIVEKIT_URL = livekitUrl || process.env.NEXT_PUBLIC_LIVEKIT_URL || 'wss://13.135.81.172:7880';
+      const LIVEKIT_URL = livekitUrl || process.env.NEXT_PUBLIC_LIVEKIT_URL || 'wss://13.135.81.172/rtc';
 
       const room = new Room({
         audioCaptureDefaults: {

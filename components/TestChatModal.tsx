@@ -81,7 +81,7 @@ export default function TestChatModal({ isOpen, onClose, agentId, agentName }: T
             const livekitUrl =
                 process.env.NEXT_PUBLIC_LIVEKIT_URL ||
                 tokenRes.data?.livekit_url ||
-                'wss://13.135.81.172:7880';
+                'wss://13.135.81.172/rtc';
 
             if (!token) {
                 throw new Error('Missing LiveKit token');

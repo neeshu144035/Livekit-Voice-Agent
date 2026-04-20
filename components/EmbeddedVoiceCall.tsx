@@ -84,7 +84,7 @@ export default function EmbeddedVoiceCall({ agentId, agentName }: EmbeddedVoiceC
         setMessages([]); // Clear previous messages
 
         try {
-            const LIVEKIT_URL = process.env.NEXT_PUBLIC_LIVEKIT_URL || 'wss://13.135.81.172:7880';
+            const LIVEKIT_URL = process.env.NEXT_PUBLIC_LIVEKIT_URL || 'wss://13.135.81.172/rtc';
 
             const room = new Room({
                 adaptiveStream: true,
