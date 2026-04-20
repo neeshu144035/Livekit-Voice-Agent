@@ -736,18 +736,20 @@ DISCONNECT_GRACE_SEC=20
 CHAT_REPLY_TIMEOUT_SEC=40
 END_CALL_DISCONNECT_DELAY_SEC=1.0
 TRANSFER_HANDOFF_DELAY_SEC=2.5
-SILENCE_REPROMPT_SEC=20
-STT_ENDPOINTING_PHONE_MS=120
-STT_ENDPOINTING_WEB_MS=80
-VAD_MIN_SPEECH_DURATION=0.04
-VAD_MIN_SILENCE_DURATION=0.30
-VAD_PREFIX_PADDING_DURATION=0.35
-ELEVENLABS_STREAMING_LATENCY=2
+SILENCE_REPROMPT_SEC=25
+STT_ENDPOINTING_PHONE_MS=40
+STT_ENDPOINTING_WEB_MS=40
+VAD_MIN_SPEECH_DURATION=0.015
+VAD_MIN_SILENCE_DURATION=0.05
+VAD_PREFIX_PADDING_DURATION=0.12
+ELEVENLABS_STREAMING_LATENCY=1
 ELEVENLABS_AUTO_MODE=1
 OPENAI_REASONING_EFFORT=low
 OPENAI_VERBOSITY=low
 OPENAI_MAX_COMPLETION_TOKENS=220
 ```
+
+**Note**: For multilingual (language=multi), the runtime now uses Nova-3 with endpointing_ms=100 for best Hindi/English detection.
 
 These values are particularly relevant to [`agent_retell.py`](agent_retell.py), where latency, silence handling, greeting behavior, and OpenAI/ElevenLabs runtime tuning are applied.
 
@@ -914,18 +916,20 @@ DISCONNECT_GRACE_SEC=20
 CHAT_REPLY_TIMEOUT_SEC=40
 END_CALL_DISCONNECT_DELAY_SEC=1.0
 TRANSFER_HANDOFF_DELAY_SEC=2.5
-SILENCE_REPROMPT_SEC=20
-STT_ENDPOINTING_PHONE_MS=120
-STT_ENDPOINTING_WEB_MS=80
-VAD_MIN_SPEECH_DURATION=0.04
-VAD_MIN_SILENCE_DURATION=0.30
-VAD_PREFIX_PADDING_DURATION=0.35
-ELEVENLABS_STREAMING_LATENCY=2
+SILENCE_REPROMPT_SEC=25
+STT_ENDPOINTING_PHONE_MS=40
+STT_ENDPOINTING_WEB_MS=40
+VAD_MIN_SPEECH_DURATION=0.015
+VAD_MIN_SILENCE_DURATION=0.05
+VAD_PREFIX_PADDING_DURATION=0.12
+ELEVENLABS_STREAMING_LATENCY=1
 ELEVENLABS_AUTO_MODE=1
 OPENAI_REASONING_EFFORT=low
 OPENAI_VERBOSITY=low
 OPENAI_MAX_COMPLETION_TOKENS=220
 ```
+
+**Note**: For multilingual, runtime uses Nova-3 with language=multi.
 
 ---
 
@@ -1117,3 +1121,44 @@ Please verify with commands:
 - curl http://127.0.0.1:8000/health
 - docker logs --tail 20 voice-agent
 ```
+
+---
+
+## Multilingual STT Discovery (April 20, 2026 - Evening)
+
+### The Problem
+- Nova-2 with `language=multi` was NOT detecting Hindi properly
+- STT was returning 0ms processing - no speech detected at all
+
+### The Solution (Nova-3 for Multilingual)
+- **Use Nova-3** with `language=multi` instead of Nova-2
+- Nova-3 has ~21% better multilingual streaming than Nova-2
+- Better code-switching for Hindi-English conversations
+- Faster too!
+
+### Key Settings (agent_retell.py)
+```python
+# Multilingual STT config (line ~2483)
+if stt_language == "multi":
+    stt_model = "nova-3"  # NOT nova-2!
+    stt_kwargs["language"] = "multi"
+    stt_kwargs["endpointing_ms"] = 100  # Faster response
+
+# VAD tuning for speech detection
+VAD_MIN_SILENCE_DURATION = 0.05  # Was 0.08, lower = faster detection
+```
+
+### Verification
+```bash
+# Check STT config in logs
+docker logs voice-agent 2>&1 | grep "STT config"
+
+# Output should show:
+# STT config: model=nova-3 language=multi endpointing_ms=100
+```
+
+### Summary
+- Nova-3 + language=multi = ✅ Working Hindi detection
+- Nova-2 + language=multi = ❌ Not working
+- Same Deepgram API, different model performance
+- Retell AI and others recommend Nova-3 now for multilingual
