@@ -797,7 +797,7 @@ ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "sudo pm2 restart api --upda
 ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "curl -s http://127.0.0.1:8000/health"
 ```
 
-#### Optional Runtime Flags
+
 ```env
 STRICT_PROTOOL_FILTER=1
 DISCONNECT_GRACE_SEC=20
@@ -828,3 +828,24 @@ OPENAI_MAX_COMPLETION_TOKENS=220
 - [Retell AI Documentation](https://docs.retellai.com)
 - [WebRTC Internals](https://webrtc.org/getting-started/overview)
 - [SIP Protocol RFC 3261](https://tools.ietf.org/html/rfc3261)
+
+---
+
+## 🎙️ Production Updates (April 2026)
+
+### Voice Agent & ElevenLabs v3 Integration
+- **Bug Fix**: Fixed a critical `TypeError` in `agent_retell.py` by ensuring `voice_id` and `model` are passed as strings to the `elevenlabs.TTS` constructor, matching the LiveKit plugin v1.4.2 signature.
+- **Multilingual Deployment**: Added native support for **Hindi** (`hi`) and **Malayalam** (`ml`) across the entire platform.
+    - **Language Enforcement**: Implemented automated system prompt injection in `agent_retell.py` that forces the AI to respond natively in the selected language.
+    - **Full-Stack Update**: 
+        - Backend schemas (`backend/main.py`) updated to validate `hi`, `hi-IN`, `ml`, and `ml-IN`.
+        - Frontend dropdowns (`CreateAgentWizard.tsx` and Agent Detail pages) updated with Hindi/Malayalam options.
+- **Automated Deployment Process**:
+    - **Backend**: API logic synced to VPS and restarted via `pm2 restart api`.
+    - **Frontend**: Dashboard built locally, zipped, and deployed to VPS `/var/www/html/` with `.next` replacement.
+    - **Agent**: Docker container rebuilt with updated prompt logic and restarted.
+
+### Future Roadmap
+- [ ] Implement Tamil, Telugu, and Kannada regional support.
+- [ ] Validate ElevenLabs V3 expressive voices for non-English dialects.
+- [ ] Add latency benchmarks for Indian subcontinent API routing.
