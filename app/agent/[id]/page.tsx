@@ -594,6 +594,16 @@ export default function AgentDetailPage() {
             console.log('Save response:', saveRes.data);
             const persistedConfig = normalizeBuiltinFunctionsConfig(saveRes.data?.config ?? normalizedToSave);
             setAllBuiltinFunctions(persistedConfig);
+            // Keep agent state fresh so main agent save doesn't overwrite with stale builtin data
+            if (agent) {
+                const mergedCustomParams = {
+                    ...(agent.custom_params || {}),
+                    ...(agentCustomParams || {}),
+                    builtin_functions: persistedConfig,
+                };
+                setAgent({ ...agent, custom_params: mergedCustomParams });
+                setAgentCustomParams(mergedCustomParams);
+            }
             if (!silent) showToast('Builtin functions saved successfully', 'success');
             setBuiltinSaved(true);
             
@@ -672,6 +682,13 @@ export default function AgentDetailPage() {
                 ...(agentCustomParams || {}),
                 voice_speed: voiceSpeed,
             };
+            // Ensure builtin_functions from the separate save flow is merged so it isn't lost
+            if (allBuiltinFunctions && Object.keys(allBuiltinFunctions).length > 0) {
+                nextCustomParams['builtin_functions'] = {
+                    ...(nextCustomParams['builtin_functions'] || {}),
+                    ...allBuiltinFunctions,
+                };
+            }
             nextCustomParams.force_phone_llm_model_override = phoneLlmOverrideEnabled;
             if (phoneLlmOverrideEnabled) {
                 nextCustomParams.phone_llm_model = phoneLlmModel;
@@ -1005,18 +1022,7 @@ export default function AgentDetailPage() {
                                     </div>
                                 )}
 
-                                {selectedTtsProvider === 'elevenlabs' && selectedTtsModel && selectedTtsModel.includes('v3') && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-amber-500 rounded-full" />
-                                        <span className="text-xs text-amber-700 font-medium">v3 is the expressive path, but Flash v2.5 is the lower-latency choice for live calls when the language supports it</span>
-                                    </div>
-                                )}
-                                {selectedTtsProvider === 'elevenlabs' && compatibleElevenModels.length > 0 && compatibleElevenModels.length !== ttsModels.length && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-sky-50 border border-sky-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-sky-500 rounded-full" />
-                                        <span className="text-xs text-sky-700 font-medium">Showing models compatible with {selectedLanguageLabel}</span>
-                                    </div>
-                                )}
+                                
                                 {selectedTtsProvider === 'elevenlabs' && selectedTtsModel && !selectedTtsModel.includes('v3') && ttsVoices.length > 0 && (
                                     <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
                                         <span className="w-2 h-2 bg-amber-500 rounded-full" />
@@ -1207,14 +1213,14 @@ export default function AgentDetailPage() {
                                 ))}
                             </select>
 
-                            {welcomeOption === 'agent_greets' && (
-                                <div className="mt-4">
+                            {welcomeOption === 'user_speaks_first' && (
+                                <div className="mt-3">
                                     <label className="block text-sm font-medium text-gray-700 mb-2">Message to Speak</label>
                                     <textarea
                                         value={welcomeMessage}
                                         onChange={(e) => setWelcomeMessage(e.target.value)}
                                         placeholder="Leave empty to auto-generate first greeting from system prompt"
-                                        className="w-full h-24 p-3 text-sm text-gray-900 border border-gray-300 rounded-lg placeholder:text-gray-400 focus:outline-none focus:border-blue-500 resize-none leading-relaxed"
+                                        className="w-full h-10 p-2 text-sm text-gray-900 border border-gray-300 rounded-lg placeholder:text-gray-400 focus:outline-none focus:border-blue-500 focus:h-32 transition-all duration-200 resize-none leading-relaxed overflow-y-auto"
                                     />
                                 </div>
                             )}
@@ -1445,12 +1451,6 @@ export default function AgentDetailPage() {
                             >
                                 Test
                             </button>
-                            <Link
-                                href={`/chatbot-dashboard?agentId=${agentId}`}
-                                className="mt-3 px-6 py-2 bg-gray-900 text-white rounded-lg text-sm font-medium hover:bg-gray-800"
-                            >
-                                Customize Chat Widget
-                            </Link>
                         </div>
                     </div>
                 </div>

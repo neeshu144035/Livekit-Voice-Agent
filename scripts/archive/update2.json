@@ -1,0 +1,12 @@
+{
+    "sipDispatchRuleId": "SDR_GwaWEb4guhX5",
+    "update": {
+        "roomConfig": {
+            "agents": [
+                {
+                    "agentName": "sarah"
+                }
+            ]
+        }
+    }
+}

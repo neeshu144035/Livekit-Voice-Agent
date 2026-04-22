@@ -1,0 +1,22 @@
+{"message": "starting worker", "level": "INFO", "name": "livekit.agents", "version": "1.4.2", "rtc-version": "1.1.2", "timestamp": "2026-02-23T17:46:26.647527+00:00"}
+{"message": "preloading plugins", "level": "INFO", "name": "livekit.agents", "packages": ["livekit.plugins.deepgram", "livekit.plugins.openai", "livekit.plugins.silero", "av"], "timestamp": "2026-02-23T17:46:26.647750+00:00"}
+{"message": "HTTP server listening on :8081", "level": "INFO", "name": "livekit.agents", "timestamp": "2026-02-23T17:46:26.683494+00:00"}
+{"message": "initializing process", "level": "INFO", "name": "livekit.agents", "pid": 17, "timestamp": "2026-02-23T17:46:28.337765+00:00"}
+{"message": "initializing process", "level": "INFO", "name": "livekit.agents", "pid": 19, "timestamp": "2026-02-23T17:46:28.342763+00:00"}
+{"message": "process initialized", "level": "INFO", "name": "livekit.agents", "pid": 17, "elapsed_time": 0.12, "timestamp": "2026-02-23T17:46:28.462336+00:00"}
+{"message": "process initialized", "level": "INFO", "name": "livekit.agents", "pid": 19, "elapsed_time": 0.13, "timestamp": "2026-02-23T17:46:28.470856+00:00"}
+{"message": "registered worker", "level": "INFO", "name": "livekit.agents", "agent_name": "", "id": "AW_idZwNVH6YEB2", "url": "ws://livekit-server:7880", "region": "", "protocol": 16, "timestamp": "2026-02-23T17:46:28.478789+00:00"}
+{"message": "received job request", "level": "INFO", "name": "livekit.agents", "job_id": "AJ_oFvS9ctxT7Wu", "dispatch_id": "AD_zf5skkQw4qyu", "room": "call_5_f07bcc99", "room_id": "RM_oTLnvvRv8BUz", "agent_name": "", "resuming": false, "enable_recording": false, "timestamp": "2026-02-23T17:47:27.980643+00:00"}
+{"message": "Starting session for room: call_5_f07bcc99", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:47:27.994832+00:00"}
+{"message": "initializing process", "level": "INFO", "name": "livekit.agents", "pid": 29, "timestamp": "2026-02-23T17:47:28.041666+00:00"}
+{"message": "Fetching functions from: http://host.docker.internal:8000/agents/5/functions", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:47:28.059789+00:00"}
+{"message": "Fetched 1 functions", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:47:28.082910+00:00"}
+{"message": "Agent: Sarah, Functions: 1", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:47:28.084503+00:00"}
+{"message": "process initialized", "level": "INFO", "name": "livekit.agents", "pid": 29, "elapsed_time": 0.15, "timestamp": "2026-02-23T17:47:28.192279+00:00"}
+{"message": "Using voice: aura-asteria-en, model: gpt-4o, base_url: None", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:47:28.313438+00:00"}
+{"message": "Session started", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:47:28.358836+00:00"}
+{"message": "Property search called: postcode=LE1, type=flat, budget=900", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:47:55.122286+00:00"}
+{"message": "Property search response: 200", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:47:56.150136+00:00"}
+{"message": "closing agent session due to participant disconnect (disable via `RoomInputOptions.close_on_disconnect=False`)", "level": "INFO", "name": "livekit.agents", "room": "call_5_f07bcc99", "participant": "user_89ce04a6", "reason": "CLIENT_INITIATED", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:48:42.711131+00:00"}
+{"message": "process exiting", "level": "INFO", "name": "livekit.agents", "reason": "", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:49:02.817365+00:00"}
+{"message": "Session ended", "level": "INFO", "name": "agent-retell", "pid": 17, "job_id": "AJ_oFvS9ctxT7Wu", "room_id": "RM_oTLnvvRv8BUz", "timestamp": "2026-02-23T17:49:02.817936+00:00"}

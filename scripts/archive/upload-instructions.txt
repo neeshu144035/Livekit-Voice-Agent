@@ -1,0 +1,105 @@
+AUTOMATIC UPLOAD - EASIEST METHOD
+==================================
+
+Since SSH key authentication is not working via command line,
+please use one of these simple methods:
+
+METHOD 1: Use FileZilla (Free, Easy)
+------------------------------------
+1. Download FileZilla: https://filezilla-project.org/
+2. Open FileZilla and go to File > Site Manager
+3. Click "New Site" and enter:
+   - Protocol: SFTP
+   - Host: oyik.info
+   - User: ec2-user
+   - Key file: C:\LiveKit-Project\livekit-company-key.pem
+4. Click "Connect"
+5. Navigate to: /var/www/html/chat/
+6. Drag and drop ALL files from: C:\LiveKit-Project\chat-widget-dashboard\dist\
+   Important: Upload the entire dist folder contents
+7. Done! Access at: https://oyik.info/chat
+
+---
+OR ---
+
+METHOD 2: Use WinSCP (Free, Easy)
+---------------------------------
+1. Download WinSCP: https://winscp.net/
+2. Open WinSCP and click "New Site"
+3. Enter:
+   - File protocol: SFTP
+   - Host name: oyik.info
+   - Port: 22
+   - User name: ec2-user
+   - Private key file: C:\LiveKit-Project\livekit-company-key.pem
+4. Click "Login"
+5. Navigate to: /var/www/html/chat/
+6. Drag files from: C:\LiveKit-Project\chat-widget-dashboard\dist\
+7. Upload all files
+8. Done! Access at: https://oyik.info/chat
+
+---
+OR ---
+
+METHOD 3: Quick Single File (Fastest)
+------------------------------------
+If you want a simple working version immediately:
+
+1. Open FileZilla or WinSCP
+2. Connect using the settings above
+3. Navigate to: /var/www/html/chat/
+4. Upload this file: C:\LiveKit-Project\chat-widget-dashboard\standalone-demo.html
+5. Rename it to: index.html
+6. Access at: https://oyik.info/chat
+
+This gives you the chat widget immediately without the dashboard.
+
+---
+
+FILES TO UPLOAD (Full Dashboard):
+
+From: C:\LiveKit-Project\chat-widget-dashboard\dist\
+
+Required Files:
+- index.html
+- assets/index-QxyCslUl.js
+- assets/index-re7PRR07.css
+
+Optional:
+- assets/index-QxyCslUl.js.map (debugging sourcemap)
+
+---
+
+WHAT YOU'LL SEE AT https://oyik.info/chat:
+
+- Professional dark-themed dashboard
+- Configuration panel on the left
+- Live chat widget preview on the right  
+- Chat button in bottom-right corner
+- Export options (embed code + HTML download)
+
+---
+
+TROUBLESHOOTING:
+
+If connection fails:
+- Make sure you have the key file at: C:\LiveKit-Project\livekit-company-key.pem
+- Check that the server oyik.info is accessible
+- Try pinging: ping oyik.info
+
+If upload partial:
+- Make sure all 3 required files are uploaded
+- Check folder structure matches dist/ folder structure
+
+If site doesn't load:
+- Open browser console (F12) to check for errors
+- Verify all files uploaded correctly
+- Refresh the page (Ctrl+F5 for hard refresh)
+
+---
+
+Estimated time: 3-5 minutes
+Difficulty: Easy
+
+Click the chat button to test the widget after deployment!
+

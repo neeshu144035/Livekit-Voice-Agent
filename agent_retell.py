@@ -33,100 +33,61 @@ import livekit.agents.llm as llm_module
 from livekit.agents.voice.room_io.types import RoomOptions
 import httpx
 
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("agent-retell")
-
-DASHBOARD_API_URL = os.getenv("DASHBOARD_API_URL", "http://host.docker.internal:8000").rstrip("/")
-DEFAULT_WORKER_DISPATCH_NAME = (os.getenv("LIVEKIT_WORKER_AGENT_NAME", "sarah") or "sarah").strip().lower()
-MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "1800"))
-DEFAULT_TTS_PROVIDER = "deepgram"
-DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
-DEFAULT_AGENT_LLM_TEMPERATURE = 0.2
-DEFAULT_AGENT_VOICE_SPEED = 1.0
-MIN_AGENT_LLM_TEMPERATURE = 0.0
-MAX_AGENT_LLM_TEMPERATURE = 1.5
-MIN_AGENT_VOICE_SPEED = 0.8
-MAX_AGENT_VOICE_SPEED = 1.2
-TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "2.5"))
-END_CALL_DISCONNECT_DELAY_SEC = float(os.getenv("END_CALL_DISCONNECT_DELAY_SEC", "1.0"))
-DISCONNECT_GRACE_SEC = float(os.getenv("DISCONNECT_GRACE_SEC", "20"))
-CHAT_REPLY_TIMEOUT_SEC = float(os.getenv("CHAT_REPLY_TIMEOUT_SEC", "40"))
-SILENCE_REPROMPT_SEC = float(os.getenv("SILENCE_REPROMPT_SEC", "20"))
-SILENCE_REPROMPT_MAX_PER_CALL = int(os.getenv("SILENCE_REPROMPT_MAX_PER_CALL", "6"))
-STT_ENDPOINTING_PHONE_MS = int(os.getenv("STT_ENDPOINTING_PHONE_MS", "40"))
-STT_ENDPOINTING_WEB_MS = int(os.getenv("STT_ENDPOINTING_WEB_MS", "40"))
-SESSION_MIN_ENDPOINTING_DELAY = float(os.getenv("SESSION_MIN_ENDPOINTING_DELAY", "0.03"))
-SESSION_MAX_ENDPOINTING_DELAY = float(os.getenv("SESSION_MAX_ENDPOINTING_DELAY", "0.12"))
-SESSION_PREEMPTIVE_GENERATION = os.getenv("SESSION_PREEMPTIVE_GENERATION", "1").strip().lower() in {"1", "true", "yes", "on"}
-VAD_MIN_SPEECH_DURATION = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.02"))
-VAD_MIN_SILENCE_DURATION = float(os.getenv("VAD_MIN_SILENCE_DURATION", "0.12"))
-VAD_PREFIX_PADDING_DURATION = float(os.getenv("VAD_PREFIX_PADDING_DURATION", "0.18"))
-ELEVENLABS_STREAMING_LATENCY = int(os.getenv("ELEVENLABS_STREAMING_LATENCY", "0"))
-ELEVENLABS_AUTO_MODE = os.getenv("ELEVENLABS_AUTO_MODE", "1").strip().lower() in {"1", "true", "yes", "on"}
-DEFAULT_OPENAI_REASONING_EFFORT = (os.getenv("OPENAI_REASONING_EFFORT", "low") or "low").strip().lower()
-DEFAULT_OPENAI_VERBOSITY = (os.getenv("OPENAI_VERBOSITY", "low") or "low").strip().lower()
-DEFAULT_OPENAI_MAX_COMPLETION_TOKENS = int(os.getenv("OPENAI_MAX_COMPLETION_TOKENS", "220"))
-PHONE_LOW_LATENCY_MAX_TOKENS = int(os.getenv("PHONE_LOW_LATENCY_MAX_TOKENS", "80"))
-OPENAI_REALTIME_TURN_MODE = (os.getenv("OPENAI_REALTIME_TURN_MODE", "server_vad") or "server_vad").strip().lower()
-OPENAI_REALTIME_SEMANTIC_EAGERNESS = (os.getenv("OPENAI_REALTIME_SEMANTIC_EAGERNESS", "high") or "high").strip().lower()
-OPENAI_REALTIME_VAD_THRESHOLD = float(os.getenv("OPENAI_REALTIME_VAD_THRESHOLD", "0.45"))
-OPENAI_REALTIME_PREFIX_PADDING_MS = int(os.getenv("OPENAI_REALTIME_PREFIX_PADDING_MS", "150"))
-OPENAI_REALTIME_SILENCE_DURATION_MS = int(os.getenv("OPENAI_REALTIME_SILENCE_DURATION_MS", "200"))
-INITIAL_GREETING_WAIT_FOR_PARTICIPANT_SEC = float(os.getenv("INITIAL_GREETING_WAIT_FOR_PARTICIPANT_SEC", "20"))
-STRICT_PROMPT_TOOL_FILTER = os.getenv("STRICT_PROMPT_TOOL_FILTER", "1").strip().lower() not in {"0", "false", "no", "off"}
-USE_DISPATCH_NAME_INBOUND_FALLBACK = os.getenv("USE_DISPATCH_NAME_INBOUND_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}
-DEEPGRAM_STT_PHONE_MODEL = os.getenv("DEEPGRAM_STT_PHONE_MODEL", "nova-3").strip() or "nova-3"
-DEEPGRAM_STT_WEB_MODEL = os.getenv("DEEPGRAM_STT_WEB_MODEL", "nova-3").strip() or "nova-3"
-
-_dashboard_api_client: Optional[httpx.AsyncClient] = None
-
-EMAIL_SPELLING_POLICY = (
-    "STRICT SPELLING RULES:\n"
-    "- When asked to spell an email address, spell each character individually (e.g., \"n, e, e, s, h, u\").\n"
-    "- Do NOT use NATO/phonetic words (e.g., \"n for november\").\n"
-    "- Use the words \"at\" and \"dot\" only for @ and .\n"
-    "- For phone numbers, read each digit individually."
+from voice_agent.config import (
+    logger,
+    DASHBOARD_API_URL,
+    DEFAULT_WORKER_DISPATCH_NAME,
+    MAX_CALL_DURATION,
+    DEFAULT_TTS_PROVIDER,
+    DEFAULT_ELEVENLABS_MODEL,
+    DEFAULT_AGENT_LLM_TEMPERATURE,
+    DEFAULT_AGENT_VOICE_SPEED,
+    MIN_AGENT_LLM_TEMPERATURE,
+    MAX_AGENT_LLM_TEMPERATURE,
+    MIN_AGENT_VOICE_SPEED,
+    MAX_AGENT_VOICE_SPEED,
+    TRANSFER_HANDOFF_DELAY_SEC,
+    END_CALL_DISCONNECT_DELAY_SEC,
+    DISCONNECT_GRACE_SEC,
+    CHAT_REPLY_TIMEOUT_SEC,
+    SILENCE_REPROMPT_SEC,
+    SILENCE_REPROMPT_MAX_PER_CALL,
+    STT_ENDPOINTING_PHONE_MS,
+    STT_ENDPOINTING_WEB_MS,
+    SESSION_MIN_ENDPOINTING_DELAY,
+    SESSION_MAX_ENDPOINTING_DELAY,
+    SESSION_PREEMPTIVE_GENERATION,
+    VAD_MIN_SPEECH_DURATION,
+    VAD_MIN_SILENCE_DURATION,
+    VAD_PREFIX_PADDING_DURATION,
+    ELEVENLABS_STREAMING_LATENCY,
+    ELEVENLABS_AUTO_MODE,
+    DEFAULT_OPENAI_REASONING_EFFORT,
+    DEFAULT_OPENAI_VERBOSITY,
+    DEFAULT_OPENAI_MAX_COMPLETION_TOKENS,
+    PHONE_LOW_LATENCY_MAX_TOKENS,
+    OPENAI_REALTIME_TURN_MODE,
+    OPENAI_REALTIME_SEMANTIC_EAGERNESS,
+    OPENAI_REALTIME_VAD_THRESHOLD,
+    OPENAI_REALTIME_PREFIX_PADDING_MS,
+    OPENAI_REALTIME_SILENCE_DURATION_MS,
+    INITIAL_GREETING_WAIT_FOR_PARTICIPANT_SEC,
+    STRICT_PROMPT_TOOL_FILTER,
+    USE_DISPATCH_NAME_INBOUND_FALLBACK,
+    DEEPGRAM_STT_PHONE_MODEL,
+    DEEPGRAM_STT_WEB_MODEL,
+    EMAIL_SPELLING_POLICY,
+    DEEPGRAM_VOICE_MAP,
+    ELEVENLABS_VOICE_MAP,
+    DOUBLE_TEMPLATE_VAR_PATTERN,
+    SINGLE_TEMPLATE_VAR_PATTERN,
+    ELEVENLABS_V3_REQUIRED_LANGUAGES,
+    LANGUAGE_NAME_MAP,
 )
 
-DEEPGRAM_VOICE_MAP = {
-    "jessica": "aura-asteria-en",
-    "mark": "aura-orion-en",
-    "sarah": "aura-luna-en",
-    "michael": "aura-perseus-en",
-    "emma": "aura-hera-en",
-    "james": "aura-zeus-en",
-}
+load_dotenv()
 
-ELEVENLABS_VOICE_MAP = {
-    "jessica": "EXAVITQu4vr4xnSDxMaL",  # Bella
-    "mark": "TxGEqnHWrfWFTfGW9XjX",  # Josh
-    "sarah": "oWAxZDx7w5VEj9dCyTpo",  # Grace
-    "michael": "NMWYbVa3kjyX8aT8TtW9",  # Dominic
-    "emma": "MF3mGyEYCl7XYWbV9V6O",  # Elli
-    "james": "VR6AewLTigWG4xSOukaG",  # Arnold
-}
-DOUBLE_TEMPLATE_VAR_PATTERN = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
-SINGLE_TEMPLATE_VAR_PATTERN = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})")
-
-ELEVENLABS_V3_REQUIRED_LANGUAGES = {"ml", "ml-IN", "multi"}
-LANGUAGE_NAME_MAP = {
-    "en": "English",
-    "en-US": "English (US)",
-    "en-GB": "English (UK)",
-    "en-AU": "English (Australia)",
-    "en-IN": "English (India)",
-    "es": "Spanish",
-    "fr": "French",
-    "de": "German",
-    "it": "Italian",
-    "hi": "Hindi",
-    "hi-IN": "Hindi",
-    "ml": "Malayalam",
-    "ml-IN": "Malayalam",
-    "multi": "Multilingual",
-}
+_dashboard_api_client: Optional[httpx.AsyncClient] = None
 
 
 def get_elevenlabs_api_key() -> str:
@@ -158,10 +119,12 @@ def resolve_stt_language(language: Any) -> str:
         return "multi"
     if normalized_language in {"ml", "ml-IN"}:
         logger.warning(
-            "Malayalam selected, but the current Deepgram streaming STT path does not natively support Malayalam. "
-            "Using language=multi as the safest real-time fallback while ElevenLabs v3 handles multilingual TTS."
+            f"Language {normalized_language} selected, Deepgram doesn't support Malayalam directly. "
+            "Using language=multi for code-switching."
         )
         return "multi"
+    if normalized_language in {"hi", "hi-IN"}:
+        return "hi"
     return normalized_language
 
 
@@ -206,9 +169,7 @@ def build_tts_output_safety_instruction(tts_provider: str, tts_model: str) -> st
     if not is_elevenlabs_v3_model(tts_model):
         return ""
     return (
-        "CRITICAL TTS OUTPUT RULES: Do not output raw SSML, XML, HTML, or angle-bracket tags such as <break>. "
-        "Do not output asterisk actions like *smiles* or bracketed emotion tags like [warmly]. "
-        "Do not speak unresolved template variables like {{name}}. "
+        "CRITICAL TTS OUTPUT RULES: Do not output raw unresolved template variables like {{name}}. "
         "Speak naturally using plain words and punctuation only."
     )
 
@@ -2260,7 +2221,7 @@ async def entrypoint(ctx: JobContext):
             voice_settings = build_elevenlabs_voice_settings(
                 config,
                 voice_speed,
-                include_extended_settings=not is_v3_model,
+                include_extended_settings=True,
             )
             if voice_settings is not None:
                 eleven_kwargs["voice_settings"] = voice_settings
@@ -2481,10 +2442,10 @@ async def entrypoint(ctx: JobContext):
     stt_model = "openai-realtime-native"
     if not use_realtime_text_tts:
         stt_language = resolve_stt_language(agent_lang)
-        # Use Nova-2 for multilingual (language=multi) because it has better code-switching
-        # Use Nova-3 for specific languages (faster, more accurate)
         if stt_language == "multi":
-            stt_model = "nova-2"
+            stt_model = "nova-3"
+        elif stt_language == "hi":
+            stt_model = "nova-3"
         else:
             stt_model = "nova-3"
         stt_kwargs: Dict[str, Any] = {
@@ -2498,8 +2459,11 @@ async def entrypoint(ctx: JobContext):
         if _callable_supports_kwarg(deepgram.STT, "punctuate"):
             stt_kwargs["punctuate"] = True
         if _callable_supports_kwarg(deepgram.STT, "endpointing_ms"):
-            raw_endpointing = STT_ENDPOINTING_PHONE_MS if is_phone_call else STT_ENDPOINTING_WEB_MS
-            stt_kwargs["endpointing_ms"] = _coerce_setting_int(raw_endpointing, default=120 if is_phone_call else 80, min_value=25, max_value=1500)
+            if stt_language == "multi":
+                stt_kwargs["endpointing_ms"] = 100
+            else:
+                raw_endpointing = STT_ENDPOINTING_PHONE_MS if is_phone_call else STT_ENDPOINTING_WEB_MS
+                stt_kwargs["endpointing_ms"] = _coerce_setting_int(raw_endpointing, default=120 if is_phone_call else 80, min_value=25, max_value=1500)
         if _callable_supports_kwarg(deepgram.STT, "no_delay"):
             stt_kwargs["no_delay"] = True
         logger.info("STT config: model=%s language=%s endpointing_ms=%s", stt_model, stt_kwargs.get("language"), stt_kwargs.get("endpointing_ms"))

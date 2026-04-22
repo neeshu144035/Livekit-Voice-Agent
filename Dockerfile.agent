@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --force-reinstall -r requirements.txt
 
+COPY voice_agent/ ./voice_agent/
 COPY agent_retell.py agent.py
 
 # Pre-warm ML models (VAD)

@@ -89,15 +89,19 @@ export default function VoiceCallModal({ isOpen, onClose, agentId, agentName }: 
       const LIVEKIT_URL = livekitUrl || process.env.NEXT_PUBLIC_LIVEKIT_URL || 'wss://13.135.81.172/rtc';
 
       const room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
         audioCaptureDefaults: {
           echoCancellation: true,
           noiseSuppression: true,
+          autoGainControl: true,
         },
         publishDefaults: {
           audioPreset: {
-            maxBitrate: 24000,
+            maxBitrate: 128000,
           },
-          dtx: true,
+          dtx: false, // disable DTX to prevent audio dropouts in conversational AI
+          stopMicTrackOnMute: false,
         },
         stopLocalTrackOnUnpublish: true,
       });
@@ -134,6 +138,16 @@ export default function VoiceCallModal({ isOpen, onClose, agentId, agentName }: 
         if (track.kind === Track.Kind.Audio) {
           const audioElement = track.attach();
           audioElementRef.current = audioElement;
+          audioElement.autoplay = true;
+          audioElement.muted = false;
+          // Resume AudioContext if suspended (browser policy)
+          const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+          if (AudioCtx) {
+            const ctx = new AudioCtx();
+            if (ctx.state === 'suspended') {
+              ctx.resume().catch(() => {});
+            }
+          }
           audioElement.play().catch(e => console.error('Error playing audio:', e));
           setIsAgentSpeaking(true);
         }

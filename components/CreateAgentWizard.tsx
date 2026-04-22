@@ -638,24 +638,8 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                                                 </option>
                                             ))}
                                         </select>
-                                        {selectedTtsModel && selectedTtsModel.includes('v3') && (
-                                            <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
-                                                <span className="w-2 h-2 bg-amber-500 rounded-full" />
-                                                <span className="text-xs text-amber-700 font-medium">v3 is the expressive path, but Flash v2.5 is the lower-latency choice for live calls when the language supports it</span>
-                                            </div>
-                                        )}
-                                        {compatibleElevenModels.length > 0 && compatibleElevenModels.length !== ttsModels.length && (
-                                            <div className="flex items-center gap-2 px-3 py-1.5 bg-sky-50 border border-sky-200 rounded-lg">
-                                                <span className="w-2 h-2 bg-sky-500 rounded-full" />
-                                                <span className="text-xs text-sky-700 font-medium">Showing models compatible with {selectedLanguageLabel}</span>
-                                            </div>
-                                        )}
-                                        {selectedTtsModel && !selectedTtsModel.includes('v3') && ttsVoices.length > 0 && (
-                                            <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
-                                                <span className="w-2 h-2 bg-amber-500 rounded-full" />
-                                                <span className="text-xs text-amber-700 font-medium">Showing {ttsVoices.length} voices compatible with {selectedTtsModel}</span>
-                                            </div>
-                                        )}
+                                        
+                                        
                                         <div className="flex items-center gap-2">
                                             <input
                                                 type="text"

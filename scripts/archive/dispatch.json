@@ -1,0 +1,17 @@
+{
+    "name": "sarah-inbound",
+    "trunks": [
+        "ST_SWvXMHU52uP7"
+    ],
+    "dispatchRule": {
+        "type": "SIP_DISPATCH_RULE_TYPE_INDIVIDUAL",
+        "callerRoomPrefix": "call_",
+        "roomConfig": {
+            "agents": [
+                {
+                    "agentName": "sarah"
+                }
+            ]
+        }
+    }
+}

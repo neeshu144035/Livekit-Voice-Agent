@@ -1,0 +1,163 @@
+[
+    {
+        "id": 5,
+        "agent_id": 5,
+        "name": "Confirmation",
+        "description": "Call this tool when they want to book an viewing appointment",
+        "method": "POST",
+        "url": "https://oyik.cloud/webhook/3720b29b-7bcd-4985-a586-4307b280b4ec",
+        "timeout_ms": 120000,
+        "headers": {},
+        "query_params": {},
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "start": {
+                    "type": "string",
+                    "description": "date and time in ISO format on when they want to book an appoontment for viewing Eg :  2026-02-11T15:00:00Z"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "name of the user"
+                },
+                "email": {
+                    "type": "string",
+                    "description": "email of the user"
+                }
+            },
+            "required": [
+                "start",
+                "name",
+                "email"
+            ]
+        },
+        "variables": {},
+        "speak_during_execution": false,
+        "speak_after_execution": true,
+        "created_at": "2026-02-23T18:12:39.866150",
+        "updated_at": "2026-02-23T18:12:39.866155"
+    },
+    {
+        "id": 4,
+        "agent_id": 5,
+        "name": "currentdatetime",
+        "description": "To get current date and time",
+        "method": "POST",
+        "url": "https://oyik.cloud/webhook/0b608626-2afc-421e-b591-c4c87d7daa23",
+        "timeout_ms": 120000,
+        "headers": {},
+        "query_params": {},
+        "parameters_schema": {},
+        "variables": {},
+        "speak_during_execution": true,
+        "speak_after_execution": false,
+        "created_at": "2026-02-23T18:11:41.360222",
+        "updated_at": "2026-02-23T18:11:41.360227"
+    },
+    {
+        "id": 3,
+        "agent_id": 5,
+        "name": "Lead_Capture",
+        "description": "Call this tool for storing leads details in CRM immediately after booking ",
+        "method": "POST",
+        "url": "https://oyik.cloud/webhook/1aa9c900-73f5-4018-8b69-89f96ea6d88c",
+        "timeout_ms": 120000,
+        "headers": {},
+        "query_params": {},
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "Email": {
+                    "type": "string",
+                    "description": "Caller\u2019s email collected by the voice agent."
+                },
+                "Full_Name": {
+                    "type": "string",
+                    "description": "Caller\u2019s full name provided during the call."
+                },
+                "Phone": {
+                    "type": "string",
+                    "description": "Caller\u2019s contact number captured in the call."
+                }
+            },
+            "required": []
+        },
+        "variables": {},
+        "speak_during_execution": false,
+        "speak_after_execution": true,
+        "created_at": "2026-02-23T18:11:10.872970",
+        "updated_at": "2026-02-23T18:11:10.872976"
+    },
+    {
+        "id": 2,
+        "agent_id": 5,
+        "name": "Viewing_availability",
+        "description": "To  check availability of property viewing",
+        "method": "POST",
+        "url": "https://oyik.cloud/webhook/4246ef63-9c62-4263-af70-af7ecc4aecfb",
+        "timeout_ms": 120000,
+        "headers": {},
+        "query_params": {},
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "start": {
+                    "type": "string",
+                    "description": "Starting date and time range in ISO format to check available slots, but should be same as end time, there should be atleast one hour gap Eg :  2026-02-11T15:00:00Z"
+                },
+                "property_matches": {
+                    "type": "string",
+                    "description": "Which property they want to view,it must be exact property name "
+                },
+                "end": {
+                    "type": "string",
+                    "description": "Ending date and time range in ISO format to check available slots,but should be same as start time, there should be atleast one hour gap Eg :  2026-02-11T15:00:00Z"
+                }
+            },
+            "required": [
+                "start",
+                "property_matches",
+                "end"
+            ]
+        },
+        "variables": {},
+        "speak_during_execution": false,
+        "speak_after_execution": true,
+        "created_at": "2026-02-23T18:09:35.429942",
+        "updated_at": "2026-02-23T18:09:35.429947"
+    },
+    {
+        "id": 1,
+        "agent_id": 5,
+        "name": "Property_search",
+        "description": "To get the available properties according to their specs",
+        "method": "POST",
+        "url": "https://oyik.cloud/webhook/37897f50-1d9b-4b24-ae71-89f5b12f6cf0",
+        "timeout_ms": 120000,
+        "headers": {},
+        "query_params": {},
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "postcode": {
+                    "type": "string",
+                    "description": "Zone region in which they want to rent/buy a property like LE1/LE2"
+                },
+                "property_type": {
+                    "type": "string",
+                    "description": "Type of the property it can be house/flat."
+                },
+                "budget": {
+                    "type": "string",
+                    "description": "Budget of the property they are looking for in format of  \"\u00a3XXX\""
+                }
+            },
+            "required": []
+        },
+        "variables": {},
+        "speak_during_execution": false,
+        "speak_after_execution": true,
+        "created_at": "2026-02-23T11:22:22.942813",
+        "updated_at": "2026-02-23T11:40:33.512734"
+    }
+]

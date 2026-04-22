@@ -1,0 +1,15 @@
+{
+    "name": "sarah-inbound",
+    "dispatchRule": {
+        "dispatchRuleIndividual": {
+            "roomPrefix": "call-"
+        }
+    },
+    "roomConfig": {
+        "agents": [
+            {
+                "agentName": "sarah"
+            }
+        ]
+    }
+}

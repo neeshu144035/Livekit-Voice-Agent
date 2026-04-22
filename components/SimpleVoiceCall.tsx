@@ -93,6 +93,19 @@ export default function SimpleVoiceCall({ agentId, agentName }: SimpleVoiceCallP
             const room = new Room({
                 adaptiveStream: true,
                 dynacast: true,
+                audioCaptureDefaults: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                },
+                publishDefaults: {
+                    audioPreset: {
+                        maxBitrate: 128000,
+                    },
+                    dtx: false,
+                    stopMicTrackOnMute: false,
+                },
+                stopLocalTrackOnUnpublish: true,
             });
 
             roomRef.current = room;
@@ -114,7 +127,16 @@ export default function SimpleVoiceCall({ agentId, agentName }: SimpleVoiceCallP
                     console.log('[Room] Audio track subscribed from:', participant.identity);
                     const audioElement = track.attach();
                     audioElementRef.current = audioElement;
+                    audioElement.autoplay = true;
+                    audioElement.muted = false;
                     document.body.appendChild(audioElement);
+                    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+                    if (AudioCtx) {
+                        const ctx = new AudioCtx();
+                        if (ctx.state === 'suspended') {
+                            ctx.resume().catch(() => {});
+                        }
+                    }
                     audioElement.play().catch(console.error);
                 }
             });

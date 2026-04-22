@@ -53,6 +53,12 @@ server_status.txt
 va_*.txt
 sip_*.txt
 api*.txt
+nul
+
+# Scripts with secrets (API keys, credentials)
+scripts/debug/*.py
+scripts/debug/*.txt
+scripts/archive/outbound-trunk.json
 
 # Keep the repo focused on the active app/runtime only
 app-original/
