@@ -1,3 +1,4 @@
+from backend.logging_config import get_logger
 from fastapi import APIRouter, HTTPException
 from typing import Optional, List, Dict, Any
 import httpx
@@ -9,6 +10,8 @@ from backend.constants import (
 )
 
 logger = logging.getLogger("backend-api")
+
+logger = get_logger("router_tts")
 router = APIRouter(prefix="/api/tts", tags=["tts"])
 
 def get_elevenlabs_api_key():

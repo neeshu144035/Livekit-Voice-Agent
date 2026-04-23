@@ -4,9 +4,12 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from sqlalchemy import or_
 
+from backend.logging_config import get_logger
 from backend.models import get_database, PhoneNumberModel, AgentModel
 from backend.schemas import PhoneNumberCreate, PhoneNumberUpdate, PhoneNumberResponse
 
+
+logger = get_logger("router_phone_numbers")
 router = APIRouter(prefix="/api/phone-numbers", tags=["phone-numbers"])
 
 @router.get("/sip-endpoint")

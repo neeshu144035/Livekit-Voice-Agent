@@ -9,23 +9,22 @@ if env_path.exists():
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import logging
 
 from backend.models import engine, SessionLocal, Base, get_database
 from backend.constants import LIVEKIT_URL
+from backend.logging_config import get_logger, LogContext
 from backend.routers import (
-    router_auth,
-    router_agents,
-    router_chat_agents,
-    router_calls,
-    router_tts,
-    router_phone_numbers,
-    router_webhooks,
-    router_analytics,
+router_auth,
+router_agents,
+router_chat_agents,
+router_calls,
+router_tts,
+router_phone_numbers,
+router_webhooks,
+router_analytics,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("backend-api")
+logger = get_logger("backend-api")
 
 app = FastAPI(title="Voice AI API", version="2.0.0")
 

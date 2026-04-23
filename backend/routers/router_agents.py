@@ -4,6 +4,7 @@ from typing import List
 from datetime import datetime
 from sqlalchemy import or_
 
+from backend.logging_config import get_logger
 from backend.models import get_database, AgentModel, FunctionModel, CallModel, TranscriptModel, WebhookLogModel, PhoneNumberModel
 from backend.schemas import AgentCreate, AgentUpdate, AgentResponse, AgentDuplicateRequest
 from backend.constants import (
@@ -19,6 +20,8 @@ from backend.agent_utils import (
     serialize_agent
 )
 
+
+logger = get_logger("router_agents")
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
 @router.post("/", response_model=AgentResponse, status_code=201)

@@ -3,8 +3,11 @@ from sqlalchemy.orm import Session
 from typing import Dict, Any, Optional
 from datetime import datetime
 
+from backend.logging_config import get_logger
 from backend.models import get_database, CallModel, WebhookLogModel, PhoneNumberModel
 
+
+logger = get_logger("router_webhooks")
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
 @router.post("/twilio-status/{call_id}")

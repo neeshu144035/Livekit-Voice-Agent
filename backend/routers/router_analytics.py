@@ -3,8 +3,11 @@ from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 
+from backend.logging_config import get_logger
 from backend.models import get_database, CallModel, AgentModel, WebhookLogModel
 
+
+logger = get_logger("router_analytics")
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 @router.get("/")

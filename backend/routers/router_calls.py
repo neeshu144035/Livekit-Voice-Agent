@@ -3,10 +3,13 @@ from sqlalchemy.orm import Session
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
+from backend.logging_config import get_logger
 from backend.models import get_database, CallModel, TranscriptModel, WebhookLogModel, AgentModel
 from backend.schemas import CallCreate, CallResponse, OutboundCallRequest
 from backend.constants import DEFAULT_CALL_DIRECTION
 
+
+logger = get_logger("router_calls")
 router = APIRouter(prefix="/api/calls", tags=["calls"])
 
 @router.post("/", response_model=CallResponse)
