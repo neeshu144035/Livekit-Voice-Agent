@@ -6,7 +6,11 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.orm.attributes import flag_modified
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:password123@localhost:5432/dashboard_db")
+def get_database_url() -> str:
+    """Get database URL from environment variable."""
+    return os.getenv("DATABASE_URL", "postgresql://admin:password123@localhost:5432/dashboard_db")
+
+DATABASE_URL = get_database_url()
 
 engine = create_engine(
     DATABASE_URL,
@@ -177,13 +181,9 @@ class PhoneNumberModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    __table_args__ = (
-        Index('idx_phone_numbers_agent_id', 'inbound_agent_id'),
-    )
-
-
-# Ensure tables exist
-Base.metadata.create_all(bind=engine)
+__table_args__ = (
+    Index('idx_phone_numbers_agent_id', 'inbound_agent_id'),
+)
 
 
 def get_database():
