@@ -22,6 +22,9 @@ router_tts,
 router_phone_numbers,
 router_webhooks,
 router_analytics,
+router_capacity,
+router_transfer,
+router_versions,
 )
 
 logger = get_logger("backend-api")
@@ -44,6 +47,9 @@ app.include_router(router_tts.router)
 app.include_router(router_phone_numbers.router)
 app.include_router(router_webhooks.router)
 app.include_router(router_analytics.router)
+app.include_router(router_capacity.router)
+app.include_router(router_transfer.router)
+app.include_router(router_versions.router)
 
 @app.on_event("startup")
 async def startup_event():
