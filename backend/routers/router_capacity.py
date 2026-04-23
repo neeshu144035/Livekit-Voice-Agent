@@ -62,30 +62,36 @@ async def configure_capacity(config: Dict[str, Any], db: Session = Depends(get_d
 
 @router.post("/call/start")
 async def start_call(call_data: Dict[str, Any], db: Session = Depends(get_database)):
+    """Start a call - voice agents handle calls simultaneously, no queuing"""
     capacity = db.query(SystemCapacity).first()
     if not capacity:
         capacity = SystemCapacity()
         db.add(capacity)
         db.commit()
     
-    if capacity.current_concurrent_calls >= capacity.max_concurrent_calls:
-        if capacity.queue_enabled and capacity.current_queue_size < capacity.max_queue_size:
-            capacity.current_queue_size += 1
-            db.commit()
-            logger.info(f"Call queued, position: {capacity.current_queue_size}")
-            return {"status": "queued", "position": capacity.current_queue_size, "message": "All agents busy, you are in queue"}
-        else:
-            logger.warning("Call rejected - capacity full")
-            raise HTTPException(status_code=503, detail="System at maximum capacity")
-    
+    # Voice agents can handle multiple calls simultaneously
+    # Just increment counter for monitoring, never reject
     capacity.current_concurrent_calls += 1
     db.commit()
     
+    utilization = (capacity.current_concurrent_calls / capacity.max_concurrent_calls * 100) if capacity.max_concurrent_calls > 0 else 0
+    
+    # Auto-scale warning if approaching limit
+    if utilization > 90:
+        logger.warning(f"High load: {capacity.current_concurrent_calls}/{capacity.max_concurrent_calls} calls - consider scaling workers")
+    
     logger.info(f"Call started, concurrent: {capacity.current_concurrent_calls}/{capacity.max_concurrent_calls}")
-    return {"status": "accepted", "concurrent_calls": capacity.current_concurrent_calls}
+    return {
+        "status": "accepted", 
+        "concurrent_calls": capacity.current_concurrent_calls,
+        "max_concurrent": capacity.max_concurrent_calls,
+        "utilization_percent": round(utilization, 1),
+        "message": f"Call accepted - voice agent handling {capacity.current_concurrent_calls} simultaneous calls"
+    }
 
 @router.post("/call/end")
 async def end_call(call_data: Dict[str, Any], db: Session = Depends(get_database)):
+    """End a call - release capacity slot"""
     capacity = db.query(SystemCapacity).first()
     if not capacity:
         raise HTTPException(status_code=404, detail="Capacity not configured")
@@ -93,13 +99,16 @@ async def end_call(call_data: Dict[str, Any], db: Session = Depends(get_database
     if capacity.current_concurrent_calls > 0:
         capacity.current_concurrent_calls -= 1
     
-    if capacity.current_queue_size > 0:
-        capacity.current_queue_size -= 1
-    
     db.commit()
     
-    logger.info(f"Call ended, concurrent: {capacity.current_concurrent_calls}/{capacity.max_concurrent_calls}")
-    return {"status": "ended", "concurrent_calls": capacity.current_concurrent_calls}
+    utilization = (capacity.current_concurrent_calls / capacity.max_concurrent_calls * 100) if capacity.max_concurrent_calls > 0 else 0
+    logger.info(f"Call ended, concurrent: {capacity.current_concurrent_calls}/{capacity.max_concurrent_calls} ({utilization:.1f}% utilization)")
+    
+    return {
+        "status": "ended", 
+        "concurrent_calls": capacity.current_concurrent_calls,
+        "utilization_percent": round(utilization, 1)
+    }
 
 @router.get("/metrics")
 async def get_capacity_metrics(db: Session = Depends(get_database)):
@@ -112,8 +121,10 @@ async def get_capacity_metrics(db: Session = Depends(get_database)):
     return {
         "utilization_percent": round(utilization, 2),
         "status": "healthy" if utilization < 80 else "warning" if utilization < 95 else "critical",
-        "calls_accepted": capacity.max_concurrent_calls - capacity.current_concurrent_calls,
-        "calls_queued": capacity.current_queue_size,
+        "concurrent_calls": capacity.current_concurrent_calls,
+        "max_concurrent_calls": capacity.max_concurrent_calls,
+        "available_slots": max(0, capacity.max_concurrent_calls - capacity.current_concurrent_calls),
         "avg_duration_seconds": capacity.avg_call_duration_seconds,
-        "estimated_wait_time_seconds": round(capacity.avg_call_duration_seconds * (capacity.current_queue_size + 1) / max(1, capacity.max_concurrent_calls), 1),
+        "voice_agent_advantage": "Voice agents handle multiple calls simultaneously - no queuing needed",
+        "scaling_recommendation": "Add more worker instances" if utilization > 80 else "Current capacity sufficient",
     }

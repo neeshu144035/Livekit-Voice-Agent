@@ -187,20 +187,23 @@ __table_args__ = (
 
 
 class SystemCapacity(Base):
+    """Track system capacity for voice agent concurrent call handling.
+    
+    Voice agents can handle multiple calls simultaneously (unlike humans).
+    This tracks how many concurrent calls each agent worker is handling.
+    Typical settings: 10-20 concurrent calls per worker instance.
+    """
     __tablename__ = "system_capacity"
     
     id = Column(Integer, primary_key=True, index=True)
     max_concurrent_calls = Column(Integer, default=10, nullable=False)
     current_concurrent_calls = Column(Integer, default=0, nullable=False)
-    queue_enabled = Column(Boolean, default=True)
-    max_queue_size = Column(Integer, default=50)
-    current_queue_size = Column(Integer, default=0)
     avg_call_duration_seconds = Column(Float, default=120.0)
     peak_hours_start = Column(Integer, default=9)
     peak_hours_end = Column(Integer, default=18)
     auto_scale_enabled = Column(Boolean, default=False)
-    scale_up_threshold = Column(Float, default=0.8)
-    scale_down_threshold = Column(Float, default=0.3)
+    scale_up_threshold = Column(Float, default=0.8)  # Add worker at 80% load
+    scale_down_threshold = Column(Float, default=0.3)  # Remove worker at 30% load
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
 
