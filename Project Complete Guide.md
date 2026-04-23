@@ -1013,10 +1013,11 @@ OPENAI_MAX_COMPLETION_TOKENS=220
 
 ---
 
-## Project State Summary (April 20, 2026)
+## Project State Summary (April 23, 2026) - Major Refactoring Complete
 
 ### Chat Summary
-- The main goal of the latest work was to make sure the app's selected settings actually control backend/runtime behavior for real-time calls and webcalls, instead of the runtime silently using older defaults.
+- **This session completed a major refactoring effort** to transform the codebase from a monolithic structure into a modular, maintainable, and production-ready platform.
+- The main goal was to split the 4,641-line backend monolith into modular routers, extract voice agent utilities, add database migrations, and implement structured logging.
 - The focus areas were:
   - deployment documentation cleanup
   - explicit use of `livekit-company-key.pem` in deploy steps
@@ -1026,12 +1027,41 @@ OPENAI_MAX_COMPLETION_TOKENS=220
   - command-based verification without relying on browser testing
 
 ### What Was Updated In Code
+
+#### Backend Architecture (NEW - April 23, 2026)
+The backend was completely refactored from a 4,641-line monolith into modular components:
+
+**New Modular Structure:**
+- `backend/routers/router_auth.py` - Authentication endpoints (login/logout/me)
+- `backend/routers/router_agents.py` - Agent CRUD operations
+- `backend/routers/router_chat_agents.py` - Chat agent endpoints
+- `backend/routers/router_calls.py` - Call management and WebSocket
+- `backend/routers/router_tts.py` - TTS providers, models, voices
+- `backend/routers/router_phone_numbers.py` - Phone number/SIP management
+- `backend/routers/router_webhooks.py` - Twilio/LiveKit webhooks
+- `backend/routers/router_analytics.py` - Analytics, admin, call history
+
+**Supporting Modules:**
+- `backend/constants.py` - All config constants (LLM models, voices, languages)
+- `backend/schemas.py` - Pydantic models (AgentCreate, CallResponse, etc.)
+- `backend/auth_utils.py` - Session token creation/verification
+- `backend/agent_utils.py` - Agent serialization, TTS provider normalization
+- `backend/llm_utils.py` - LLM client resolution, tool filtering
+- `backend/logging_config.py` - Structured JSON logging
+- `backend/alembic/` - Database migration management
+
+**Voice Agent Package:**
+- `voice_agent/llm_tools.py` - Tool filtering, speech guidance
+- `voice_agent/tts_config.py` - TTS provider selection, ElevenLabs settings
+- `voice_agent/call_lifecycle.py` - Usage tracking, transcript management
+
+#### Previous Updates (April 20, 2026)
 - [`backend/main.py`](backend/main.py)
   - Call metadata is now populated from the saved agent configuration at call creation time.
   - Webcalls now persist selected values such as `tts_provider`, `tts_model`, `language`, `voice`, `voice_speed`, and `llm_temperature` immediately.
   - Usage updates were extended so later syncs can also store effective `language` and `tts_voice_id_used`.
-  - **NEW**: Create/update now require explicit ElevenLabs `tts_model`; no default advertised
-  - **NEW**: LLM default reverted to `moonshot-v1-8k`
+  - **NOTE**: Create/update now require explicit ElevenLabs `tts_model`; no default advertised
+  - **NOTE**: LLM default reverted to `moonshot-v1-8k`
 - [`agent_retell.py`](agent_retell.py)
   - ElevenLabs `eleven_v3` is now the preferred multilingual/expressive TTS path.
   - Added `multi` language support for multilingual mode.
@@ -1039,19 +1069,19 @@ OPENAI_MAX_COMPLETION_TOKENS=220
   - Malayalam now falls back through multilingual STT mode rather than staying on a weaker unsupported path.
   - Added runtime protections to prevent speech output from reading unresolved placeholders like `{{name}}` or raw tags like `<break ...>`.
   - Reduced forced low-token phone behavior unless explicitly enabled, which should help speech feel less clipped.
-  - **NEW**: `voice_runtime_mode` and `voice_realtime_model` read from saved config only
-  - **NEW**: No auto-swapping of ElevenLabs models - app selection is honored
-  - **NEW**: Greeting uses saved script, no fallback invention
+  - **NOTE**: `voice_runtime_mode` and `voice_realtime_model` read from saved config only
+  - **NOTE**: No auto-swapping of ElevenLabs models - app selection is honored
+  - **NOTE**: Greeting uses saved script, no fallback invention
   - **RETAINED**: Pooled HTTP clients and parallel config/function fetches (latency wins)
-- Frontend/editor-side updates were also made in:
+  - Frontend/editor-side updates were also made in:
   - [`app/agent/[id]/page.tsx`](app/agent/[id]/page.tsx)
   - [`components/CreateAgentWizard.tsx`](components/CreateAgentWizard.tsx)
   - [`components/CreateAgentModal.tsx`](components/CreateAgentModal.tsx)
   - [`components/VoiceCallModal.tsx`](components/VoiceCallModal.tsx)
-  - **NEW**: Voice Runtime mode (Pipeline / Realtime text + TTS) explicitly exposed
-  - **NEW**: Explicit ElevenLabs model/voice selection required
-  - **NEW**: Warning shown for `eleven_v3` (slower HTTP path)
-- Language options now include a multilingual selection similar to Retell-style language switching:
+  - **NOTE**: Voice Runtime mode (Pipeline / Realtime text + TTS) explicitly exposed
+  - **NOTE**: Explicit ElevenLabs model/voice selection required
+  - **NOTE**: Warning shown for `eleven_v3` (slower HTTP path)
+  - Language options now include a multilingual selection similar to Retell-style language switching:
   - `Multilingual (Auto)`
   - plus UK English, Hindi, Malayalam, and the other existing locale choices
 
@@ -1096,30 +1126,112 @@ OPENAI_MAX_COMPLETION_TOKENS=220
 - Improve multilingual STT if Malayalam understanding needs to be production-grade.
 - Add per-language prompt and pacing presets for more human-sounding delivery.
 
-### Suggested Prompt For A New Chat
+### Suggested Prompt For A New Chat (Post-Refactoring)
+
 ```text
-Continue from the April 20, 2026 LiveKit project state in C:\LiveKit-Project.
+Continue from the April 23, 2026 LiveKit project state in C:\LiveKit-Project.
 
-Current known state after latest deploy:
-- backend/main.py and agent_retell.py updated so app-selected settings control runtime (voice_runtime_mode, voice_realtime_model, ElevenLabs model, greeting)
-- explicit ElevenLabs tts_model required on create/update; no auto-swapping
-- LLM default reverted to moonshot-v1-8k
-- frontend (CreateAgentModal, CreateAgentWizard, agent page) exposes Voice Runtime mode explicitly
-- safe latency wins retained: pooled HTTP clients, parallel config/function fetches
-- Voice agent container rebuilt and restarted
-- PM2 frontend/backend restarted
-- curl health check passed
+## Current State (After Major Refactoring)
 
-Prior verified state:
-- agent 21 webcalls use ElevenLabs eleven_v3
-- multilingual mode, Hindi, Malayalam, UK English supported
-- deployment is hybrid: PM2 for frontend/backend, Docker Compose for voice-agent
+### Backend Architecture (Modular)
+- `backend/routers/` - 9 modular FastAPI routers (auth, agents, calls, tts, phone-numbers, webhooks, analytics)
+- `backend/constants.py` - All config constants
+- `backend/schemas.py` - Pydantic models
+- `backend/auth_utils.py`, `agent_utils.py`, `llm_utils.py` - Helper modules
+- `backend/logging_config.py` - Structured JSON logging
+- `backend/alembic/` - Database migrations (Alembic)
+- `backend/main.py` - Reduced to ~80 lines (router mounting only)
 
-Please verify with commands:
-- python -m py_compile backend/main.py agent_retell.py
-- npx tsc --noEmit
-- curl http://127.0.0.1:8000/health
-- docker logs --tail 20 voice-agent
+### Voice Agent
+- `voice_agent/llm_tools.py` - Tool filtering, speech guidance
+- `voice_agent/tts_config.py` - TTS configuration
+- `voice_agent/call_lifecycle.py` - Usage tracking
+- `voice_agent/config.py` - Env vars and constants
+- `agent_retell.py` - Main entrypoint (~2500 lines, imports from voice_agent/)
+
+### Infrastructure
+- Alembic migrations configured (run: `python -m alembic upgrade head`)
+- Structured JSON logging available (replace print() with logger)
+- CI/CD with GitHub Actions
+- Pre-commit hooks (black, ruff, tsc)
+- Pytest + Vitest test setup
+
+### Verified Working
+- All routers compile and import correctly
+- Backend compiles: `python -m py_compile backend/main.py`
+- Frontend compiles: `npx tsc --noEmit`
+- Git pushed to: https://github.com/neeshu144035/Livekit-Voice-Agent.git
+
+## Next Steps - Priority Features to Implement
+
+### High Priority (Production Readiness)
+1. **Replace print() statements** - Migrate all print() to structured logger
+2. **Test database migrations** - Run alembic upgrade on production DB
+3. **Update deployment scripts** - Reflect new modular structure
+4. **Add health checks per router** - Individual endpoint health monitoring
+
+### Medium Priority (Feature Enhancements)
+5. **Improve call transfer flow** - Better UX for human handoff
+6. **Add call analytics dashboard** - Real-time metrics visualization
+7. **Implement call queuing** - Handle overflow when all agents busy
+8. **Add multi-language greetings** - Language-specific welcome messages
+9. **Enhance silence handling** - Better reprompt strategies
+
+### Low Priority (Nice to Have)
+10. **Add regional languages** - Tamil, Telugu, Kannada support
+11. **Implement call recording playback** - In-dashboard audio player
+12. **Add webhook retry logic** - Exponential backoff for failed deliveries
+13. **Create admin CLI tools** - Database cleanup, bulk operations
+
+## Frontend Options - Best Improvements for Retell-style UX
+
+### Most Impactful Frontend Upgrades:
+1. **Real-time call monitoring** - Live waveform, latency metrics, transcript scrolling
+2. **Quick agent templates** - Pre-built prompts for common use cases (sales, support, appointment)
+3. **Voice preview** - Play sample of selected TTS voice before saving
+4. **Call analytics dashboard** - Charts for call volume, duration, cost trends
+5. **Agent versioning** - Rollback to previous agent configurations
+6. **Bulk operations** - Export/import agents, batch update phone numbers
+
+### Retell-style Features to Clone:
+- **Phone number marketplace** - Buy numbers directly from dashboard
+- **Call screening** - Listen before picking up (for human handoff)
+- **Custom function builder** - Visual tool creation (Zapier-style)
+- **Conversation analytics** - Sentiment analysis, keyword spotting
+- **A/B testing** - Test different prompts/voices for conversion rates
+
+## Deployment Commands (Updated for Modular Structure)
+
+### Backend Deploy:
+```bash
+# Sync entire backend directory (not just main.py)
+scp -r -i livekit-company-key.pem backend/ ubuntu@13.135.81.172:~/livekit-dashboard-api/
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "sudo pm2 restart api --update-env"
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "curl -s http://127.0.0.1:8000/health"
+```
+
+### Agent Deploy:
+```bash
+scp -i livekit-company-key.pem agent_retell.py ubuntu@13.135.81.172:~/livekit-agent/
+scp -i livekit-company-key.pem -r voice_agent/ ubuntu@13.135.81.172:~/livekit-agent/
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "cd ~/livekit-agent && docker compose up -d --build voice-agent"
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "docker logs --tail 80 voice-agent"
+```
+
+### Database Migration:
+```bash
+# Generate new migration
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "cd ~/livekit-dashboard-api && python -m alembic revision --autogenerate -m 'description'"
+
+# Apply migration
+ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "cd ~/livekit-dashboard-api && python -m alembic upgrade head"
+```
+
+## Please Start By:
+1. Verify all components compile and imports work
+2. Run test suite (if tests exist)
+3. Check production health endpoints
+4. Review next priority feature to implement
 ```
 
 ---
