@@ -4,8 +4,7 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 
 from backend.logging_config import get_logger
-from backend.models import get_database
-from backend.models.capacity import SystemCapacity
+from backend.models import get_database, SystemCapacity
 
 logger = get_logger("router_capacity")
 router = APIRouter(prefix="/api/capacity", tags=["capacity"])
