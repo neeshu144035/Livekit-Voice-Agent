@@ -25,6 +25,8 @@ router_analytics,
 router_capacity,
 router_transfer,
 router_versions,
+router_functions,
+router_token,
 )
 
 logger = get_logger("backend-api")
@@ -50,6 +52,8 @@ app.include_router(router_analytics.router)
 app.include_router(router_capacity.router)
 app.include_router(router_transfer.router)
 app.include_router(router_versions.router)
+app.include_router(router_functions.router)
+app.include_router(router_token.router)
 
 @app.on_event("startup")
 async def startup_event():

@@ -1,4 +1,3 @@
-# Router exports
 from . import (
     router_auth,
     router_agents,
@@ -7,5 +6,10 @@ from . import (
     router_tts,
     router_phone_numbers,
     router_webhooks,
-    router_analytics
+    router_analytics,
+    router_capacity,
+    router_transfer,
+    router_versions,
+    router_functions,
+    router_token,
 )
