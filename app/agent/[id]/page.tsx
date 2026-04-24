@@ -49,6 +49,12 @@ interface Agent {
     custom_params?: Record<string, any>;
 }
 
+interface PublishedAgentVersion {
+    version: number;
+    published_at?: string;
+    snapshot?: Record<string, any>;
+}
+
 interface Function {
     id: number;
     name: string;
@@ -188,6 +194,8 @@ const SUPPORTED_LANGUAGE_OPTIONS = [
     ...LANGUAGE_OPTIONS,
     { value: 'multi', label: 'Multilingual (Auto)', flag: '' },
 ];
+const XAI_SUPPORTED_LANGUAGE_VALUES = ['multi', 'en-US', 'en-GB', 'en-AU', 'en-IN', 'hi', 'hi-IN', 'ml', 'ml-IN'];
+const XAI_SUPPORTED_LANGUAGE_SET = new Set(XAI_SUPPORTED_LANGUAGE_VALUES);
 
 const DEEPGRAM_TTS_SUPPORTED_LANGUAGES = new Set([
     'en',
@@ -243,6 +251,32 @@ const getCompatibleElevenModels = (models: TTSModelOption[], language: string) =
 
 const getLanguageLabel = (language: string) =>
     SUPPORTED_LANGUAGE_OPTIONS.find((option) => option.value === language)?.label || language;
+
+const getProviderLanguageOptions = (provider: string) => {
+    if (provider !== 'xai') return SUPPORTED_LANGUAGE_OPTIONS;
+    return [
+        ...SUPPORTED_LANGUAGE_OPTIONS.filter((option) => option.value === 'multi'),
+        ...SUPPORTED_LANGUAGE_OPTIONS.filter((option) => option.value !== 'multi' && XAI_SUPPORTED_LANGUAGE_SET.has(option.value)),
+    ];
+};
+
+const normalizeLanguageForProvider = (provider: string, language: string) => {
+    const options = getProviderLanguageOptions(provider);
+    return options.some((option) => option.value === language) ? language : (options[0]?.value || 'en-GB');
+};
+
+const normalizePublishedVersions = (raw: any): PublishedAgentVersion[] => {
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .filter((item) => item && typeof item === 'object')
+        .map((item) => ({
+            version: Number(item.version) || 0,
+            published_at: typeof item.published_at === 'string' ? item.published_at : '',
+            snapshot: item.snapshot && typeof item.snapshot === 'object' ? item.snapshot : {},
+        }))
+        .filter((item) => item.version > 0)
+        .sort((a, b) => b.version - a.version);
+};
 
 const WELCOME_OPTIONS = [
     { value: 'user_speaks_first', label: 'User speaks first' },
@@ -306,6 +340,7 @@ export default function AgentDetailPage() {
     const [welcomeMessage, setWelcomeMessage] = useState('');
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
+    const [publishing, setPublishing] = useState(false);
     const [expandedSections, setExpandedSections] = useState<string[]>([]);
     const [isEditingName, setIsEditingName] = useState(false);
     const [agentName, setAgentName] = useState('');
@@ -329,6 +364,10 @@ export default function AgentDetailPage() {
     const visibleElevenModels = compatibleElevenModels.length > 0 ? compatibleElevenModels : ttsModels;
     const visibleProviderModels = selectedTtsProvider === 'elevenlabs' ? visibleElevenModels : ttsModels;
     const selectedLanguageLabel = getLanguageLabel(selectedLanguage);
+    const providerLanguageOptions = getProviderLanguageOptions(selectedTtsProvider);
+    const publishedVersions = normalizePublishedVersions(agentCustomParams?.published_versions || agent?.custom_params?.published_versions);
+    const latestPublishedVersion = publishedVersions[0]?.version || 0;
+    const nextPublishedVersion = latestPublishedVersion + 1;
 
     const toggleSection = (section: string) => {
         setExpandedSections(prev =>
@@ -418,6 +457,17 @@ export default function AgentDetailPage() {
         const normalized = normalizeBuiltinFunctionsConfig(res.data);
         console.log('Builtin functions config loaded:', normalized);
         setAllBuiltinFunctions(normalized);
+        setAgentCustomParams((prev) => ({
+            ...(prev || {}),
+            builtin_functions: normalized,
+        }));
+        setAgent((prev) => prev ? ({
+            ...prev,
+            custom_params: {
+                ...(prev.custom_params || {}),
+                builtin_functions: normalized,
+            },
+        }) : prev);
     };
 
     const loadTtsVoicesForModel = async (provider: string, modelId?: string) => {
@@ -489,6 +539,13 @@ export default function AgentDetailPage() {
     useEffect(() => {
         loadTtsOptions(selectedTtsProvider);
     }, [selectedTtsProvider]);
+
+    useEffect(() => {
+        const normalizedLanguage = normalizeLanguageForProvider(selectedTtsProvider, selectedLanguage);
+        if (normalizedLanguage !== selectedLanguage) {
+            setSelectedLanguage(normalizedLanguage);
+        }
+    }, [selectedTtsProvider, selectedLanguage]);
 
     useEffect(() => {
         if (selectedTtsProvider !== 'xai') return;
@@ -639,6 +696,17 @@ export default function AgentDetailPage() {
             console.log('Save response:', saveRes.data);
             const persistedConfig = normalizeBuiltinFunctionsConfig(saveRes.data?.config ?? normalizedToSave);
             setAllBuiltinFunctions(persistedConfig);
+            setAgentCustomParams((prev) => ({
+                ...(prev || {}),
+                builtin_functions: persistedConfig,
+            }));
+            setAgent((prev) => prev ? ({
+                ...prev,
+                custom_params: {
+                    ...(prev.custom_params || {}),
+                    builtin_functions: persistedConfig,
+                },
+            }) : prev);
             if (!silent) showToast('Builtin functions saved successfully', 'success');
             setBuiltinSaved(true);
             
@@ -682,11 +750,56 @@ export default function AgentDetailPage() {
         closeBuiltinConfigModal();
     };
 
-    const handleSave = async () => {
-        if (!agent) return;
+    const applyPersistedAgent = (persisted: Agent) => {
+        const persistedProvider = inferProviderFromVoice(
+            persisted.voice || selectedVoice,
+            persisted.tts_provider || selectedTtsProvider,
+        );
+        const persistedCustomParams = persisted.custom_params || {};
+        const normalizedLanguage = normalizeLanguageForProvider(
+            persistedProvider,
+            persisted.language || selectedLanguage,
+        );
+
+        setAgent((prev) => ({
+            ...(prev || {}),
+            ...persisted,
+        }));
+        setAgentName(persisted.display_name || persisted.name);
+        setLivekitAgentName(persisted.agent_name || '');
+        setSystemPrompt(persisted.system_prompt || '');
+        setSelectedModel(persisted.llm_model || selectedModel);
+        setSelectedVoice(persisted.voice || selectedVoice);
+        setSelectedLanguage(normalizedLanguage);
+        setWelcomeOption(persisted.welcome_message_type || 'user_speaks_first');
+        setSelectedTtsProvider(persistedProvider);
+        setSelectedTtsModel(persisted.tts_model || (persistedProvider === 'xai' ? XAI_DEFAULT_MODEL : ''));
+        setWelcomeMessageMode(persistedCustomParams.welcome_message_mode === 'custom' ? 'custom' : 'dynamic');
+        setWelcomeMessage(persisted.welcome_message || '');
+        setAgentCustomParams(persistedCustomParams);
+        const persistedOverride = persistedCustomParams.force_phone_llm_model_override;
+        setPhoneLlmOverrideEnabled(persistedOverride === undefined ? false : Boolean(persistedOverride));
+        setPhoneLlmModel(persistedCustomParams.phone_llm_model || persisted.llm_model || phoneLlmModel);
+        setVoiceRuntimeMode(
+            persistedProvider === 'xai'
+                ? 'realtime_unified'
+                : persistedCustomParams.voice_runtime_mode === 'realtime_text_tts'
+                    ? 'realtime_text_tts'
+                    : 'pipeline'
+        );
+        setVoiceRealtimeModel(
+            persistedCustomParams.voice_realtime_model
+            || (persistedProvider === 'xai' ? (persisted.tts_model || XAI_DEFAULT_MODEL) : '')
+        );
+        const persistedSpeed = Number(persisted.voice_speed ?? persistedCustomParams.voice_speed ?? voiceSpeed);
+        setVoiceSpeed(clampNumber(persistedSpeed, MIN_VOICE_SPEED, MAX_VOICE_SPEED, voiceSpeed));
+    };
+
+    const handleSave = async (options?: { silent?: boolean }) => {
+        if (!agent) return null;
         if (selectedTtsProvider === 'deepgram' && languageRequiresElevenLabsTts(selectedLanguage)) {
             showToast(`Use ElevenLabs or xAI for ${selectedLanguageLabel}. Deepgram TTS does not support that language.`, 'error');
-            return;
+            return null;
         }
         if (!selectedVoice) {
             const voiceLabel = selectedTtsProvider === 'elevenlabs'
@@ -695,29 +808,29 @@ export default function AgentDetailPage() {
                     ? 'xAI voice'
                     : 'voice';
             showToast(`Select a ${voiceLabel}`, 'error');
-            return;
+            return null;
         }
         if (selectedTtsProvider === 'elevenlabs') {
             if (ttsVoices.length === 0) {
                 showToast('ElevenLabs voices are not available. Configure ELEVEN_API_KEY on the server.', 'error');
-                return;
+                return null;
             }
             if (visibleElevenModels.length === 0) {
                 showToast('ElevenLabs models are not available. Configure ELEVEN_API_KEY on the server.', 'error');
-                return;
+                return null;
             }
             if (!selectedTtsModel) {
                 showToast('Select an ElevenLabs model', 'error');
-                return;
+                return null;
             }
         }
         if (selectedTtsProvider === 'xai' && !selectedTtsModel) {
             showToast('Select an xAI voice model', 'error');
-            return;
+            return null;
         }
         if (selectedTtsProvider !== 'xai' && voiceRuntimeMode === 'realtime_text_tts' && !voiceRealtimeModel.trim()) {
             showToast('Enter the realtime model to use for realtime mode', 'error');
-            return;
+            return null;
         }
         setSaving(true);
         try {
@@ -763,51 +876,43 @@ export default function AgentDetailPage() {
             });
 
             const persisted = saveRes.data as Agent;
-            setAgent({
-                ...agent,
-                ...persisted,
-            });
-            setAgentName(persisted.display_name || persisted.name);
-            setLivekitAgentName(persisted.agent_name || '');
-            setSystemPrompt(persisted.system_prompt || '');
-            setSelectedModel(persisted.llm_model || selectedModel);
-            setSelectedVoice(persisted.voice || selectedVoice);
-            setSelectedLanguage(persisted.language || selectedLanguage);
-            setWelcomeOption(persisted.welcome_message_type || welcomeOption);
-            const persistedProvider = inferProviderFromVoice(persisted.voice || selectedVoice, persisted.tts_provider || selectedTtsProvider);
-            setSelectedTtsProvider(persistedProvider);
-            setSelectedTtsModel(persisted.tts_model || (persistedProvider === 'xai' ? XAI_DEFAULT_MODEL : ''));
-            const persistedCustomParams = persisted.custom_params || {};
-            setWelcomeMessageMode(persistedCustomParams.welcome_message_mode === 'custom' ? 'custom' : 'dynamic');
-            setWelcomeMessage(persisted.welcome_message || '');
-            setAgentCustomParams(persistedCustomParams);
-            const persistedOverride = persistedCustomParams.force_phone_llm_model_override;
-            setPhoneLlmOverrideEnabled(persistedOverride === undefined ? false : Boolean(persistedOverride));
-            setPhoneLlmModel(persistedCustomParams.phone_llm_model || persisted.llm_model || phoneLlmModel);
-            setVoiceRuntimeMode(
-                persistedProvider === 'xai'
-                    ? 'realtime_unified'
-                    : persistedCustomParams.voice_runtime_mode === 'realtime_text_tts'
-                        ? 'realtime_text_tts'
-                        : 'pipeline'
-            );
-            setVoiceRealtimeModel(
-                persistedCustomParams.voice_realtime_model
-                || (persistedProvider === 'xai' ? (persisted.tts_model || XAI_DEFAULT_MODEL) : '')
-            );
-            const persistedSpeed = Number(persisted.voice_speed ?? persistedCustomParams.voice_speed ?? voiceSpeed);
-            setVoiceSpeed(clampNumber(persistedSpeed, MIN_VOICE_SPEED, MAX_VOICE_SPEED, voiceSpeed));
+            applyPersistedAgent(persisted);
 
             if ((persisted.system_prompt || '') !== systemPrompt) {
                 showToast('Saved, but backend normalized system prompt. Editor now shows exact backend value.', 'error');
             }
 
-            showToast('Saved successfully!', 'success');
+            if (!options?.silent) {
+                showToast('Saved successfully!', 'success');
+            }
+            return persisted;
         } catch (err) {
             console.error('Save error:', err);
             showToast('Failed to save changes', 'error');
+            return null;
         } finally {
             setSaving(false);
+        }
+    };
+
+    const handlePublish = async () => {
+        if (publishing) return;
+        setPublishing(true);
+        try {
+            const persisted = await handleSave({ silent: true });
+            if (!persisted) return;
+            const publishRes = await axios.post(`${API_URL}agents/${agentId}/publish`);
+            const publishedAgent = publishRes.data?.agent as Agent | undefined;
+            if (publishedAgent) {
+                applyPersistedAgent(publishedAgent);
+            }
+            const publishedVersion = Number(publishRes.data?.version) || nextPublishedVersion;
+            showToast(`Published version v${publishedVersion}`, 'success');
+        } catch (err) {
+            console.error('Publish error:', err);
+            showToast('Failed to publish version', 'error');
+        } finally {
+            setPublishing(false);
         }
     };
 
@@ -898,7 +1003,7 @@ export default function AgentDetailPage() {
     return (
         <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
             {/* Main Content - full screen for agent editing */}
-            <main className="overflow-auto">
+            <main className="overflow-hidden">
                 {/* Header */}
                 <div className="border-b border-gray-200 bg-white">
                     <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between px-4 sm:px-6 py-3 sm:h-16 gap-3">
@@ -948,6 +1053,8 @@ export default function AgentDetailPage() {
                                         </button>
                                         <span>•</span>
                                         <span>{MODEL_OPTIONS.find(m => m.value === selectedModel)?.price || '$0.00/min'}</span>
+                                        <span>&bull;</span>
+                                        <span>{latestPublishedVersion > 0 ? `Published v${latestPublishedVersion}` : 'Draft only'}</span>
                                     </div>
                                 </div>
                             </div>
@@ -955,7 +1062,7 @@ export default function AgentDetailPage() {
 
                         <div className="flex items-center gap-2 sm:gap-3">
                             <button
-                                onClick={handleSave}
+                                onClick={() => { void handleSave(); }}
                                 disabled={saving}
                                 className="flex items-center gap-2 px-3 sm:px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg disabled:opacity-50"
                             >
@@ -971,21 +1078,22 @@ export default function AgentDetailPage() {
                             </button>
 
                             <button
-                                onClick={handleSave}
-                                className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-gray-900 text-white text-sm font-medium rounded-lg hover:bg-gray-800"
+                                onClick={() => { void handlePublish(); }}
+                                disabled={saving || publishing}
+                                className="flex items-center gap-2 px-3 sm:px-4 py-2 bg-gray-900 text-white text-sm font-medium rounded-lg hover:bg-gray-800 disabled:opacity-60"
                             >
-                                <Play className="w-4 h-4" />
-                                <span className="hidden sm:inline">Publish</span>
+                                {publishing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                                <span className="hidden sm:inline">Publish v{nextPublishedVersion}</span>
                             </button>
                         </div>
                     </div>
                 </div>
 
                 {/* Main Content - 3 Column Layout */}
-                <div className="flex h-[calc(100vh-64px)]">
+                <div className="flex h-[calc(100vh-64px)] overflow-hidden">
 
                     {/* Left Column - Prompt Editor (45%) */}
-                    <div className="w-[45%] flex flex-col border-r border-gray-200">
+                    <div className="flex min-h-0 min-w-0 w-[45%] flex-col border-r border-gray-200 bg-white">
                         {/* Model Selectors */}
                         <div className="px-4 sm:px-6 py-3 border-b border-gray-200">
                             <div className="flex flex-wrap items-center gap-2 sm:gap-3">
@@ -1093,37 +1201,6 @@ export default function AgentDetailPage() {
                                     </div>
                                 )}
 
-                                {selectedTtsProvider === 'elevenlabs' && selectedTtsModel && selectedTtsModel.includes('v3') && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-amber-500 rounded-full" />
-                                        <span className="text-xs text-amber-700 font-medium">v3 is the expressive path, but Flash v2.5 is the lower-latency choice for live calls when the language supports it</span>
-                                    </div>
-                                )}
-                                {selectedTtsProvider === 'xai' && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-blue-500 rounded-full" />
-                                        <span className="text-xs text-blue-700 font-medium">xAI uses a unified realtime voice pipeline, so speech recognition, reasoning, and speech output all come from the same model.</span>
-                                    </div>
-                                )}
-                                {selectedTtsProvider === 'xai' && selectedTtsModel === 'grok-voice-fast-1.0' && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-amber-500 rounded-full" />
-                                        <span className="text-xs text-amber-700 font-medium">`grok-voice-fast-1.0` is legacy. Prefer `grok-voice-think-fast-1.0` for the current xAI voice path.</span>
-                                    </div>
-                                )}
-                                {selectedTtsProvider === 'elevenlabs' && compatibleElevenModels.length > 0 && compatibleElevenModels.length !== ttsModels.length && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-sky-50 border border-sky-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-sky-500 rounded-full" />
-                                        <span className="text-xs text-sky-700 font-medium">Showing models compatible with {selectedLanguageLabel}</span>
-                                    </div>
-                                )}
-                                {selectedTtsProvider === 'elevenlabs' && selectedTtsModel && !selectedTtsModel.includes('v3') && ttsVoices.length > 0 && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-amber-500 rounded-full" />
-                                        <span className="text-xs text-amber-700 font-medium">Showing {ttsVoices.length} voices for {selectedTtsModel}</span>
-                                    </div>
-                                )}
-
                                 {/* Language Dropdown */}
                                 <div className="relative min-w-[175px]">
                                     <select
@@ -1131,7 +1208,7 @@ export default function AgentDetailPage() {
                                         onChange={(e) => setSelectedLanguage(e.target.value)}
                                         className="w-full appearance-none px-3 py-2 pr-8 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200 focus:outline-none cursor-pointer"
                                     >
-                                        {SUPPORTED_LANGUAGE_OPTIONS.map(lang => (
+                                        {providerLanguageOptions.map(lang => (
                                             <option key={lang.value} value={lang.value}>
                                                 {lang.flag} {lang.label}
                                             </option>
@@ -1139,19 +1216,6 @@ export default function AgentDetailPage() {
                                     </select>
                                     <ChevronDown className="absolute right-2 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-500 pointer-events-none" />
                                 </div>
-                                {selectedTtsProvider === 'elevenlabs' && selectedLanguage === 'multi' && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-blue-500 rounded-full" />
-                                        <span className="text-xs text-blue-700 font-medium">Multilingual mode keeps the agent on a multilingual ElevenLabs model and lets it follow the caller&apos;s language</span>
-                                    </div>
-                                )}
-                                {selectedTtsProvider === 'xai' && selectedLanguage === 'multi' && (
-                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg">
-                                        <span className="w-2 h-2 bg-blue-500 rounded-full" />
-                                        <span className="text-xs text-blue-700 font-medium">xAI voice can automatically detect and answer in the caller&apos;s language while staying on the unified realtime model.</span>
-                                    </div>
-                                )}
-
                                 <button
                                     type="button"
                                     onClick={() => setShowAdvancedVoiceLlmSettings(prev => !prev)}
@@ -1232,9 +1296,6 @@ export default function AgentDetailPage() {
                                                 >
                                                     <option value="realtime_unified">Realtime unified (xAI)</option>
                                                 </select>
-                                                <p className="mt-1 text-[11px] text-gray-500">
-                                                    xAI always runs as a unified realtime voice model in this dashboard.
-                                                </p>
                                             </>
                                         ) : (
                                             <>
@@ -1255,9 +1316,6 @@ export default function AgentDetailPage() {
                                                         className="mt-2 w-full px-3 py-2 bg-white text-gray-700 rounded-lg text-sm font-medium border border-gray-200 focus:outline-none focus:border-gray-400"
                                                     />
                                                 )}
-                                                <p className="mt-1 text-[11px] text-gray-500">
-                                                    Realtime is used only when you explicitly save it here.
-                                                </p>
                                             </>
                                         )}
                                     </div>
@@ -1308,17 +1366,17 @@ export default function AgentDetailPage() {
                         </div>
 
                         {/* Prompt Text Area */}
-                        <div className="flex-1 p-6 pt-4">
+                        <div className="min-h-0 flex-1 px-6 pb-4 pt-4">
                             <textarea
                                 value={systemPrompt}
                                 onChange={(e) => setSystemPrompt(e.target.value)}
                                 placeholder="Enter your system prompt here..."
-                                className="h-[620px] max-h-[620px] min-h-[620px] w-full resize-none overflow-y-auto rounded-2xl border border-gray-200 bg-white px-4 py-4 text-sm leading-relaxed text-gray-900 placeholder:text-gray-400 focus:outline-none focus:border-gray-400"
+                                className="h-full min-h-[320px] w-full resize-none overflow-y-auto rounded-2xl border border-gray-200 bg-white px-4 py-4 text-sm leading-relaxed text-gray-900 placeholder:text-gray-400 focus:outline-none focus:border-gray-400"
                             />
                         </div>
 
                         {/* Welcome Message */}
-                        <div className="px-6 py-4 border-t border-gray-200">
+                        <div className="shrink-0 border-t border-gray-200 bg-white px-6 py-4">
                             <label className="block text-sm font-medium text-gray-700 mb-2">Welcome Message</label>
                             <select
                                 value={welcomeOption}
@@ -1366,7 +1424,7 @@ export default function AgentDetailPage() {
                     </div>
 
                     {/* Middle Column - Settings (25%) */}
-                    <div className="w-[30%] border-r border-gray-200 overflow-y-auto">
+                    <div className="min-h-0 w-[30%] overflow-y-auto border-r border-gray-200 bg-white">
                         {SETTINGS_SECTIONS.map((section) => {
                             const Icon = section.icon;
                             const isExpanded = expandedSections.includes(section.id);
@@ -1550,27 +1608,29 @@ export default function AgentDetailPage() {
                     </div>
 
                     {/* Right Column - Testing (25%) */}
-                    <div className="w-[25%] bg-gray-50">
+                    <div className="flex min-h-0 w-[25%] flex-col overflow-hidden bg-gray-50">
                         {/* Test Buttons */}
-                        <div className="flex gap-2 p-4 border-b border-gray-200">
-                            <button
-                                onClick={() => setShowVoiceCall(true)}
-                                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50"
-                            >
-                                <Phone className="w-4 h-4" />
-                                Test Audio
-                            </button>
-                            <button
-                                onClick={() => setShowTestChat(true)}
-                                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50"
-                            >
-                                <MessageSquare className="w-4 h-4" />
-                                Test Chat
-                            </button>
+                        <div className="shrink-0 border-b border-gray-200 p-4">
+                            <div className="flex gap-2">
+                                <button
+                                    onClick={() => setShowVoiceCall(true)}
+                                    className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50"
+                                >
+                                    <Phone className="w-4 h-4" />
+                                    Test Audio
+                                </button>
+                                <button
+                                    onClick={() => setShowTestChat(true)}
+                                    className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50"
+                                >
+                                    <MessageSquare className="w-4 h-4" />
+                                    Test Chat
+                                </button>
+                            </div>
                         </div>
 
                         {/* Test Area */}
-                        <div className="flex flex-col items-center justify-center h-[calc(100%-73px)] p-6 text-center">
+                        <div className="flex flex-1 flex-col items-center justify-center p-6 text-center">
                             <div className="w-16 h-16 mb-4 text-gray-300">
                                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
                                     <path d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
@@ -1589,12 +1649,6 @@ export default function AgentDetailPage() {
                             >
                                 Test
                             </button>
-                            <Link
-                                href={`/chatbot-dashboard?agentId=${agentId}`}
-                                className="mt-3 px-6 py-2 bg-gray-900 text-white rounded-lg text-sm font-medium hover:bg-gray-800"
-                            >
-                                Customize Chat Widget
-                            </Link>
                         </div>
                     </div>
                 </div>

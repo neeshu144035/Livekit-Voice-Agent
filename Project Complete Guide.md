@@ -1056,7 +1056,10 @@ OPENAI_MAX_COMPLETION_TOKENS=220
   - **NEW**: Warning shown for `eleven_v3` (slower HTTP path)
 
 ### Greeting Editor Behavior (April 24, 2026)
-- The main agent editor now keeps the existing top-row model/voice/language controls and uses a fixed-height system prompt area for easier prompt editing.
+- The main agent editor now keeps the existing top-row model/voice/language controls and uses a bounded prompt editor so the page behaves more like Retell:
+  - only the prompt editor itself scrolls
+  - `Welcome Message` stays pinned below the prompt editor instead of disappearing off-screen
+  - the system prompt area was reduced from the earlier oversized fixed height
 - `Welcome Message` still starts with:
   - `User speaks first`
   - `Agent greets first`
@@ -1066,9 +1069,23 @@ OPENAI_MAX_COMPLETION_TOKENS=220
 - If `Custom message` is selected but left empty, runtime falls back to the greeting written in the prompt.
 - If `User speaks first` is selected, that second selector is hidden.
 - The selected sub-mode is saved in `custom_params.welcome_message_mode` so both web test-chat and the live voice runtime follow the same greeting behavior.
+- Live call metadata now also carries `welcome_message_type`, `welcome_message`, and sanitized `custom_params`, so web/phone runtime no longer silently falls back to `user_speaks_first` when the UI was set to `Agent greets first`.
+- The test panel no longer shows the extra `Customize Chat Widget` button in the right-side testing card.
+- Voice runtime helper banners were trimmed so the editor keeps just the controls instead of extra suggestion text.
 - Language options now include a multilingual selection similar to Retell-style language switching:
   - `Multilingual (Auto)`
   - plus UK English, Hindi, Malayalam, and the other existing locale choices
+- Built-in transfer function configuration now stays in sync with the page's main agent state after saving, which prevents a later general `Save` action from restoring an older transfer phone number.
+
+### Publish Versioning (April 24, 2026)
+- `Save` and `Publish` now behave differently on the agent editor:
+  - `Save` updates the current draft agent
+  - `Publish` first saves the current draft and then stores a version snapshot in `custom_params.published_versions`
+- Each publish creates a numbered version entry with:
+  - `version`
+  - `published_at`
+  - a snapshot of the saved agent config at publish time
+- The editor header now shows the latest published version and the next publish button label as `Publish vN`.
 
 ### Deployment And VPS Update
 - The deployment guide was updated to reflect the real hybrid production model:
@@ -1077,6 +1094,10 @@ OPENAI_MAX_COMPLETION_TOKENS=220
 - The deployment section now explicitly mentions the SSH key:
   - [`livekit-company-key.pem`](livekit-company-key.pem)
 - Backend and worker code were synced to the VPS and restarted successfully during verification.
+- Current VPS frontend expectation:
+  - only one production dashboard port should remain active
+  - the current live dashboard is expected on PM2/Nginx through port `3001`
+  - stale duplicate frontend listeners such as old `3000` processes should be removed instead of left running
 
 ### xAI Unified Voice Integration (April 24, 2026)
 - Added `xai` as a first-class speech provider across:
@@ -1096,10 +1117,15 @@ OPENAI_MAX_COMPLETION_TOKENS=220
   - `rex`
   - `sal`
   - `leo`
+- xAI language selection in the UI is now provider-aware:
+  - `Multilingual (Auto)` is shown first
+  - the list is restricted to the language set currently supported in this dashboard for xAI (`en-*`, `hi-*`, `ml-*`, `multi`)
+  - switching to xAI automatically normalizes an unsupported previously-selected language instead of silently keeping an invalid combination
 - Runtime behavior:
   - selecting `tts_provider=xai` automatically forces `voice_runtime_mode=realtime_unified`
   - the saved `tts_model` is also persisted as `voice_realtime_model`
   - Deepgram STT and external TTS are skipped for xAI calls
+- Backend create/update validation now also rejects unsupported xAI language selections instead of accepting them and falling back later.
 - Cost handling was updated for xAI voice calls:
   - fallback cost display uses xAI Voice Agent pricing (`$0.05/min`)
   - LLM/STT/TTS are not double-counted separately for xAI unified sessions

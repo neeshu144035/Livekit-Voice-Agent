@@ -44,6 +44,7 @@ const AGENT_TYPES = [
 const TTS_PROVIDER_OPTIONS = [
     { value: 'deepgram', label: 'Deepgram' },
     { value: 'elevenlabs', label: 'ElevenLabs' },
+    { value: 'xai', label: 'xAI' },
 ];
 
 interface TTSVoiceOption {
@@ -61,6 +62,7 @@ interface TTSModelOption {
     languages_count?: number;
     languages?: string[];
     supports_multilingual?: boolean;
+    deprecated?: boolean;
 }
 
 const DEEPGRAM_VOICE_OPTIONS: TTSVoiceOption[] = [
@@ -80,6 +82,8 @@ const DEEPGRAM_VOICE_IDS = new Set([
     'aura-perseus-en',
     'aura-zeus-en',
 ]);
+const XAI_DEFAULT_MODEL = 'grok-voice-think-fast-1.0';
+const XAI_VOICE_IDS = new Set(['ara', 'eve', 'leo', 'rex', 'sal']);
 
 const SUPPORTED_LANGUAGE_OPTIONS = [
     { value: 'en-US', label: 'English (US)' },
@@ -95,6 +99,16 @@ const SUPPORTED_LANGUAGE_OPTIONS = [
     { value: 'ml', label: 'Malayalam' },
     { value: 'ml-IN', label: 'Malayalam (India)' },
     { value: 'multi', label: 'Multilingual (Auto)' },
+];
+const XAI_SUPPORTED_LANGUAGE_VALUES = ['multi', 'en-US', 'en-GB', 'en-AU', 'en-IN', 'hi', 'hi-IN', 'ml', 'ml-IN'];
+const XAI_SUPPORTED_LANGUAGE_SET = new Set(XAI_SUPPORTED_LANGUAGE_VALUES);
+const WELCOME_OPTIONS = [
+    { value: 'user_speaks_first', label: 'User speaks first' },
+    { value: 'agent_greets', label: 'Agent greets first' },
+];
+const WELCOME_MESSAGE_MODE_OPTIONS = [
+    { value: 'dynamic', label: 'Dynamic message' },
+    { value: 'custom', label: 'Custom message' },
 ];
 
 const DEEPGRAM_TTS_SUPPORTED_LANGUAGES = new Set([
@@ -152,6 +166,19 @@ const getCompatibleElevenModels = (models: TTSModelOption[], language: string) =
 
 const getLanguageLabel = (language: string) =>
     SUPPORTED_LANGUAGE_OPTIONS.find((option) => option.value === language)?.label || language;
+
+const getProviderLanguageOptions = (provider: string) => {
+    if (provider !== 'xai') return SUPPORTED_LANGUAGE_OPTIONS;
+    return [
+        ...SUPPORTED_LANGUAGE_OPTIONS.filter((option) => option.value === 'multi'),
+        ...SUPPORTED_LANGUAGE_OPTIONS.filter((option) => option.value !== 'multi' && XAI_SUPPORTED_LANGUAGE_SET.has(option.value)),
+    ];
+};
+
+const normalizeLanguageForProvider = (provider: string, language: string) => {
+    const options = getProviderLanguageOptions(provider);
+    return options.some((option) => option.value === language) ? language : (options[0]?.value || 'en-GB');
+};
 
 const LLM_OPTIONS = [
     { value: 'gpt-5.4', name: 'GPT-5.4', provider: 'OpenAI', description: 'Latest flagship model' },
@@ -231,6 +258,9 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
     const [primaryLanguage, setPrimaryLanguage] = useState('en-GB');
     const [voiceRuntimeMode, setVoiceRuntimeMode] = useState('pipeline');
     const [voiceRealtimeModel, setVoiceRealtimeModel] = useState('');
+    const [welcomeOption, setWelcomeOption] = useState('user_speaks_first');
+    const [welcomeMessageMode, setWelcomeMessageMode] = useState('dynamic');
+    const [welcomeMessage, setWelcomeMessage] = useState('');
 
     // Step 3: Flow Builder (for conversation flow agents)
     const [nodes, setNodes] = useState<any[]>([]);
@@ -245,13 +275,14 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
     const compatibleElevenModels = getCompatibleElevenModels(ttsModels, primaryLanguage);
     const visibleElevenModels = compatibleElevenModels.length > 0 ? compatibleElevenModels : ttsModels;
     const selectedLanguageLabel = getLanguageLabel(primaryLanguage);
+    const providerLanguageOptions = getProviderLanguageOptions(selectedTtsProvider);
     const selectedTtsModelMeta =
         visibleElevenModels.find((model) => model.id === selectedTtsModel)
         || ttsModels.find((model) => model.id === selectedTtsModel)
         || null;
 
     const loadTtsVoicesForModel = async (provider: string, modelId?: string) => {
-        const normalized = provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
+        const normalized = provider === 'xai' ? 'xai' : provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
         if (normalized !== 'elevenlabs') return;
         setTtsLoading(true);
         try {
@@ -267,7 +298,7 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
     };
 
     const loadTtsOptions = async (provider: string) => {
-        const normalized = provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
+        const normalized = provider === 'xai' ? 'xai' : provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
         setTtsLoading(true);
         if (normalized === 'deepgram') {
             setTtsVoices(DEEPGRAM_VOICE_OPTIONS);
@@ -280,19 +311,19 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
         setTtsModels([]);
         try {
             const voicesPromise = fetch(`${API_URL}/tts/voices?provider=${normalized}`).then((r) => r.json());
-            const modelsPromise = normalized === 'elevenlabs'
-                ? fetch(`${API_URL}/tts/models?provider=${normalized}`).then((r) => r.json())
-                : Promise.resolve({ models: [] });
+            const modelsPromise = fetch(`${API_URL}/tts/models?provider=${normalized}`).then((r) => r.json());
             const [voicesData, modelsData] = await Promise.all([voicesPromise, modelsPromise]);
 
             if (normalized === 'elevenlabs' && modelsData?.available === false) {
                 showToast('ElevenLabs is not configured on the server (missing ELEVEN_API_KEY).', 'error');
+            } else if (normalized === 'xai' && modelsData?.available === false) {
+                showToast('xAI is not configured on the server (missing XAI_API_KEY).', 'error');
             }
 
             const voices = (voicesData?.voices || []) as TTSVoiceOption[];
             setTtsVoices(voices);
 
-            if (normalized === 'elevenlabs') {
+            if (normalized === 'elevenlabs' || normalized === 'xai') {
                 const models = (modelsData?.models || []) as TTSModelOption[];
                 setTtsModels(models);
             } else {
@@ -301,6 +332,8 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
         } catch (e) {
             if (normalized === 'elevenlabs') {
                 showToast('Could not load ElevenLabs voices. Configure ELEVEN_API_KEY on backend.', 'error');
+            } else if (normalized === 'xai') {
+                showToast('Could not load xAI voices. Configure XAI_API_KEY on backend.', 'error');
             }
             setTtsVoices([]);
             setTtsModels([]);
@@ -314,6 +347,13 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
         loadTtsOptions(selectedTtsProvider);
     }, [isOpen, selectedTtsProvider]);
 
+    useEffect(() => {
+        const normalizedLanguage = normalizeLanguageForProvider(selectedTtsProvider, primaryLanguage);
+        if (normalizedLanguage !== primaryLanguage) {
+            setPrimaryLanguage(normalizedLanguage);
+        }
+    }, [selectedTtsProvider, primaryLanguage]);
+
     // Re-fetch voices when ElevenLabs model changes (v3 shows all voices, v2.5 filters by compatibility)
     useEffect(() => {
         if (!isOpen || selectedTtsProvider !== 'elevenlabs' || !selectedTtsModel) return;
@@ -321,10 +361,32 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
     }, [selectedTtsModel]);
 
     useEffect(() => {
-        if (selectedTtsProvider !== 'elevenlabs') return;
+        if (selectedTtsProvider !== 'xai') return;
+        if (!selectedVoice || !XAI_VOICE_IDS.has(selectedVoice)) {
+            setSelectedVoice('eve');
+        }
+        if (!selectedTtsModel) {
+            setSelectedTtsModel(XAI_DEFAULT_MODEL);
+        }
+    }, [selectedTtsProvider, selectedVoice, selectedTtsModel]);
+
+    useEffect(() => {
         if (!selectedVoice) return;
-        if (!DEEPGRAM_VOICE_IDS.has(selectedVoice)) return;
-        setSelectedVoice('');
+        if (selectedTtsProvider === 'deepgram') {
+            if (!DEEPGRAM_VOICE_IDS.has(selectedVoice)) {
+                setSelectedVoice(DEEPGRAM_VOICE_OPTIONS[0]?.id || 'jessica');
+            }
+            return;
+        }
+        if (selectedTtsProvider === 'xai') {
+            if (!XAI_VOICE_IDS.has(selectedVoice)) {
+                setSelectedVoice('eve');
+            }
+            return;
+        }
+        if (DEEPGRAM_VOICE_IDS.has(selectedVoice) || XAI_VOICE_IDS.has(selectedVoice)) {
+            setSelectedVoice('');
+        }
     }, [selectedTtsProvider, selectedVoice]);
 
     useEffect(() => {
@@ -356,11 +418,16 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
 
     const handleCreate = async () => {
         if (selectedTtsProvider === 'deepgram' && languageRequiresElevenLabsTts(primaryLanguage)) {
-            showToast(`Use ElevenLabs for ${selectedLanguageLabel}. Deepgram TTS does not support that language.`, 'error');
+            showToast(`Use ElevenLabs or xAI for ${selectedLanguageLabel}. Deepgram TTS does not support that language.`, 'error');
             return;
         }
         if (!selectedVoice) {
-            showToast(`Select a ${selectedTtsProvider === 'elevenlabs' ? 'voice ID' : 'voice'}`, 'error');
+            const voiceLabel = selectedTtsProvider === 'elevenlabs'
+                ? 'voice ID'
+                : selectedTtsProvider === 'xai'
+                    ? 'xAI voice'
+                    : 'voice';
+            showToast(`Select a ${voiceLabel}`, 'error');
             return;
         }
         if (selectedTtsProvider === 'elevenlabs') {
@@ -377,12 +444,26 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                 return;
             }
         }
-        if (voiceRuntimeMode === 'realtime_text_tts' && !voiceRealtimeModel.trim()) {
+        if (selectedTtsProvider === 'xai' && !selectedTtsModel) {
+            showToast('Select an xAI voice model', 'error');
+            return;
+        }
+        if (selectedTtsProvider !== 'xai' && voiceRuntimeMode === 'realtime_text_tts' && !voiceRealtimeModel.trim()) {
             showToast('Enter the realtime model to use for realtime mode', 'error');
             return;
         }
         setIsLoading(true);
         try {
+            const nextCustomParams: Record<string, any> = welcomeOption === 'agent_greets'
+                ? { welcome_message_mode: welcomeMessageMode === 'custom' ? 'custom' : 'dynamic' }
+                : {};
+            if (selectedTtsProvider === 'xai') {
+                nextCustomParams.voice_runtime_mode = 'realtime_unified';
+                nextCustomParams.voice_realtime_model = selectedTtsModel || XAI_DEFAULT_MODEL;
+            } else if (voiceRuntimeMode === 'realtime_text_tts') {
+                nextCustomParams.voice_runtime_mode = 'realtime_text_tts';
+                nextCustomParams.voice_realtime_model = voiceRealtimeModel.trim();
+            }
             const response = await fetch(`${API_URL}/agents/`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -391,18 +472,15 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                     type: selectedType,
                     voice: selectedVoice,
                     tts_provider: selectedTtsProvider,
-                    tts_model: selectedTtsProvider === 'elevenlabs' ? selectedTtsModel : null,
+                    tts_model: selectedTtsProvider === 'deepgram' ? null : selectedTtsModel,
                     llm_model: selectedLLM,
                     system_prompt: globalPrompt,
                     language: primaryLanguage,
+                    welcome_message_type: welcomeOption,
+                    welcome_message: welcomeMessage,
                     functions: selectedFunctions,
                     flow: nodes,
-                    custom_params: voiceRuntimeMode === 'realtime_text_tts'
-                        ? {
-                            voice_runtime_mode: 'realtime_text_tts',
-                            voice_realtime_model: voiceRealtimeModel.trim(),
-                        }
-                        : {}
+                    custom_params: nextCustomParams,
                 })
             });
 
@@ -420,6 +498,9 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                 setPrimaryLanguage('en-GB');
                 setVoiceRuntimeMode('pipeline');
                 setVoiceRealtimeModel('');
+                setWelcomeOption('user_speaks_first');
+                setWelcomeMessageMode('dynamic');
+                setWelcomeMessage('');
                 setNodes([]);
                 setSelectedFunctions([]);
             } else {
@@ -594,7 +675,11 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                                         className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
                                     >
                                         <option value="">
-                                            {selectedTtsProvider === 'elevenlabs' ? 'Select an ElevenLabs voice' : 'Select a voice'}
+                                            {selectedTtsProvider === 'elevenlabs'
+                                                ? 'Select an ElevenLabs voice'
+                                                : selectedTtsProvider === 'xai'
+                                                    ? 'Select an xAI voice'
+                                                    : 'Select a voice'}
                                         </option>
                                         {ttsVoices.map((voice) => (
                                             <option key={voice.id} value={voice.id}>
@@ -620,9 +705,11 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                                 </div>
                             </div>
 
-                            {selectedTtsProvider === 'elevenlabs' && (
+                            {selectedTtsProvider !== 'deepgram' && (
                                 <div>
-                                    <label className="block text-sm font-medium text-gray-700 mb-2">ElevenLabs Model</label>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                                        {selectedTtsProvider === 'xai' ? 'xAI Voice Model' : 'ElevenLabs Model'}
+                                    </label>
                                     <div className="space-y-2">
                                         <select
                                             value={selectedTtsModel}
@@ -630,48 +717,36 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                                             disabled={ttsLoading}
                                             className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
                                         >
-                                            <option value="">Select an ElevenLabs model</option>
-                                            {visibleElevenModels.map((model) => (
+                                            <option value="">
+                                                {selectedTtsProvider === 'xai' ? 'Select an xAI model' : 'Select an ElevenLabs model'}
+                                            </option>
+                                            {(selectedTtsProvider === 'xai' ? ttsModels : visibleElevenModels).map((model) => (
                                                 <option key={model.id} value={model.id}>
                                                     {model.name}
-                                                    {model.is_v3 ? ' (v3)' : model.supports_multilingual ? ' (Multilingual)' : ''}
+                                                    {selectedTtsProvider === 'xai'
+                                                        ? model.deprecated ? ' (Legacy)' : ' (Unified)'
+                                                        : model.is_v3 ? ' (v3)' : model.supports_multilingual ? ' (Multilingual)' : ''}
                                                 </option>
                                             ))}
                                         </select>
-                                        {selectedTtsModel && selectedTtsModel.includes('v3') && (
-                                            <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
-                                                <span className="w-2 h-2 bg-amber-500 rounded-full" />
-                                                <span className="text-xs text-amber-700 font-medium">v3 is the expressive path, but Flash v2.5 is the lower-latency choice for live calls when the language supports it</span>
+                                        {selectedTtsProvider === 'elevenlabs' && (
+                                            <div className="flex items-center gap-2">
+                                                <input
+                                                    type="text"
+                                                    value={customElevenVoiceId}
+                                                    onChange={(e) => setCustomElevenVoiceId(e.target.value)}
+                                                    placeholder="Enter ElevenLabs Voice ID"
+                                                    className="flex-1 px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
+                                                />
+                                                <button
+                                                    type="button"
+                                                    onClick={applyCustomElevenVoiceId}
+                                                    className="px-4 py-2 bg-violet-600 text-white rounded-lg text-sm font-medium hover:bg-violet-700 transition-colors"
+                                                >
+                                                    Use ID
+                                                </button>
                                             </div>
                                         )}
-                                        {compatibleElevenModels.length > 0 && compatibleElevenModels.length !== ttsModels.length && (
-                                            <div className="flex items-center gap-2 px-3 py-1.5 bg-sky-50 border border-sky-200 rounded-lg">
-                                                <span className="w-2 h-2 bg-sky-500 rounded-full" />
-                                                <span className="text-xs text-sky-700 font-medium">Showing models compatible with {selectedLanguageLabel}</span>
-                                            </div>
-                                        )}
-                                        {selectedTtsModel && !selectedTtsModel.includes('v3') && ttsVoices.length > 0 && (
-                                            <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
-                                                <span className="w-2 h-2 bg-amber-500 rounded-full" />
-                                                <span className="text-xs text-amber-700 font-medium">Showing {ttsVoices.length} voices compatible with {selectedTtsModel}</span>
-                                            </div>
-                                        )}
-                                        <div className="flex items-center gap-2">
-                                            <input
-                                                type="text"
-                                                value={customElevenVoiceId}
-                                                onChange={(e) => setCustomElevenVoiceId(e.target.value)}
-                                                placeholder="Enter ElevenLabs Voice ID"
-                                                className="flex-1 px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
-                                            />
-                                            <button
-                                                type="button"
-                                                onClick={applyCustomElevenVoiceId}
-                                                className="px-4 py-2 bg-violet-600 text-white rounded-lg text-sm font-medium hover:bg-violet-700 transition-colors"
-                                            >
-                                                Use ID
-                                            </button>
-                                        </div>
                                     </div>
                                 </div>
                             )}
@@ -679,15 +754,25 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                             <div>
                                 <label className="block text-sm font-medium text-gray-700 mb-2">Voice Runtime</label>
                                 <div className="space-y-2">
-                                    <select
-                                        value={voiceRuntimeMode}
-                                        onChange={(e) => setVoiceRuntimeMode(e.target.value)}
-                                        className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
-                                    >
-                                        <option value="pipeline">Pipeline</option>
-                                        <option value="realtime_text_tts">Realtime text + TTS</option>
-                                    </select>
-                                    {voiceRuntimeMode === 'realtime_text_tts' && (
+                                    {selectedTtsProvider === 'xai' ? (
+                                        <select
+                                            value="realtime_unified"
+                                            disabled
+                                            className="w-full px-4 py-2 bg-gray-100 border border-gray-200 rounded-lg text-gray-900 cursor-not-allowed"
+                                        >
+                                            <option value="realtime_unified">Realtime unified (xAI)</option>
+                                        </select>
+                                    ) : (
+                                        <select
+                                            value={voiceRuntimeMode}
+                                            onChange={(e) => setVoiceRuntimeMode(e.target.value)}
+                                            className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
+                                        >
+                                            <option value="pipeline">Pipeline</option>
+                                            <option value="realtime_text_tts">Realtime text + TTS</option>
+                                        </select>
+                                    )}
+                                    {selectedTtsProvider !== 'xai' && voiceRuntimeMode === 'realtime_text_tts' && (
                                         <input
                                             type="text"
                                             value={voiceRealtimeModel}
@@ -714,13 +799,52 @@ export default function CreateAgentWizard({ isOpen, onClose, onSuccess }: Create
                             </div>
 
                             <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">Welcome Message</label>
+                                <select
+                                    value={welcomeOption}
+                                    onChange={(e) => setWelcomeOption(e.target.value)}
+                                    className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
+                                >
+                                    {WELCOME_OPTIONS.map((option) => (
+                                        <option key={option.value} value={option.value}>
+                                            {option.label}
+                                        </option>
+                                    ))}
+                                </select>
+                                {welcomeOption === 'agent_greets' && (
+                                    <div className="mt-2 space-y-2">
+                                        <select
+                                            value={welcomeMessageMode}
+                                            onChange={(e) => setWelcomeMessageMode(e.target.value)}
+                                            className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
+                                        >
+                                            {WELCOME_MESSAGE_MODE_OPTIONS.map((option) => (
+                                                <option key={option.value} value={option.value}>
+                                                    {option.label}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        {welcomeMessageMode === 'custom' && (
+                                            <textarea
+                                                value={welcomeMessage}
+                                                onChange={(e) => setWelcomeMessage(e.target.value)}
+                                                placeholder="Write the exact first sentence to speak"
+                                                rows={3}
+                                                className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400 resize-none"
+                                            />
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+
+                            <div>
                                 <label className="block text-sm font-medium text-gray-700 mb-2">Primary Language</label>
                                 <select
                                     value={primaryLanguage}
                                     onChange={(e) => setPrimaryLanguage(e.target.value)}
                                     className="w-full px-4 py-2 border border-gray-200 rounded-lg focus:outline-none focus:border-gray-400"
                                 >
-                                    {SUPPORTED_LANGUAGE_OPTIONS.map((language) => (
+                                    {providerLanguageOptions.map((language) => (
                                         <option key={language.value} value={language.value}>
                                             {language.label}
                                         </option>

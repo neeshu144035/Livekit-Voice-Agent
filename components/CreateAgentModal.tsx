@@ -115,6 +115,16 @@ const SUPPORTED_LANGUAGE_OPTIONS = [
     { value: 'ml-IN', label: 'Malayalam (India)', flag: '' },
     { value: 'multi', label: 'Multilingual (Auto)', flag: '' },
 ];
+const XAI_SUPPORTED_LANGUAGE_VALUES = ['multi', 'en-US', 'en-GB', 'en-AU', 'en-IN', 'hi', 'hi-IN', 'ml', 'ml-IN'];
+const XAI_SUPPORTED_LANGUAGE_SET = new Set(XAI_SUPPORTED_LANGUAGE_VALUES);
+const WELCOME_OPTIONS = [
+    { value: 'user_speaks_first', label: 'User speaks first' },
+    { value: 'agent_greets', label: 'Agent greets first' },
+];
+const WELCOME_MESSAGE_MODE_OPTIONS = [
+    { value: 'dynamic', label: 'Dynamic message' },
+    { value: 'custom', label: 'Custom message' },
+];
 
 const DEEPGRAM_TTS_SUPPORTED_LANGUAGES = new Set([
     'en',
@@ -128,6 +138,19 @@ const DEEPGRAM_TTS_SUPPORTED_LANGUAGES = new Set([
     'it',
 ]);
 
+const getProviderLanguageOptions = (provider: string) => {
+    if (provider !== 'xai') return SUPPORTED_LANGUAGE_OPTIONS;
+    return [
+        ...SUPPORTED_LANGUAGE_OPTIONS.filter((option) => option.value === 'multi'),
+        ...SUPPORTED_LANGUAGE_OPTIONS.filter((option) => option.value !== 'multi' && XAI_SUPPORTED_LANGUAGE_SET.has(option.value)),
+    ];
+};
+
+const normalizeLanguageForProvider = (provider: string, language: string) => {
+    const options = getProviderLanguageOptions(provider);
+    return options.some((option) => option.value === language) ? language : (options[0]?.value || 'en-US');
+};
+
 export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateAgentModalProps) {
     const [activeTab, setActiveTab] = useState<TabType>('llm');
     const [name, setName] = useState('');
@@ -140,12 +163,16 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
     const [selectedLanguage, setSelectedLanguage] = useState('en-US');
     const [voiceRuntimeMode, setVoiceRuntimeMode] = useState('pipeline');
     const [voiceRealtimeModel, setVoiceRealtimeModel] = useState('');
+    const [welcomeOption, setWelcomeOption] = useState('user_speaks_first');
+    const [welcomeMessageMode, setWelcomeMessageMode] = useState('dynamic');
+    const [welcomeMessage, setWelcomeMessage] = useState('');
     const [ttsVoices, setTtsVoices] = useState<TTSVoiceOption[]>([]);
     const [ttsModels, setTtsModels] = useState<TTSModelOption[]>([]);
     const [ttsLoading, setTtsLoading] = useState(false);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [created, setCreated] = useState(false);
+    const providerLanguageOptions = getProviderLanguageOptions(selectedTtsProvider);
 
     const loadProviderVoices = async (provider: string, modelId?: string) => {
         setTtsLoading(true);
@@ -200,6 +227,13 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
         if (!isOpen || selectedTtsProvider !== 'elevenlabs' || !selectedTtsModel) return;
         void loadProviderVoices('elevenlabs', selectedTtsModel);
     }, [isOpen, selectedTtsProvider, selectedTtsModel]);
+
+    useEffect(() => {
+        const normalizedLanguage = normalizeLanguageForProvider(selectedTtsProvider, selectedLanguage);
+        if (normalizedLanguage !== selectedLanguage) {
+            setSelectedLanguage(normalizedLanguage);
+        }
+    }, [selectedTtsProvider, selectedLanguage]);
 
     useEffect(() => {
         if (selectedTtsProvider === 'xai') {
@@ -266,6 +300,16 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
         setError(null);
 
         try {
+            const nextCustomParams: Record<string, any> = welcomeOption === 'agent_greets'
+                ? { welcome_message_mode: welcomeMessageMode === 'custom' ? 'custom' : 'dynamic' }
+                : {};
+            if (selectedTtsProvider === 'xai') {
+                nextCustomParams.voice_runtime_mode = 'realtime_unified';
+                nextCustomParams.voice_realtime_model = selectedTtsModel || XAI_DEFAULT_MODEL;
+            } else if (voiceRuntimeMode === 'realtime_text_tts') {
+                nextCustomParams.voice_runtime_mode = 'realtime_text_tts';
+                nextCustomParams.voice_realtime_model = voiceRealtimeModel.trim();
+            }
             await axios.post(`${API_URL}agents/`, {
                 name: name.trim(),
                 agent_name: agentName.trim() || null,
@@ -276,17 +320,9 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                 tts_model: selectedTtsProvider === 'deepgram' ? null : selectedTtsModel,
                 language: selectedLanguage,
                 twilio_number: null,
-                custom_params: selectedTtsProvider === 'xai'
-                    ? {
-                        voice_runtime_mode: 'realtime_unified',
-                        voice_realtime_model: selectedTtsModel || XAI_DEFAULT_MODEL,
-                    }
-                    : voiceRuntimeMode === 'realtime_text_tts'
-                        ? {
-                            voice_runtime_mode: 'realtime_text_tts',
-                            voice_realtime_model: voiceRealtimeModel.trim(),
-                        }
-                        : {}
+                welcome_message_type: welcomeOption,
+                welcome_message: welcomeMessage,
+                custom_params: nextCustomParams,
             });
 
             setCreated(true);
@@ -303,6 +339,9 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                 setSelectedLanguage('en-US');
                 setVoiceRuntimeMode('pipeline');
                 setVoiceRealtimeModel('');
+                setWelcomeOption('user_speaks_first');
+                setWelcomeMessageMode('dynamic');
+                setWelcomeMessage('');
                 setCreated(false);
             }, 1500);
         } catch (err) {
@@ -453,7 +492,7 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                 onChange={(e) => setSelectedLanguage(e.target.value)}
                                                 className="px-3 py-1.5 bg-white border border-gray-200 rounded-lg text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-green-500"
                                             >
-                                                {SUPPORTED_LANGUAGE_OPTIONS.map((lang) => (
+                                                {providerLanguageOptions.map((lang) => (
                                                     <option key={lang.value} value={lang.value}>
                                                         {lang.flag} {lang.label}
                                                     </option>
@@ -506,11 +545,11 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                         </option>
                                                     ))}
                                                 </select>
-                                                <p className="text-xs text-gray-500">
-                                                    {selectedTtsProvider === 'xai'
-                                                        ? 'xAI voices come from the backend provider catalog and stay on the unified realtime path.'
-                                                        : 'Voice IDs come directly from the backend&apos;s ElevenLabs integration. Nothing is auto-picked.'}
-                                                </p>
+                                                {selectedTtsProvider !== 'xai' && (
+                                                    <p className="text-xs text-gray-500">
+                                                        Voice IDs come directly from the backend&apos;s ElevenLabs integration. Nothing is auto-picked.
+                                                    </p>
+                                                )}
                                             </div>
                                         )}
                                     </div>
@@ -580,11 +619,6 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                         `eleven_v3` stays available when you choose it, but it is the slower HTTP path for live synthesis.
                                                     </div>
                                                 )}
-                                                {selectedTtsProvider === 'xai' && (
-                                                    <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
-                                                        xAI uses a unified realtime voice model, so STT, reasoning, and voice output all come from the same provider session.
-                                                    </div>
-                                                )}
                                             </div>
                                         )}
                                         <div className="space-y-3">
@@ -628,11 +662,6 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                     </p>
                                                 </div>
                                             )}
-                                            {selectedTtsProvider === 'xai' && (
-                                                <p className="text-xs text-gray-500">
-                                                    Choosing xAI automatically saves this agent on the unified realtime voice path.
-                                                </p>
-                                            )}
                                         </div>
                                     </div>
                                 )}
@@ -653,6 +682,48 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                 <p className="mt-2 text-xs text-gray-500">
                                     This prompt defines your agent&apos;s personality and behavior.
                                 </p>
+                            </div>
+
+                            <div className="rounded-xl border border-gray-100 bg-gray-50 p-4">
+                                <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                    Welcome Message
+                                </label>
+                                <select
+                                    value={welcomeOption}
+                                    onChange={(e) => setWelcomeOption(e.target.value)}
+                                    className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                >
+                                    {WELCOME_OPTIONS.map((option) => (
+                                        <option key={option.value} value={option.value}>
+                                            {option.label}
+                                        </option>
+                                    ))}
+                                </select>
+
+                                {welcomeOption === 'agent_greets' && (
+                                    <div className="mt-3 space-y-3">
+                                        <select
+                                            value={welcomeMessageMode}
+                                            onChange={(e) => setWelcomeMessageMode(e.target.value)}
+                                            className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                        >
+                                            {WELCOME_MESSAGE_MODE_OPTIONS.map((option) => (
+                                                <option key={option.value} value={option.value}>
+                                                    {option.label}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        {welcomeMessageMode === 'custom' && (
+                                            <textarea
+                                                value={welcomeMessage}
+                                                onChange={(e) => setWelcomeMessage(e.target.value)}
+                                                placeholder="Write the exact first sentence to speak"
+                                                rows={3}
+                                                className="w-full px-4 py-3 border border-gray-200 rounded-xl text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition-all resize-none"
+                                            />
+                                        )}
+                                    </div>
+                                )}
                             </div>
 
                             {/* Advanced - Agent Name */}

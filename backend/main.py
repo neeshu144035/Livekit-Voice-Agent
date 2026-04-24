@@ -340,6 +340,19 @@ DEEPGRAM_VOICE_ALIASES = {
 }
 
 ELEVENLABS_V3_REQUIRED_LANGUAGES = {"ml", "ml-IN", "multi"}
+XAI_SUPPORTED_LANGUAGE_VALUES = [
+    "multi",
+    "en",
+    "en-US",
+    "en-GB",
+    "en-AU",
+    "en-IN",
+    "hi",
+    "hi-IN",
+    "ml",
+    "ml-IN",
+]
+XAI_SUPPORTED_LANGUAGE_SET = set(XAI_SUPPORTED_LANGUAGE_VALUES)
 XAI_VOICE_OPTIONS = [
     {
         "id": "ara",
@@ -349,6 +362,7 @@ XAI_VOICE_OPTIONS = [
         "gender": "Female",
         "provider": "xai",
         "tone": "Warm, friendly",
+        "languages": XAI_SUPPORTED_LANGUAGE_VALUES,
     },
     {
         "id": "eve",
@@ -358,6 +372,7 @@ XAI_VOICE_OPTIONS = [
         "gender": "Female",
         "provider": "xai",
         "tone": "Energetic, upbeat",
+        "languages": XAI_SUPPORTED_LANGUAGE_VALUES,
     },
     {
         "id": "leo",
@@ -367,6 +382,7 @@ XAI_VOICE_OPTIONS = [
         "gender": "Male",
         "provider": "xai",
         "tone": "Authoritative, strong",
+        "languages": XAI_SUPPORTED_LANGUAGE_VALUES,
     },
     {
         "id": "rex",
@@ -376,6 +392,7 @@ XAI_VOICE_OPTIONS = [
         "gender": "Male",
         "provider": "xai",
         "tone": "Confident, clear",
+        "languages": XAI_SUPPORTED_LANGUAGE_VALUES,
     },
     {
         "id": "sal",
@@ -385,6 +402,7 @@ XAI_VOICE_OPTIONS = [
         "gender": "Neutral",
         "provider": "xai",
         "tone": "Smooth, balanced",
+        "languages": XAI_SUPPORTED_LANGUAGE_VALUES,
     },
 ]
 XAI_VOICE_IDS = {voice["id"] for voice in XAI_VOICE_OPTIONS}
@@ -397,6 +415,7 @@ XAI_MODEL_OPTIONS = [
         "runtime_mode": "realtime_unified",
         "deprecated": False,
         "supports_multilingual": True,
+        "languages": XAI_SUPPORTED_LANGUAGE_VALUES,
     },
     {
         "id": "grok-voice-fast-1.0",
@@ -406,8 +425,13 @@ XAI_MODEL_OPTIONS = [
         "runtime_mode": "realtime_unified",
         "deprecated": True,
         "supports_multilingual": True,
+        "languages": XAI_SUPPORTED_LANGUAGE_VALUES,
     },
 ]
+AGENT_PUBLISHED_VERSIONS_KEY = "published_versions"
+AGENT_LAST_PUBLISHED_VERSION_KEY = "last_published_version"
+AGENT_LAST_PUBLISHED_AT_KEY = "last_published_at"
+MAX_AGENT_PUBLISHED_VERSIONS = 25
 
 
 def get_elevenlabs_api_key() -> Optional[str]:
@@ -454,6 +478,113 @@ def normalize_voice_runtime_mode(mode: Optional[str], provider: Optional[str]) -
 
 def ensure_custom_params(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return dict(data or {})
+
+
+def normalize_welcome_message_type(value: Optional[str]) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"agent_greets", "agent_greets_first", "agent_speaks_first"}:
+        return "agent_greets"
+    return "user_speaks_first"
+
+
+def validate_language_for_provider_or_400(language: Optional[str], provider: Optional[str]) -> str:
+    normalized_language = normalize_agent_language(language)
+    normalized_provider = normalize_tts_provider(provider, None)
+    if normalized_provider == "xai" and normalized_language not in XAI_SUPPORTED_LANGUAGE_SET:
+        allowed = ", ".join(XAI_SUPPORTED_LANGUAGE_VALUES)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid language for xAI. Must be one of: {allowed}",
+        )
+    return normalized_language
+
+
+def _sanitize_agent_custom_params_for_snapshot(custom_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    sanitized = ensure_custom_params(custom_params)
+    sanitized.pop(AGENT_PUBLISHED_VERSIONS_KEY, None)
+    sanitized.pop(AGENT_LAST_PUBLISHED_VERSION_KEY, None)
+    sanitized.pop(AGENT_LAST_PUBLISHED_AT_KEY, None)
+    return sanitized
+
+
+def _normalize_agent_published_versions(raw_versions: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_versions, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for item in raw_versions:
+        if not isinstance(item, dict):
+            continue
+        try:
+            version = int(item.get("version"))
+        except (TypeError, ValueError):
+            continue
+        published_at = str(item.get("published_at") or "").strip()
+        snapshot = item.get("snapshot") if isinstance(item.get("snapshot"), dict) else {}
+        normalized.append(
+            {
+                "version": version,
+                "published_at": published_at,
+                "snapshot": snapshot,
+            }
+        )
+
+    normalized.sort(key=lambda entry: entry.get("version", 0), reverse=True)
+    return normalized
+
+
+def build_agent_version_snapshot(agent: AgentModel, custom_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    tts = extract_agent_tts_settings(agent)
+    snapshot_custom_params = _sanitize_agent_custom_params_for_snapshot(custom_params if custom_params is not None else agent.custom_params)
+    return {
+        "agent_id": agent.id,
+        "name": agent.name,
+        "agent_name": agent.agent_name,
+        "system_prompt": agent.system_prompt,
+        "llm_model": agent.llm_model,
+        "voice": agent.voice,
+        "tts_provider": tts["tts_provider"],
+        "tts_model": tts["tts_model"],
+        "language": agent.language,
+        "welcome_message_type": normalize_welcome_message_type(agent.welcome_message_type),
+        "welcome_message": agent.welcome_message,
+        "max_call_duration": agent.max_call_duration,
+        "enable_recording": agent.enable_recording,
+        "webhook_url": agent.webhook_url,
+        "custom_params": snapshot_custom_params,
+        "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
+    }
+
+
+def publish_agent_snapshot(agent: AgentModel, db: Session) -> Dict[str, Any]:
+    custom_params = ensure_custom_params(agent.custom_params)
+    existing_versions = _normalize_agent_published_versions(custom_params.get(AGENT_PUBLISHED_VERSIONS_KEY))
+    highest_existing_version = max((entry.get("version", 0) for entry in existing_versions), default=0)
+    next_version = highest_existing_version + 1
+    published_at = datetime.utcnow().isoformat() + "Z"
+
+    new_entry = {
+        "version": next_version,
+        "published_at": published_at,
+        "snapshot": build_agent_version_snapshot(agent, custom_params),
+    }
+    next_versions = [new_entry, *existing_versions][:MAX_AGENT_PUBLISHED_VERSIONS]
+    custom_params[AGENT_PUBLISHED_VERSIONS_KEY] = next_versions
+    custom_params[AGENT_LAST_PUBLISHED_VERSION_KEY] = next_version
+    custom_params[AGENT_LAST_PUBLISHED_AT_KEY] = published_at
+    agent.custom_params = custom_params
+    flag_modified(agent, "custom_params")
+    agent.updated_at = datetime.utcnow()
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+
+    return {
+        "version": next_version,
+        "published_at": published_at,
+        "versions": next_versions,
+        "agent": serialize_agent(agent),
+    }
 
 
 def normalize_runtime_vars(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1117,6 +1248,9 @@ def build_call_metadata_from_agent(agent: AgentModel) -> Dict[str, Any]:
         "tts_model": tts["tts_model"],
         "llm_temperature": resolve_agent_llm_temperature_from_params(custom_params),
         "voice_speed": resolve_agent_voice_speed_from_params(custom_params),
+        "welcome_message_type": normalize_welcome_message_type(agent.welcome_message_type),
+        "welcome_message": agent.welcome_message,
+        "custom_params": _sanitize_agent_custom_params_for_snapshot(custom_params),
     }
     return {key: value for key, value in metadata.items() if value not in (None, "")}
 
@@ -1614,6 +1748,7 @@ async def create_agent(agent: AgentCreate, db: Session = Depends(get_database)):
         raise HTTPException(status_code=400, detail="voice must be a valid xAI voice ID when tts_provider=xai")
     if agent.language not in VALID_LANGUAGES:
         raise HTTPException(status_code=400, detail=f"Invalid language. Must be one of: {', '.join(VALID_LANGUAGES)}")
+    validate_language_for_provider_or_400(agent.language, provider)
 
     resolved_name = resolve_display_name(agent.name, agent.display_name)
 
@@ -1675,7 +1810,7 @@ async def create_agent(agent: AgentCreate, db: Session = Depends(get_database)):
         voice=agent.voice,
         language=agent.language,
         twilio_number=agent.twilio_number,
-        welcome_message_type=agent.welcome_message_type,
+        welcome_message_type=normalize_welcome_message_type(agent.welcome_message_type),
         welcome_message=agent.welcome_message,
         max_call_duration=agent.max_call_duration,
         enable_recording=agent.enable_recording,
@@ -1733,6 +1868,10 @@ async def update_agent(agent_id: int, agent_update: AgentUpdate, db: Session = D
         raise HTTPException(status_code=400, detail="voice must be provided for ElevenLabs")
     if new_provider == "xai" and not new_voice:
         raise HTTPException(status_code=400, detail="voice must be provided for xAI")
+    if agent_update.language is not None:
+        validate_language_for_provider_or_400(agent_update.language, new_provider)
+    else:
+        validate_language_for_provider_or_400(agent.language, new_provider)
 
     update_data = agent_update.dict(exclude_unset=True)
     update_data.pop("tts_provider", None)
@@ -1747,6 +1886,8 @@ async def update_agent(agent_id: int, agent_update: AgentUpdate, db: Session = D
 
     for field, value in update_data.items():
         if value is not None:
+            if field == "welcome_message_type":
+                value = normalize_welcome_message_type(value)
             setattr(agent, field, value)
 
     custom_params = ensure_custom_params(agent.custom_params)
@@ -1817,6 +1958,29 @@ async def update_agent(agent_id: int, agent_update: AgentUpdate, db: Session = D
     db.commit()
     db.refresh(agent)
     return serialize_agent(agent)
+
+
+@app.get("/api/agents/{agent_id}/versions")
+async def get_agent_versions(agent_id: int, db: Session = Depends(get_database)):
+    agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    custom_params = ensure_custom_params(agent.custom_params)
+    versions = _normalize_agent_published_versions(custom_params.get(AGENT_PUBLISHED_VERSIONS_KEY))
+    return {
+        "versions": versions,
+        "last_published_version": custom_params.get(AGENT_LAST_PUBLISHED_VERSION_KEY),
+        "last_published_at": custom_params.get(AGENT_LAST_PUBLISHED_AT_KEY),
+    }
+
+
+@app.post("/api/agents/{agent_id}/publish")
+async def publish_agent(agent_id: int, db: Session = Depends(get_database)):
+    agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return publish_agent_snapshot(agent, db)
 
 
 @app.delete("/api/agents/{agent_id}")
@@ -1993,6 +2157,7 @@ async def get_tts_models(provider: str = DEFAULT_TTS_PROVIDER):
             "available": bool(xai_api_key),
             "missing_env": [] if xai_api_key else ["XAI_API_KEY"],
             "default_model": DEFAULT_XAI_TTS_MODEL,
+            "supported_languages": XAI_SUPPORTED_LANGUAGE_VALUES,
             "models": XAI_MODEL_OPTIONS,
         }
 
@@ -2095,6 +2260,7 @@ async def get_tts_voices(provider: str = DEFAULT_TTS_PROVIDER, model: Optional[s
             "provider": "xai",
             "available": bool(xai_api_key),
             "missing_env": [] if xai_api_key else ["XAI_API_KEY"],
+            "supported_languages": XAI_SUPPORTED_LANGUAGE_VALUES,
             "voices": XAI_VOICE_OPTIONS,
             "model_filter": model or None,
         }
