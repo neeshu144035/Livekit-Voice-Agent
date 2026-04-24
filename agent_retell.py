@@ -43,6 +43,8 @@ DEFAULT_WORKER_DISPATCH_NAME = (os.getenv("LIVEKIT_WORKER_AGENT_NAME", "sarah") 
 MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "1800"))
 DEFAULT_TTS_PROVIDER = "deepgram"
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+DEFAULT_XAI_REALTIME_MODEL = os.getenv("XAI_REALTIME_MODEL", "grok-voice-think-fast-1.0").strip() or "grok-voice-think-fast-1.0"
+XAI_REALTIME_BASE_URL = os.getenv("XAI_REALTIME_BASE_URL", "https://api.x.ai/v1").strip() or "https://api.x.ai/v1"
 DEFAULT_AGENT_LLM_TEMPERATURE = 0.2
 DEFAULT_AGENT_VOICE_SPEED = 1.0
 MIN_AGENT_LLM_TEMPERATURE = 0.0
@@ -107,6 +109,7 @@ ELEVENLABS_VOICE_MAP = {
     "emma": "MF3mGyEYCl7XYWbV9V6O",  # Elli
     "james": "VR6AewLTigWG4xSOukaG",  # Arnold
 }
+XAI_VOICE_IDS = {"eve", "ara", "rex", "sal", "leo"}
 DOUBLE_TEMPLATE_VAR_PATTERN = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 SINGLE_TEMPLATE_VAR_PATTERN = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})")
 
@@ -131,6 +134,10 @@ LANGUAGE_NAME_MAP = {
 
 def get_elevenlabs_api_key() -> str:
     return (os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY") or "").strip()
+
+
+def get_xai_api_key() -> str:
+    return (os.getenv("XAI_API_KEY") or "").strip()
 
 
 def normalize_agent_language(language: Any, default: str = "en-GB") -> str:
@@ -221,7 +228,7 @@ def normalize_tts_provider(config: Dict[str, Any]) -> str:
         or DEFAULT_TTS_PROVIDER
     )
     provider = str(provider).strip().lower()
-    if provider not in ("deepgram", "elevenlabs"):
+    if provider not in ("deepgram", "elevenlabs", "xai"):
         provider = DEFAULT_TTS_PROVIDER
     return provider
 
@@ -277,15 +284,24 @@ def get_dashboard_api_client() -> httpx.AsyncClient:
 
 
 def resolve_voice_runtime_mode(config: Dict[str, Any]) -> str:
+    if normalize_tts_provider(config) == "xai":
+        return "realtime_unified"
     custom_params = config.get("custom_params") or {}
     raw = str(custom_params.get("voice_runtime_mode") or "").strip().lower()
-    if raw in {"pipeline", "realtime_text_tts"}:
+    if raw in {"pipeline", "realtime_text_tts", "realtime_unified"}:
         return raw
     return "pipeline"
 
 
 def resolve_voice_realtime_model(config: Dict[str, Any]) -> str:
     custom_params = config.get("custom_params") or {}
+    if normalize_tts_provider(config) == "xai":
+        return str(
+            custom_params.get("voice_realtime_model")
+            or config.get("tts_model")
+            or custom_params.get("tts_model")
+            or DEFAULT_XAI_REALTIME_MODEL
+        ).strip() or DEFAULT_XAI_REALTIME_MODEL
     return str(custom_params.get("voice_realtime_model") or "").strip()
 
 
@@ -2217,6 +2233,11 @@ async def entrypoint(ctx: JobContext):
     tts_provider = normalize_tts_provider(config)
     if tts_provider == "elevenlabs":
         selected_voice = ELEVENLABS_VOICE_MAP.get(selected_voice.lower(), selected_voice)
+    elif tts_provider == "xai":
+        selected_voice = str(selected_voice or "eve").strip().lower() or "eve"
+        if selected_voice not in XAI_VOICE_IDS:
+            logger.warning("Unsupported xAI voice '%s'; falling back to eve", selected_voice)
+            selected_voice = "eve"
     selected_tts_model = (
         config.get("tts_model")
         or (config.get("custom_params") or {}).get("tts_model")
@@ -2231,6 +2252,8 @@ async def entrypoint(ctx: JobContext):
 
     tts_engine = None
     resolved_voice_id = selected_voice
+    if tts_provider == "xai":
+        selected_tts_model = voice_realtime_model or selected_tts_model or DEFAULT_XAI_REALTIME_MODEL
     if tts_provider == "elevenlabs":
         eleven_key = get_elevenlabs_api_key()
         selected_tts_model = resolve_elevenlabs_tts_model_for_language(
@@ -2338,10 +2361,37 @@ async def entrypoint(ctx: JobContext):
     if not api_key:
         api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    xai_api_key = get_xai_api_key()
 
     llm = None
-    use_realtime_text_tts = False
-    if (
+    use_realtime_llm = False
+    use_unified_realtime_audio = False
+    if tts_provider == "xai":
+        if not voice_realtime_model:
+            raise RuntimeError("xAI selected but no realtime model was saved in the app")
+        if not xai_api_key:
+            raise RuntimeError("xAI selected but XAI_API_KEY is not set")
+        if not hasattr(openai, "realtime") or not hasattr(openai.realtime, "RealtimeModel"):
+            raise RuntimeError("xAI unified voice path requires livekit-plugins-openai RealtimeModel support")
+        realtime_kwargs: Dict[str, Any] = {
+            "model": voice_realtime_model,
+            "api_key": xai_api_key,
+            "base_url": XAI_REALTIME_BASE_URL,
+            "voice": selected_voice,
+            "modalities": ["audio"],
+        }
+        turn_detection = _build_openai_realtime_turn_detection()
+        if turn_detection is not None:
+            realtime_kwargs["turn_detection"] = turn_detection
+        try:
+            llm = openai.realtime.RealtimeModel(**realtime_kwargs)
+            runtime_llm_model = voice_realtime_model
+            base_url = XAI_REALTIME_BASE_URL
+            use_realtime_llm = True
+            use_unified_realtime_audio = True
+        except Exception as realtime_err:
+            raise RuntimeError(f"xAI unified realtime voice path unavailable: {realtime_err}") from realtime_err
+    elif (
         voice_runtime_mode == "realtime_text_tts"
         and voice_realtime_model
         and tts_engine is not None
@@ -2360,7 +2410,7 @@ async def entrypoint(ctx: JobContext):
         try:
             llm = openai.realtime.RealtimeModel(**realtime_kwargs)
             runtime_llm_model = voice_realtime_model
-            use_realtime_text_tts = True
+            use_realtime_llm = True
         except Exception as realtime_err:
             logger.warning("OpenAI Realtime voice path unavailable; falling back to pipeline LLM: %s", realtime_err)
     elif voice_runtime_mode == "realtime_text_tts" and not voice_realtime_model:
@@ -2385,7 +2435,7 @@ async def entrypoint(ctx: JobContext):
     usage.llm_model = runtime_llm_model
     usage.tts_provider = tts_provider
     usage.tts_model = selected_tts_model or ""
-    usage.tts_voice_id = selected_voice if tts_provider == "elevenlabs" else resolved_voice_id
+    usage.tts_voice_id = selected_voice if tts_provider in {"elevenlabs", "xai"} else resolved_voice_id
     usage.llm_temperature = effective_llm_temperature
     usage.voice_speed = voice_speed
     usage.language = agent_lang
@@ -2473,13 +2523,14 @@ async def entrypoint(ctx: JobContext):
     )
     session_kwargs: Dict[str, Any] = {
         "llm": llm,
-        "tts": tts_engine,
         "min_endpointing_delay": max(0.05, SESSION_MIN_ENDPOINTING_DELAY),
         "max_endpointing_delay": max(max(0.05, SESSION_MIN_ENDPOINTING_DELAY), SESSION_MAX_ENDPOINTING_DELAY),
         "preemptive_generation": SESSION_PREEMPTIVE_GENERATION,
     }
-    stt_model = "openai-realtime-native"
-    if not use_realtime_text_tts:
+    if tts_engine is not None:
+        session_kwargs["tts"] = tts_engine
+    stt_model = "xai-voice-agent-native" if use_unified_realtime_audio else "openai-realtime-native"
+    if not use_realtime_llm:
         stt_language = resolve_stt_language(agent_lang)
         # Use Nova-2 for multilingual (language=multi) because it has better code-switching
         # Use Nova-3 for specific languages (faster, more accurate)
@@ -2506,7 +2557,10 @@ async def entrypoint(ctx: JobContext):
         session_kwargs["vad"] = ctx.proc.userdata["vad"]
         session_kwargs["stt"] = deepgram.STT(**stt_kwargs)
     else:
-        logger.info("Realtime voice path enabled: using OpenAI Realtime for speech understanding and turn detection")
+        if use_unified_realtime_audio:
+            logger.info("Realtime voice path enabled: using xAI unified voice realtime for STT, generation, and speech output")
+        else:
+            logger.info("Realtime voice path enabled: using OpenAI Realtime for speech understanding and turn detection")
 
     session = AgentSession(**session_kwargs)
 

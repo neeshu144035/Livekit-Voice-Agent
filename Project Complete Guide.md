@@ -744,6 +744,9 @@ VAD_MIN_SILENCE_DURATION=0.05
 VAD_PREFIX_PADDING_DURATION=0.12
 ELEVENLABS_STREAMING_LATENCY=1
 ELEVENLABS_AUTO_MODE=1
+XAI_API_KEY=
+XAI_REALTIME_MODEL=grok-voice-think-fast-1.0
+XAI_REALTIME_BASE_URL=https://api.x.ai/v1
 OPENAI_REASONING_EFFORT=low
 OPENAI_VERBOSITY=low
 OPENAI_MAX_COMPLETION_TOKENS=220
@@ -1063,10 +1066,44 @@ OPENAI_MAX_COMPLETION_TOKENS=220
   - [`livekit-company-key.pem`](livekit-company-key.pem)
 - Backend and worker code were synced to the VPS and restarted successfully during verification.
 
+### xAI Unified Voice Integration (April 24, 2026)
+- Added `xai` as a first-class speech provider across:
+  - [`backend/main.py`](backend/main.py)
+  - [`agent_retell.py`](agent_retell.py)
+  - [`app/agent/[id]/page.tsx`](app/agent/[id]/page.tsx)
+  - [`components/CreateAgentModal.tsx`](components/CreateAgentModal.tsx)
+  - [`app/call-history/page.tsx`](app/call-history/page.tsx)
+- The xAI path is intentionally **not** the old cascaded pipeline.
+  - It uses a unified realtime voice model through LiveKit's OpenAI-compatible `RealtimeModel`
+  - Base URL: `https://api.x.ai/v1`
+  - Current default model: `grok-voice-think-fast-1.0`
+  - Legacy model still exposed for compatibility: `grok-voice-fast-1.0`
+- Supported xAI voices currently exposed in the dashboard:
+  - `eve`
+  - `ara`
+  - `rex`
+  - `sal`
+  - `leo`
+- Runtime behavior:
+  - selecting `tts_provider=xai` automatically forces `voice_runtime_mode=realtime_unified`
+  - the saved `tts_model` is also persisted as `voice_realtime_model`
+  - Deepgram STT and external TTS are skipped for xAI calls
+- Cost handling was updated for xAI voice calls:
+  - fallback cost display uses xAI Voice Agent pricing (`$0.05/min`)
+  - LLM/STT/TTS are not double-counted separately for xAI unified sessions
+- Important deployment requirement:
+  - production must have `XAI_API_KEY` available to both the backend env and the voice-agent env before live xAI calls will work
+  - without `XAI_API_KEY`, the dashboard can still show xAI models/voices, but the live runtime will fail fast instead of silently falling back to another provider
+
 ### Verification Completed With Commands
 - Local verification completed successfully:
   - `python -m py_compile backend/main.py agent_retell.py`
   - `npx tsc --noEmit`
+  - `npm run build`
+  - backend sanity check with temporary SQLite import context:
+    - `get_tts_models('xai')`
+    - `get_tts_voices('xai')`
+    - `lookup_tts_voice('xai', 'eve')`
 - Remote/VPS verification completed with command-line checks:
   - `curl http://127.0.0.1:8000/api/agents/21`
   - `curl http://127.0.0.1:8000/api/token/21`
@@ -1103,6 +1140,8 @@ Continue from the April 20, 2026 LiveKit project state in C:\LiveKit-Project.
 Current known state after latest deploy:
 - backend/main.py and agent_retell.py updated so app-selected settings control runtime (voice_runtime_mode, voice_realtime_model, ElevenLabs model, greeting)
 - explicit ElevenLabs tts_model required on create/update; no auto-swapping
+- xAI provider support added with unified realtime voice mode (`grok-voice-think-fast-1.0` default)
+- xAI calls require `XAI_API_KEY` on both backend and voice-agent environments
 - LLM default reverted to moonshot-v1-8k
 - frontend (CreateAgentModal, CreateAgentWizard, agent page) exposes Voice Runtime mode explicitly
 - safe latency wins retained: pooled HTTP clients, parallel config/function fetches

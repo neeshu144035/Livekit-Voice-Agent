@@ -40,6 +40,7 @@ interface TTSModelOption {
     name: string;
     is_v3?: boolean;
     supports_multilingual?: boolean;
+    deprecated?: boolean;
 }
 
 const MODEL_OPTIONS: ModelOption[] = [
@@ -84,10 +85,13 @@ const VOICE_OPTIONS: VoiceOption[] = [
 ];
 
 const DEEPGRAM_VOICE_IDS = new Set(VOICE_OPTIONS.map((voice) => voice.value));
+const XAI_DEFAULT_MODEL = 'grok-voice-think-fast-1.0';
+const XAI_VOICE_IDS = new Set(['ara', 'eve', 'leo', 'rex', 'sal']);
 
 const TTS_PROVIDERS = [
     { value: 'deepgram', label: 'Deepgram', description: 'Fast & affordable' },
     { value: 'elevenlabs', label: 'ElevenLabs', description: 'High quality voices' },
+    { value: 'xai', label: 'xAI', description: 'Unified realtime voice' },
 ];
 
 const LANGUAGE_OPTIONS = [
@@ -143,12 +147,12 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
     const [error, setError] = useState<string | null>(null);
     const [created, setCreated] = useState(false);
 
-    const loadElevenLabsVoices = async (modelId?: string) => {
+    const loadProviderVoices = async (provider: string, modelId?: string) => {
         setTtsLoading(true);
         try {
             const params = modelId
-                ? { provider: 'elevenlabs', model: modelId }
-                : { provider: 'elevenlabs' };
+                ? { provider, model: modelId }
+                : { provider };
             const response = await axios.get(`${API_URL}tts/voices`, { params });
             setTtsVoices(response.data?.voices || []);
         } catch (fetchError) {
@@ -159,7 +163,7 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
     };
 
     const loadTtsOptions = async (provider: string) => {
-        if (provider !== 'elevenlabs') {
+        if (provider === 'deepgram') {
             setTtsVoices([]);
             setTtsModels([]);
             setSelectedTtsModel('');
@@ -169,11 +173,16 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
         setTtsLoading(true);
         try {
             const [voicesResponse, modelsResponse] = await Promise.all([
-                axios.get(`${API_URL}tts/voices`, { params: { provider: 'elevenlabs' } }),
-                axios.get(`${API_URL}tts/models`, { params: { provider: 'elevenlabs' } }),
+                axios.get(`${API_URL}tts/voices`, { params: { provider } }),
+                axios.get(`${API_URL}tts/models`, { params: { provider } }),
             ]);
             setTtsVoices(voicesResponse.data?.voices || []);
             setTtsModels(modelsResponse.data?.models || []);
+            if (modelsResponse.data?.available === false) {
+                setError(provider === 'xai'
+                    ? 'xAI is not configured on the server yet. Add XAI_API_KEY before using it live.'
+                    : 'ElevenLabs is not configured on the server yet. Add ELEVEN_API_KEY before using it live.');
+            }
         } catch (fetchError) {
             setTtsVoices([]);
             setTtsModels([]);
@@ -189,14 +198,28 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
 
     useEffect(() => {
         if (!isOpen || selectedTtsProvider !== 'elevenlabs' || !selectedTtsModel) return;
-        void loadElevenLabsVoices(selectedTtsModel);
+        void loadProviderVoices('elevenlabs', selectedTtsModel);
     }, [isOpen, selectedTtsProvider, selectedTtsModel]);
 
     useEffect(() => {
-        if (selectedTtsProvider !== 'elevenlabs') return;
-        if (!DEEPGRAM_VOICE_IDS.has(selectedVoice)) return;
+        if (selectedTtsProvider === 'xai') {
+            if (!selectedVoice || !XAI_VOICE_IDS.has(selectedVoice)) {
+                setSelectedVoice('eve');
+            }
+            if (!selectedTtsModel) {
+                setSelectedTtsModel(XAI_DEFAULT_MODEL);
+            }
+            return;
+        }
+        if (selectedTtsProvider === 'deepgram') {
+            if (!DEEPGRAM_VOICE_IDS.has(selectedVoice)) {
+                setSelectedVoice('aura-asteria-en');
+            }
+            return;
+        }
+        if (!DEEPGRAM_VOICE_IDS.has(selectedVoice) && !XAI_VOICE_IDS.has(selectedVoice)) return;
         setSelectedVoice('');
-    }, [selectedTtsProvider, selectedVoice]);
+    }, [selectedTtsProvider, selectedVoice, selectedTtsModel]);
 
     const tabs = [
         { id: 'llm' as TabType, label: 'LLM', icon: Cpu, description: 'Language Model' },
@@ -214,18 +237,27 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
             return;
         }
         if (selectedTtsProvider === 'deepgram' && !DEEPGRAM_TTS_SUPPORTED_LANGUAGES.has(selectedLanguage)) {
-            setError('Use ElevenLabs for Hindi, Malayalam, or multilingual output.');
+            setError('Use ElevenLabs or xAI for Hindi, Malayalam, or multilingual output.');
             return;
         }
         if (!selectedVoice) {
-            setError(`Select a ${selectedTtsProvider === 'elevenlabs' ? 'voice ID' : 'voice'}.`);
+            const voiceLabel = selectedTtsProvider === 'elevenlabs'
+                ? 'voice ID'
+                : selectedTtsProvider === 'xai'
+                    ? 'xAI voice'
+                    : 'voice';
+            setError(`Select a ${voiceLabel}.`);
             return;
         }
         if (selectedTtsProvider === 'elevenlabs' && !selectedTtsModel) {
             setError('Select an ElevenLabs model.');
             return;
         }
-        if (voiceRuntimeMode === 'realtime_text_tts' && !voiceRealtimeModel.trim()) {
+        if (selectedTtsProvider === 'xai' && !selectedTtsModel) {
+            setError('Select an xAI voice model.');
+            return;
+        }
+        if (selectedTtsProvider !== 'xai' && voiceRuntimeMode === 'realtime_text_tts' && !voiceRealtimeModel.trim()) {
             setError('Enter the realtime model you want this agent to use.');
             return;
         }
@@ -241,15 +273,20 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                 llm_model: selectedModel,
                 voice: selectedVoice,
                 tts_provider: selectedTtsProvider,
-                tts_model: selectedTtsProvider === 'elevenlabs' ? selectedTtsModel : null,
+                tts_model: selectedTtsProvider === 'deepgram' ? null : selectedTtsModel,
                 language: selectedLanguage,
                 twilio_number: null,
-                custom_params: voiceRuntimeMode === 'realtime_text_tts'
+                custom_params: selectedTtsProvider === 'xai'
                     ? {
-                        voice_runtime_mode: 'realtime_text_tts',
-                        voice_realtime_model: voiceRealtimeModel.trim(),
+                        voice_runtime_mode: 'realtime_unified',
+                        voice_realtime_model: selectedTtsModel || XAI_DEFAULT_MODEL,
                     }
-                    : {}
+                    : voiceRuntimeMode === 'realtime_text_tts'
+                        ? {
+                            voice_runtime_mode: 'realtime_text_tts',
+                            voice_realtime_model: voiceRealtimeModel.trim(),
+                        }
+                        : {}
             });
 
             setCreated(true);
@@ -459,7 +496,9 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                     disabled={ttsLoading}
                                                     className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
                                                 >
-                                                    <option value="">Select an ElevenLabs voice</option>
+                                                    <option value="">
+                                                        {selectedTtsProvider === 'xai' ? 'Select an xAI voice' : 'Select an ElevenLabs voice'}
+                                                    </option>
                                                     {ttsVoices.map((voice) => (
                                                         <option key={voice.id} value={voice.id}>
                                                             {voice.label}
@@ -468,7 +507,9 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                     ))}
                                                 </select>
                                                 <p className="text-xs text-gray-500">
-                                                    Voice IDs come directly from the backend&apos;s ElevenLabs integration. Nothing is auto-picked.
+                                                    {selectedTtsProvider === 'xai'
+                                                        ? 'xAI voices come from the backend provider catalog and stay on the unified realtime path.'
+                                                        : 'Voice IDs come directly from the backend&apos;s ElevenLabs integration. Nothing is auto-picked.'}
                                                 </p>
                                             </div>
                                         )}
@@ -482,7 +523,7 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                             <Zap className="w-5 h-5 text-gray-400" />
                                             <h3 className="text-sm font-semibold text-gray-700">Text-to-Speech Provider</h3>
                                         </div>
-                                        <div className="grid grid-cols-2 gap-3">
+                                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                                             {TTS_PROVIDERS.map((provider) => (
                                                 <button
                                                     key={provider.value}
@@ -497,7 +538,9 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                     <div className={`w-14 h-14 rounded-xl flex items-center justify-center mb-3 ${
                                                         provider.value === 'deepgram' 
                                                             ? 'bg-gradient-to-br from-purple-500 to-purple-600' 
-                                                            : 'bg-gradient-to-br from-orange-500 to-red-500'
+                                                            : provider.value === 'xai'
+                                                                ? 'bg-gradient-to-br from-sky-500 to-cyan-600'
+                                                                : 'bg-gradient-to-br from-orange-500 to-red-500'
                                                     }`}>
                                                         <Zap className="w-7 h-7 text-white" />
                                                     </div>
@@ -509,11 +552,11 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                 </button>
                                             ))}
                                         </div>
-                                        {selectedTtsProvider === 'elevenlabs' && (
+                                        {selectedTtsProvider !== 'deepgram' && (
                                             <div className="space-y-3">
                                                 <div>
                                                     <label className="block text-sm font-medium text-gray-700 mb-2">
-                                                        ElevenLabs Model
+                                                        {selectedTtsProvider === 'xai' ? 'xAI Voice Model' : 'ElevenLabs Model'}
                                                     </label>
                                                     <select
                                                         value={selectedTtsModel}
@@ -521,18 +564,25 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                         disabled={ttsLoading}
                                                         className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
                                                     >
-                                                        <option value="">Select an ElevenLabs model</option>
+                                                        <option value="">{selectedTtsProvider === 'xai' ? 'Select an xAI model' : 'Select an ElevenLabs model'}</option>
                                                         {ttsModels.map((model) => (
                                                             <option key={model.id} value={model.id}>
                                                                 {model.name}
-                                                                {model.is_v3 ? ' (v3)' : model.supports_multilingual ? ' (Multilingual)' : ''}
+                                                                {selectedTtsProvider === 'xai'
+                                                                    ? model.deprecated ? ' (Legacy)' : ' (Unified)'
+                                                                    : model.is_v3 ? ' (v3)' : model.supports_multilingual ? ' (Multilingual)' : ''}
                                                             </option>
                                                         ))}
                                                     </select>
                                                 </div>
-                                                {selectedTtsModel && selectedTtsModel.includes('v3') && (
+                                                {selectedTtsProvider === 'elevenlabs' && selectedTtsModel && selectedTtsModel.includes('v3') && (
                                                     <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
                                                         `eleven_v3` stays available when you choose it, but it is the slower HTTP path for live synthesis.
+                                                    </div>
+                                                )}
+                                                {selectedTtsProvider === 'xai' && (
+                                                    <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+                                                        xAI uses a unified realtime voice model, so STT, reasoning, and voice output all come from the same provider session.
                                                     </div>
                                                 )}
                                             </div>
@@ -542,16 +592,26 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                 <label className="block text-sm font-medium text-gray-700 mb-2">
                                                     Voice Runtime
                                                 </label>
-                                                <select
-                                                    value={voiceRuntimeMode}
-                                                    onChange={(e) => setVoiceRuntimeMode(e.target.value)}
-                                                    className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
-                                                >
-                                                    <option value="pipeline">Pipeline</option>
-                                                    <option value="realtime_text_tts">Realtime text + TTS</option>
-                                                </select>
+                                                {selectedTtsProvider === 'xai' ? (
+                                                    <select
+                                                        value="realtime_unified"
+                                                        disabled
+                                                        className="w-full px-4 py-3 bg-gray-100 border border-gray-200 rounded-lg text-gray-900 cursor-not-allowed"
+                                                    >
+                                                        <option value="realtime_unified">Realtime unified (xAI)</option>
+                                                    </select>
+                                                ) : (
+                                                    <select
+                                                        value={voiceRuntimeMode}
+                                                        onChange={(e) => setVoiceRuntimeMode(e.target.value)}
+                                                        className="w-full px-4 py-3 bg-white border border-gray-200 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                                                    >
+                                                        <option value="pipeline">Pipeline</option>
+                                                        <option value="realtime_text_tts">Realtime text + TTS</option>
+                                                    </select>
+                                                )}
                                             </div>
-                                            {voiceRuntimeMode === 'realtime_text_tts' && (
+                                            {selectedTtsProvider !== 'xai' && voiceRuntimeMode === 'realtime_text_tts' && (
                                                 <div>
                                                     <label className="block text-sm font-medium text-gray-700 mb-2">
                                                         Realtime Model
@@ -567,6 +627,11 @@ export default function CreateAgentModal({ isOpen, onClose, onSuccess }: CreateA
                                                         This is saved only when you explicitly choose realtime here.
                                                     </p>
                                                 </div>
+                                            )}
+                                            {selectedTtsProvider === 'xai' && (
+                                                <p className="text-xs text-gray-500">
+                                                    Choosing xAI automatically saves this agent on the unified realtime voice path.
+                                                </p>
                                             )}
                                         </div>
                                     </div>

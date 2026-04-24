@@ -117,6 +117,7 @@ const MODEL_OPTIONS = [
 const TTS_PROVIDER_OPTIONS = [
     { value: 'deepgram', label: 'Deepgram' },
     { value: 'elevenlabs', label: 'ElevenLabs' },
+    { value: 'xai', label: 'xAI' },
 ];
 
 interface TTSVoiceOption {
@@ -137,6 +138,7 @@ interface TTSModelOption {
     languages_count?: number;
     languages?: string[];
     supports_multilingual?: boolean;
+    deprecated?: boolean;
 }
 
 // Voices available for Deepgram TTS
@@ -155,6 +157,15 @@ const DEEPGRAM_VOICE_OPTIONS: TTSVoiceOption[] = [
     { id: 'james', label: 'James', accent: 'US', gender: 'Male', provider: 'deepgram' },
 ];
 const DEEPGRAM_VOICE_IDS = new Set(DEEPGRAM_VOICE_OPTIONS.map((voice) => voice.id));
+const XAI_DEFAULT_MODEL = 'grok-voice-think-fast-1.0';
+const XAI_VOICE_OPTIONS: TTSVoiceOption[] = [
+    { id: 'ara', label: 'Ara', accent: 'Warm, friendly', gender: 'Female', provider: 'xai' },
+    { id: 'eve', label: 'Eve', accent: 'Energetic, upbeat', gender: 'Female', provider: 'xai' },
+    { id: 'leo', label: 'Leo', accent: 'Authoritative, strong', gender: 'Male', provider: 'xai' },
+    { id: 'rex', label: 'Rex', accent: 'Confident, clear', gender: 'Male', provider: 'xai' },
+    { id: 'sal', label: 'Sal', accent: 'Smooth, balanced', gender: 'Neutral', provider: 'xai' },
+];
+const XAI_VOICE_IDS = new Set(XAI_VOICE_OPTIONS.map((voice) => voice.id));
 const CUSTOM_ELEVEN_VOICE_OPTION_ID = '__custom_eleven_voice_option__';
 
 // Language options
@@ -207,7 +218,6 @@ const ELEVENLABS_LANGUAGE_ID_MAP: Record<string, string[]> = {
 };
 
 const languageRequiresElevenLabsTts = (language: string) => !DEEPGRAM_TTS_SUPPORTED_LANGUAGES.has(language);
-
 const isElevenV3Model = (modelId?: string | null) => {
     const normalized = String(modelId || '').toLowerCase();
     return normalized.includes('v3') && !normalized.includes('flash');
@@ -312,6 +322,7 @@ export default function AgentDetailPage() {
     const agentId = params.id as string;
     const compatibleElevenModels = getCompatibleElevenModels(ttsModels, selectedLanguage);
     const visibleElevenModels = compatibleElevenModels.length > 0 ? compatibleElevenModels : ttsModels;
+    const visibleProviderModels = selectedTtsProvider === 'elevenlabs' ? visibleElevenModels : ttsModels;
     const selectedLanguageLabel = getLanguageLabel(selectedLanguage);
 
     const toggleSection = (section: string) => {
@@ -323,8 +334,9 @@ export default function AgentDetailPage() {
     };
 
     const inferProviderFromVoice = (voice?: string, explicit?: string) => {
-        if (explicit === 'deepgram' || explicit === 'elevenlabs') return explicit;
+        if (explicit === 'deepgram' || explicit === 'elevenlabs' || explicit === 'xai') return explicit;
         if (!voice) return 'deepgram';
+        if (XAI_VOICE_IDS.has(voice)) return 'xai';
         if (voice.startsWith('aura-') || ['jessica', 'mark', 'sarah', 'michael', 'emma', 'james'].includes(voice)) {
             return 'deepgram';
         }
@@ -404,7 +416,7 @@ export default function AgentDetailPage() {
     };
 
     const loadTtsVoicesForModel = async (provider: string, modelId?: string) => {
-        const normalized = provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
+        const normalized = provider === 'xai' ? 'xai' : provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
         if (normalized !== 'elevenlabs') return;
         setTtsLoading(true);
         try {
@@ -420,7 +432,7 @@ export default function AgentDetailPage() {
     };
 
     const loadTtsOptions = async (provider: string) => {
-        const normalizedProvider = provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
+        const normalizedProvider = provider === 'xai' ? 'xai' : provider === 'elevenlabs' ? 'elevenlabs' : 'deepgram';
         setTtsLoading(true);
         if (normalizedProvider === 'deepgram') {
             setTtsVoices(DEEPGRAM_VOICE_OPTIONS);
@@ -429,34 +441,33 @@ export default function AgentDetailPage() {
             return;
         }
 
-        // ElevenLabs: do not show fallback models/voices; only display provider API results.
+        // Provider-managed voices/models: do not show fallback rows, only backend API results.
         setTtsVoices([]);
         setTtsModels([]);
         try {
             const voicesPromise = axios.get(`${API_URL}tts/voices`, {
                 params: { provider: normalizedProvider },
             });
-            const modelsPromise = normalizedProvider === 'elevenlabs'
-                ? axios.get(`${API_URL}tts/models`, { params: { provider: normalizedProvider } })
-                : Promise.resolve({ data: { models: [] } });
+            const modelsPromise = axios.get(`${API_URL}tts/models`, { params: { provider: normalizedProvider } });
 
             const [voicesRes, modelsRes] = await Promise.all([voicesPromise, modelsPromise]);
-            if (normalizedProvider === 'elevenlabs' && modelsRes.data?.available === false) {
-                showToast('ElevenLabs is not configured on the server (missing ELEVEN_API_KEY).', 'error');
+            if (modelsRes.data?.available === false) {
+                if (normalizedProvider === 'elevenlabs') {
+                    showToast('ElevenLabs is not configured on the server (missing ELEVEN_API_KEY).', 'error');
+                } else if (normalizedProvider === 'xai') {
+                    showToast('xAI is not configured on the server (missing XAI_API_KEY).', 'error');
+                }
             }
 
             const voices = (voicesRes.data?.voices || []) as TTSVoiceOption[];
             setTtsVoices(voices);
-
-            if (normalizedProvider === 'elevenlabs') {
-                const models = (modelsRes.data?.models || []) as TTSModelOption[];
-                setTtsModels(models);
-            } else {
-                setTtsModels([]);
-            }
+            const models = (modelsRes.data?.models || []) as TTSModelOption[];
+            setTtsModels(models);
         } catch (err: any) {
             if (normalizedProvider === 'elevenlabs') {
                 showToast(err?.response?.data?.detail || 'Failed to load ElevenLabs voices. Check ELEVEN_API_KEY on server.', 'error');
+            } else if (normalizedProvider === 'xai') {
+                showToast(err?.response?.data?.detail || 'Failed to load xAI voices. Check XAI_API_KEY on server.', 'error');
             }
             setTtsVoices([]);
             setTtsModels([]);
@@ -474,6 +485,16 @@ export default function AgentDetailPage() {
         loadTtsOptions(selectedTtsProvider);
     }, [selectedTtsProvider]);
 
+    useEffect(() => {
+        if (selectedTtsProvider !== 'xai') return;
+        if (!selectedVoice || !XAI_VOICE_IDS.has(selectedVoice)) {
+            setSelectedVoice('eve');
+        }
+        if (!selectedTtsModel) {
+            setSelectedTtsModel(XAI_DEFAULT_MODEL);
+        }
+    }, [selectedTtsProvider, selectedVoice, selectedTtsModel]);
+
     // Re-fetch voices when ElevenLabs model changes (v3 shows all voices, v2.5 filters by compatibility)
     useEffect(() => {
         if (selectedTtsProvider !== 'elevenlabs' || !selectedTtsModel) return;
@@ -481,10 +502,22 @@ export default function AgentDetailPage() {
     }, [selectedTtsModel]);
 
     useEffect(() => {
-        if (selectedTtsProvider !== 'elevenlabs') return;
         if (!selectedVoice) return;
-        if (!DEEPGRAM_VOICE_IDS.has(selectedVoice)) return;
-        setSelectedVoice('');
+        if (selectedTtsProvider === 'deepgram') {
+            if (!DEEPGRAM_VOICE_IDS.has(selectedVoice)) {
+                setSelectedVoice(DEEPGRAM_VOICE_OPTIONS[0]?.id || 'jessica');
+            }
+            return;
+        }
+        if (selectedTtsProvider === 'xai') {
+            if (!XAI_VOICE_IDS.has(selectedVoice)) {
+                setSelectedVoice('eve');
+            }
+            return;
+        }
+        if (DEEPGRAM_VOICE_IDS.has(selectedVoice) || XAI_VOICE_IDS.has(selectedVoice)) {
+            setSelectedVoice('');
+        }
     }, [selectedTtsProvider, selectedVoice]);
 
     useEffect(() => {
@@ -516,8 +549,8 @@ export default function AgentDetailPage() {
             setSelectedModel(data.llm_model || 'moonshot-v1-8k');
             const provider = inferProviderFromVoice(data.voice, data.tts_provider);
             setSelectedTtsProvider(provider);
-            setSelectedTtsModel(data.tts_model || '');
-            setSelectedVoice(data.voice || 'jessica');
+            setSelectedTtsModel(data.tts_model || (provider === 'xai' ? XAI_DEFAULT_MODEL : ''));
+            setSelectedVoice(data.voice || (provider === 'xai' ? 'eve' : 'jessica'));
             setSelectedLanguage(data.language || 'en-GB');
             setWelcomeOption(data.welcome_message_type || 'user_speaks_first');
             setWelcomeMessage(data.welcome_message || '');
@@ -526,8 +559,14 @@ export default function AgentDetailPage() {
             const overrideEnabled = customParams.force_phone_llm_model_override;
             setPhoneLlmOverrideEnabled(overrideEnabled === undefined ? false : Boolean(overrideEnabled));
             setPhoneLlmModel(customParams.phone_llm_model || data.llm_model || DEFAULT_PHONE_LLM_MODEL);
-            setVoiceRuntimeMode(customParams.voice_runtime_mode === 'realtime_text_tts' ? 'realtime_text_tts' : 'pipeline');
-            setVoiceRealtimeModel(customParams.voice_realtime_model || '');
+            setVoiceRuntimeMode(
+                provider === 'xai'
+                    ? 'realtime_unified'
+                    : customParams.voice_runtime_mode === 'realtime_text_tts'
+                        ? 'realtime_text_tts'
+                        : 'pipeline'
+            );
+            setVoiceRealtimeModel(customParams.voice_realtime_model || (provider === 'xai' ? (data.tts_model || XAI_DEFAULT_MODEL) : ''));
             const persistedSpeed = Number(data.voice_speed ?? customParams.voice_speed ?? DEFAULT_VOICE_SPEED);
             setVoiceSpeed(clampNumber(persistedSpeed, MIN_VOICE_SPEED, MAX_VOICE_SPEED, DEFAULT_VOICE_SPEED));
         } catch (err) {
@@ -640,11 +679,16 @@ export default function AgentDetailPage() {
     const handleSave = async () => {
         if (!agent) return;
         if (selectedTtsProvider === 'deepgram' && languageRequiresElevenLabsTts(selectedLanguage)) {
-            showToast(`Use ElevenLabs for ${selectedLanguageLabel}. Deepgram TTS does not support that language.`, 'error');
+            showToast(`Use ElevenLabs or xAI for ${selectedLanguageLabel}. Deepgram TTS does not support that language.`, 'error');
             return;
         }
         if (!selectedVoice) {
-            showToast(`Select a ${selectedTtsProvider === 'elevenlabs' ? 'voice ID' : 'voice'}`, 'error');
+            const voiceLabel = selectedTtsProvider === 'elevenlabs'
+                ? 'voice ID'
+                : selectedTtsProvider === 'xai'
+                    ? 'xAI voice'
+                    : 'voice';
+            showToast(`Select a ${voiceLabel}`, 'error');
             return;
         }
         if (selectedTtsProvider === 'elevenlabs') {
@@ -661,7 +705,11 @@ export default function AgentDetailPage() {
                 return;
             }
         }
-        if (voiceRuntimeMode === 'realtime_text_tts' && !voiceRealtimeModel.trim()) {
+        if (selectedTtsProvider === 'xai' && !selectedTtsModel) {
+            showToast('Select an xAI voice model', 'error');
+            return;
+        }
+        if (selectedTtsProvider !== 'xai' && voiceRuntimeMode === 'realtime_text_tts' && !voiceRealtimeModel.trim()) {
             showToast('Enter the realtime model to use for realtime mode', 'error');
             return;
         }
@@ -678,8 +726,10 @@ export default function AgentDetailPage() {
             } else {
                 delete nextCustomParams.phone_llm_model;
             }
-            nextCustomParams.voice_runtime_mode = voiceRuntimeMode;
-            if (voiceRuntimeMode === 'realtime_text_tts') {
+            nextCustomParams.voice_runtime_mode = selectedTtsProvider === 'xai' ? 'realtime_unified' : voiceRuntimeMode;
+            if (selectedTtsProvider === 'xai') {
+                nextCustomParams.voice_realtime_model = selectedTtsModel || XAI_DEFAULT_MODEL;
+            } else if (voiceRuntimeMode === 'realtime_text_tts') {
                 nextCustomParams.voice_realtime_model = voiceRealtimeModel.trim();
             } else {
                 delete nextCustomParams.voice_realtime_model;
@@ -692,7 +742,7 @@ export default function AgentDetailPage() {
                 llm_model: selectedModel,
                 voice: selectedVoice,
                 tts_provider: selectedTtsProvider,
-                tts_model: selectedTtsProvider === 'elevenlabs' ? selectedTtsModel : null,
+                tts_model: selectedTtsProvider === 'deepgram' ? null : selectedTtsModel,
                 language: selectedLanguage,
                 voice_speed: voiceSpeed,
                 twilio_number: agent.twilio_number,
@@ -714,15 +764,25 @@ export default function AgentDetailPage() {
             setSelectedLanguage(persisted.language || selectedLanguage);
             setWelcomeOption(persisted.welcome_message_type || welcomeOption);
             setWelcomeMessage(persisted.welcome_message || '');
-            setSelectedTtsProvider(persisted.tts_provider || selectedTtsProvider);
-            setSelectedTtsModel(persisted.tts_model || '');
+            const persistedProvider = inferProviderFromVoice(persisted.voice || selectedVoice, persisted.tts_provider || selectedTtsProvider);
+            setSelectedTtsProvider(persistedProvider);
+            setSelectedTtsModel(persisted.tts_model || (persistedProvider === 'xai' ? XAI_DEFAULT_MODEL : ''));
             const persistedCustomParams = persisted.custom_params || {};
             setAgentCustomParams(persistedCustomParams);
             const persistedOverride = persistedCustomParams.force_phone_llm_model_override;
             setPhoneLlmOverrideEnabled(persistedOverride === undefined ? false : Boolean(persistedOverride));
             setPhoneLlmModel(persistedCustomParams.phone_llm_model || persisted.llm_model || phoneLlmModel);
-            setVoiceRuntimeMode(persistedCustomParams.voice_runtime_mode === 'realtime_text_tts' ? 'realtime_text_tts' : 'pipeline');
-            setVoiceRealtimeModel(persistedCustomParams.voice_realtime_model || '');
+            setVoiceRuntimeMode(
+                persistedProvider === 'xai'
+                    ? 'realtime_unified'
+                    : persistedCustomParams.voice_runtime_mode === 'realtime_text_tts'
+                        ? 'realtime_text_tts'
+                        : 'pipeline'
+            );
+            setVoiceRealtimeModel(
+                persistedCustomParams.voice_realtime_model
+                || (persistedProvider === 'xai' ? (persisted.tts_model || XAI_DEFAULT_MODEL) : '')
+            );
             const persistedSpeed = Number(persisted.voice_speed ?? persistedCustomParams.voice_speed ?? voiceSpeed);
             setVoiceSpeed(clampNumber(persistedSpeed, MIN_VOICE_SPEED, MAX_VOICE_SPEED, voiceSpeed));
 
@@ -967,7 +1027,11 @@ export default function AgentDetailPage() {
                                         className="w-full appearance-none px-3 py-2 pr-8 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200 focus:outline-none cursor-pointer"
                                     >
                                         <option value="">
-                                            {selectedTtsProvider === 'elevenlabs' ? 'Select an ElevenLabs voice' : 'Select a voice'}
+                                            {selectedTtsProvider === 'elevenlabs'
+                                                ? 'Select an ElevenLabs voice'
+                                                : selectedTtsProvider === 'xai'
+                                                    ? 'Select an xAI voice'
+                                                    : 'Select a voice'}
                                         </option>
 {ttsVoices.map(voice => (
                                                 <option key={voice.id} value={voice.id}>
@@ -984,8 +1048,8 @@ export default function AgentDetailPage() {
                                     <ChevronDown className="absolute right-2 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-500 pointer-events-none" />
                                 </div>
 
-                                {/* ElevenLabs Model Dropdown */}
-                                {selectedTtsProvider === 'elevenlabs' && (
+                                {/* Provider Model Dropdown */}
+                                {selectedTtsProvider !== 'deepgram' && (
                                     <div className="relative min-w-[190px]">
                                         <select
                                             value={selectedTtsModel}
@@ -993,11 +1057,23 @@ export default function AgentDetailPage() {
                                             disabled={ttsLoading}
                                             className="w-full appearance-none px-3 py-2 pr-8 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200 focus:outline-none cursor-pointer"
                                         >
-                                            <option value="">Select an ElevenLabs model</option>
-                                            {visibleElevenModels.map(model => (
+                                            <option value="">
+                                                {selectedTtsProvider === 'elevenlabs' ? 'Select an ElevenLabs model' : 'Select an xAI model'}
+                                            </option>
+                                            {visibleProviderModels.map(model => (
                                                 <option key={model.id} value={model.id}>
                                                     {model.name}
-                                                    {model.is_v3 ? ' (v3)' : model.streaming_type === 'http' ? ' (HTTP)' : model.supports_multilingual ? ' (Multilingual)' : ' (WS)'}
+                                                    {selectedTtsProvider === 'elevenlabs'
+                                                        ? model.is_v3
+                                                            ? ' (v3)'
+                                                            : model.streaming_type === 'http'
+                                                                ? ' (HTTP)'
+                                                                : model.supports_multilingual
+                                                                    ? ' (Multilingual)'
+                                                                    : ' (WS)'
+                                                        : model.deprecated
+                                                            ? ' (Legacy)'
+                                                            : ' (Unified)'}
                                                 </option>
                                             ))}
                                         </select>
@@ -1009,6 +1085,18 @@ export default function AgentDetailPage() {
                                     <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
                                         <span className="w-2 h-2 bg-amber-500 rounded-full" />
                                         <span className="text-xs text-amber-700 font-medium">v3 is the expressive path, but Flash v2.5 is the lower-latency choice for live calls when the language supports it</span>
+                                    </div>
+                                )}
+                                {selectedTtsProvider === 'xai' && (
+                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg">
+                                        <span className="w-2 h-2 bg-blue-500 rounded-full" />
+                                        <span className="text-xs text-blue-700 font-medium">xAI uses a unified realtime voice pipeline, so speech recognition, reasoning, and speech output all come from the same model.</span>
+                                    </div>
+                                )}
+                                {selectedTtsProvider === 'xai' && selectedTtsModel === 'grok-voice-fast-1.0' && (
+                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-50 border border-amber-200 rounded-lg">
+                                        <span className="w-2 h-2 bg-amber-500 rounded-full" />
+                                        <span className="text-xs text-amber-700 font-medium">`grok-voice-fast-1.0` is legacy. Prefer `grok-voice-think-fast-1.0` for the current xAI voice path.</span>
                                     </div>
                                 )}
                                 {selectedTtsProvider === 'elevenlabs' && compatibleElevenModels.length > 0 && compatibleElevenModels.length !== ttsModels.length && (
@@ -1043,6 +1131,12 @@ export default function AgentDetailPage() {
                                     <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg">
                                         <span className="w-2 h-2 bg-blue-500 rounded-full" />
                                         <span className="text-xs text-blue-700 font-medium">Multilingual mode keeps the agent on a multilingual ElevenLabs model and lets it follow the caller&apos;s language</span>
+                                    </div>
+                                )}
+                                {selectedTtsProvider === 'xai' && selectedLanguage === 'multi' && (
+                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-50 border border-blue-200 rounded-lg">
+                                        <span className="w-2 h-2 bg-blue-500 rounded-full" />
+                                        <span className="text-xs text-blue-700 font-medium">xAI voice can automatically detect and answer in the caller&apos;s language while staying on the unified realtime model.</span>
                                     </div>
                                 )}
 
@@ -1117,26 +1211,43 @@ export default function AgentDetailPage() {
                                         <div className="flex items-center justify-between mb-1">
                                             <label className="text-xs font-medium text-gray-700">Voice Runtime</label>
                                         </div>
-                                        <select
-                                            value={voiceRuntimeMode}
-                                            onChange={(e) => setVoiceRuntimeMode(e.target.value)}
-                                            className="w-full appearance-none px-3 py-2 pr-8 bg-white text-gray-700 rounded-lg text-sm font-medium border border-gray-200 hover:bg-gray-50 focus:outline-none cursor-pointer"
-                                        >
-                                            <option value="pipeline">Pipeline</option>
-                                            <option value="realtime_text_tts">Realtime text + TTS</option>
-                                        </select>
-                                        {voiceRuntimeMode === 'realtime_text_tts' && (
-                                            <input
-                                                type="text"
-                                                value={voiceRealtimeModel}
-                                                onChange={(e) => setVoiceRealtimeModel(e.target.value)}
-                                                placeholder="e.g. gpt-realtime"
-                                                className="mt-2 w-full px-3 py-2 bg-white text-gray-700 rounded-lg text-sm font-medium border border-gray-200 focus:outline-none focus:border-gray-400"
-                                            />
+                                        {selectedTtsProvider === 'xai' ? (
+                                            <>
+                                                <select
+                                                    value="realtime_unified"
+                                                    disabled
+                                                    className="w-full appearance-none px-3 py-2 pr-8 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium border border-gray-200 cursor-not-allowed"
+                                                >
+                                                    <option value="realtime_unified">Realtime unified (xAI)</option>
+                                                </select>
+                                                <p className="mt-1 text-[11px] text-gray-500">
+                                                    xAI always runs as a unified realtime voice model in this dashboard.
+                                                </p>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <select
+                                                    value={voiceRuntimeMode}
+                                                    onChange={(e) => setVoiceRuntimeMode(e.target.value)}
+                                                    className="w-full appearance-none px-3 py-2 pr-8 bg-white text-gray-700 rounded-lg text-sm font-medium border border-gray-200 hover:bg-gray-50 focus:outline-none cursor-pointer"
+                                                >
+                                                    <option value="pipeline">Pipeline</option>
+                                                    <option value="realtime_text_tts">Realtime text + TTS</option>
+                                                </select>
+                                                {voiceRuntimeMode === 'realtime_text_tts' && (
+                                                    <input
+                                                        type="text"
+                                                        value={voiceRealtimeModel}
+                                                        onChange={(e) => setVoiceRealtimeModel(e.target.value)}
+                                                        placeholder="e.g. gpt-realtime"
+                                                        className="mt-2 w-full px-3 py-2 bg-white text-gray-700 rounded-lg text-sm font-medium border border-gray-200 focus:outline-none focus:border-gray-400"
+                                                    />
+                                                )}
+                                                <p className="mt-1 text-[11px] text-gray-500">
+                                                    Realtime is used only when you explicitly save it here.
+                                                </p>
+                                            </>
                                         )}
-                                        <p className="mt-1 text-[11px] text-gray-500">
-                                            Realtime is used only when you explicitly save it here.
-                                        </p>
                                     </div>
                                 </div>
                             )}

@@ -296,9 +296,11 @@ VALID_LANGUAGES = [
     'en', 'en-US', 'en-GB', 'en-AU', 'en-IN', 'es', 'fr', 'de', 'it', 'hi', 'hi-IN', 'ml', 'ml-IN', 'multi'
 ]
 
-VALID_TTS_PROVIDERS = ["deepgram", "elevenlabs"]
+VALID_TTS_PROVIDERS = ["deepgram", "elevenlabs", "xai"]
 DEFAULT_TTS_PROVIDER = "deepgram"
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+DEFAULT_XAI_TTS_MODEL = "grok-voice-think-fast-1.0"
+XAI_VOICE_SESSION_RATE_PER_MINUTE = 0.05
 VALID_CALL_DIRECTIONS = {"inbound", "outbound"}
 DEFAULT_CALL_DIRECTION = "outbound"
 ACTIVE_CALL_STATUSES = ("pending", "in-progress", "initiating", "dialing")
@@ -338,10 +340,82 @@ DEEPGRAM_VOICE_ALIASES = {
 }
 
 ELEVENLABS_V3_REQUIRED_LANGUAGES = {"ml", "ml-IN", "multi"}
+XAI_VOICE_OPTIONS = [
+    {
+        "id": "ara",
+        "name": "Ara",
+        "label": "Ara",
+        "accent": "Warm, friendly",
+        "gender": "Female",
+        "provider": "xai",
+        "tone": "Warm, friendly",
+    },
+    {
+        "id": "eve",
+        "name": "Eve",
+        "label": "Eve",
+        "accent": "Energetic, upbeat",
+        "gender": "Female",
+        "provider": "xai",
+        "tone": "Energetic, upbeat",
+    },
+    {
+        "id": "leo",
+        "name": "Leo",
+        "label": "Leo",
+        "accent": "Authoritative, strong",
+        "gender": "Male",
+        "provider": "xai",
+        "tone": "Authoritative, strong",
+    },
+    {
+        "id": "rex",
+        "name": "Rex",
+        "label": "Rex",
+        "accent": "Confident, clear",
+        "gender": "Male",
+        "provider": "xai",
+        "tone": "Confident, clear",
+    },
+    {
+        "id": "sal",
+        "name": "Sal",
+        "label": "Sal",
+        "accent": "Smooth, balanced",
+        "gender": "Neutral",
+        "provider": "xai",
+        "tone": "Smooth, balanced",
+    },
+]
+XAI_VOICE_IDS = {voice["id"] for voice in XAI_VOICE_OPTIONS}
+XAI_MODEL_OPTIONS = [
+    {
+        "id": DEFAULT_XAI_TTS_MODEL,
+        "name": "Grok Voice Think Fast 1.0",
+        "description": "Flagship unified realtime voice model.",
+        "provider": "xai",
+        "runtime_mode": "realtime_unified",
+        "deprecated": False,
+        "supports_multilingual": True,
+    },
+    {
+        "id": "grok-voice-fast-1.0",
+        "name": "Grok Voice Fast 1.0",
+        "description": "Legacy unified realtime voice model. Kept only for backward compatibility.",
+        "provider": "xai",
+        "runtime_mode": "realtime_unified",
+        "deprecated": True,
+        "supports_multilingual": True,
+    },
+]
 
 
 def get_elevenlabs_api_key() -> Optional[str]:
     return os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
+
+
+def get_xai_api_key() -> Optional[str]:
+    return os.getenv("XAI_API_KEY")
 
 
 def normalize_agent_language(language: Optional[str], default: str = "en") -> str:
@@ -358,11 +432,24 @@ def normalize_tts_provider(provider: Optional[str], voice: Optional[str]) -> str
     candidate = (provider or "").strip().lower()
     if candidate in VALID_TTS_PROVIDERS:
         return candidate
+    if voice in XAI_VOICE_IDS:
+        return "xai"
     if voice and voice.startswith("eleven_"):
         return "elevenlabs"
     if voice and len(voice) >= 20 and voice.replace("_", "").replace("-", "").isalnum():
         return "elevenlabs"
     return DEFAULT_TTS_PROVIDER
+
+
+def normalize_voice_runtime_mode(mode: Optional[str], provider: Optional[str]) -> str:
+    normalized_provider = normalize_tts_provider(provider, None)
+    if normalized_provider == "xai":
+        return "realtime_unified"
+
+    candidate = str(mode or "").strip().lower()
+    if candidate in {"pipeline", "realtime_text_tts"}:
+        return candidate
+    return "pipeline"
 
 
 def ensure_custom_params(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1259,10 +1346,14 @@ async def create_agent(agent: AgentCreate, db: Session = Depends(get_database)):
         raise HTTPException(status_code=400, detail=f"Invalid llm_model. Must be one of: {', '.join(VALID_LLM_MODELS)}")
     if provider == "deepgram" and agent.voice not in VALID_VOICES:
         raise HTTPException(status_code=400, detail=f"Invalid voice. Must be one of: {', '.join(VALID_VOICES)}")
+    if provider == "xai" and agent.voice not in XAI_VOICE_IDS:
+        raise HTTPException(status_code=400, detail=f"Invalid xAI voice. Must be one of: {', '.join(sorted(XAI_VOICE_IDS))}")
     if provider not in VALID_TTS_PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Invalid tts_provider. Must be one of: {', '.join(VALID_TTS_PROVIDERS)}")
     if provider == "elevenlabs" and not agent.voice:
         raise HTTPException(status_code=400, detail="voice must be a valid ElevenLabs voice ID when tts_provider=elevenlabs")
+    if provider == "xai" and not agent.voice:
+        raise HTTPException(status_code=400, detail="voice must be a valid xAI voice ID when tts_provider=xai")
     if agent.language not in VALID_LANGUAGES:
         raise HTTPException(status_code=400, detail=f"Invalid language. Must be one of: {', '.join(VALID_LANGUAGES)}")
 
@@ -1270,15 +1361,41 @@ async def create_agent(agent: AgentCreate, db: Session = Depends(get_database)):
 
     custom_params = ensure_custom_params(agent.custom_params)
     custom_params["tts_provider"] = provider
+    custom_params["voice_runtime_mode"] = normalize_voice_runtime_mode(
+        custom_params.get("voice_runtime_mode"),
+        provider,
+    )
     if provider == "elevenlabs":
         resolved_tts_model = agent.tts_model or custom_params.get("tts_model")
         if not resolved_tts_model:
             raise HTTPException(status_code=400, detail="tts_model must be explicitly selected in the app when tts_provider=elevenlabs")
         custom_params["tts_model"] = resolved_tts_model
+    elif provider == "xai":
+        resolved_tts_model = (
+            str(
+                agent.tts_model
+                or custom_params.get("tts_model")
+                or custom_params.get("voice_realtime_model")
+                or DEFAULT_XAI_TTS_MODEL
+            ).strip()
+            or DEFAULT_XAI_TTS_MODEL
+        )
+        custom_params["tts_model"] = resolved_tts_model
+        custom_params["voice_runtime_mode"] = "realtime_unified"
+        custom_params["voice_realtime_model"] = resolved_tts_model
     elif agent.tts_model:
         custom_params["tts_model"] = agent.tts_model
     else:
         custom_params.pop("tts_model", None)
+    if provider != "xai":
+        if custom_params["voice_runtime_mode"] == "realtime_text_tts":
+            realtime_model = str(custom_params.get("voice_realtime_model") or "").strip()
+            if realtime_model:
+                custom_params["voice_realtime_model"] = realtime_model
+            else:
+                custom_params.pop("voice_realtime_model", None)
+        else:
+            custom_params.pop("voice_realtime_model", None)
     custom_params["llm_temperature"] = _coerce_agent_setting_float(
         agent.llm_temperature,
         default=DEFAULT_AGENT_LLM_TEMPERATURE,
@@ -1352,8 +1469,12 @@ async def update_agent(agent_id: int, agent_update: AgentUpdate, db: Session = D
         raise HTTPException(status_code=400, detail=f"Invalid tts_provider. Must be one of: {', '.join(VALID_TTS_PROVIDERS)}")
     if new_provider == "deepgram" and new_voice and new_voice not in VALID_VOICES:
         raise HTTPException(status_code=400, detail=f"Invalid voice. Must be one of: {', '.join(VALID_VOICES)}")
+    if new_provider == "xai" and new_voice and new_voice not in XAI_VOICE_IDS:
+        raise HTTPException(status_code=400, detail=f"Invalid xAI voice. Must be one of: {', '.join(sorted(XAI_VOICE_IDS))}")
     if new_provider == "elevenlabs" and not new_voice:
         raise HTTPException(status_code=400, detail="voice must be provided for ElevenLabs")
+    if new_provider == "xai" and not new_voice:
+        raise HTTPException(status_code=400, detail="voice must be provided for xAI")
 
     update_data = agent_update.dict(exclude_unset=True)
     update_data.pop("tts_provider", None)
@@ -1374,19 +1495,43 @@ async def update_agent(agent_id: int, agent_update: AgentUpdate, db: Session = D
     if agent_update.custom_params is not None:
         custom_params = ensure_custom_params(agent_update.custom_params)
     custom_params["tts_provider"] = new_provider
+    custom_params["voice_runtime_mode"] = normalize_voice_runtime_mode(
+        custom_params.get("voice_runtime_mode"),
+        new_provider,
+    )
 
     resolved_tts_model = agent_update.tts_model
     if resolved_tts_model is None and new_provider == "elevenlabs":
         resolved_tts_model = current_tts.get("tts_model") or custom_params.get("tts_model")
+    elif resolved_tts_model is None and new_provider == "xai":
+        resolved_tts_model = (
+            current_tts.get("tts_model")
+            or custom_params.get("tts_model")
+            or custom_params.get("voice_realtime_model")
+            or DEFAULT_XAI_TTS_MODEL
+        )
     if resolved_tts_model:
-        if new_provider == "elevenlabs":
+        if new_provider in {"elevenlabs", "xai"}:
             custom_params["tts_model"] = resolved_tts_model
         else:
             custom_params["tts_model"] = resolved_tts_model
     elif new_provider == "elevenlabs":
         raise HTTPException(status_code=400, detail="tts_model must be explicitly selected in the app when tts_provider=elevenlabs")
+    elif new_provider == "xai":
+        custom_params["tts_model"] = DEFAULT_XAI_TTS_MODEL
     elif new_provider == "deepgram":
         custom_params.pop("tts_model", None)
+    if new_provider == "xai":
+        custom_params["voice_runtime_mode"] = "realtime_unified"
+        custom_params["voice_realtime_model"] = str(custom_params.get("tts_model") or DEFAULT_XAI_TTS_MODEL).strip() or DEFAULT_XAI_TTS_MODEL
+    elif custom_params["voice_runtime_mode"] == "realtime_text_tts":
+        realtime_model = str(custom_params.get("voice_realtime_model") or "").strip()
+        if realtime_model:
+            custom_params["voice_realtime_model"] = realtime_model
+        else:
+            custom_params.pop("voice_realtime_model", None)
+    else:
+        custom_params.pop("voice_realtime_model", None)
 
     if agent_update.llm_temperature is not None:
         custom_params["llm_temperature"] = _coerce_agent_setting_float(
@@ -1549,6 +1694,7 @@ async def duplicate_agent(agent_id: int, request: AgentDuplicateRequest, db: Ses
 @app.get("/api/tts/providers")
 async def get_tts_providers():
     eleven_api_key = get_elevenlabs_api_key()
+    xai_api_key = get_xai_api_key()
     return {
         "providers": [
             {
@@ -1562,6 +1708,13 @@ async def get_tts_providers():
                 "available": bool(eleven_api_key),
                 "missing_env": [] if eleven_api_key else ["ELEVEN_API_KEY or ELEVENLABS_API_KEY"],
             },
+            {
+                "id": "xai",
+                "name": "xAI",
+                "available": bool(xai_api_key),
+                "missing_env": [] if xai_api_key else ["XAI_API_KEY"],
+                "runtime_mode": "realtime_unified",
+            },
         ]
     }
 
@@ -1574,6 +1727,15 @@ async def get_tts_models(provider: str = DEFAULT_TTS_PROVIDER):
             "provider": "deepgram",
             "default_model": None,
             "models": [],
+        }
+    if provider == "xai":
+        xai_api_key = get_xai_api_key()
+        return {
+            "provider": "xai",
+            "available": bool(xai_api_key),
+            "missing_env": [] if xai_api_key else ["XAI_API_KEY"],
+            "default_model": DEFAULT_XAI_TTS_MODEL,
+            "models": XAI_MODEL_OPTIONS,
         }
 
     eleven_api_key = get_elevenlabs_api_key()
@@ -1669,6 +1831,15 @@ async def get_tts_voices(provider: str = DEFAULT_TTS_PROVIDER, model: Optional[s
             )
 
         return {"provider": "deepgram", "voices": options}
+    if provider == "xai":
+        xai_api_key = get_xai_api_key()
+        return {
+            "provider": "xai",
+            "available": bool(xai_api_key),
+            "missing_env": [] if xai_api_key else ["XAI_API_KEY"],
+            "voices": XAI_VOICE_OPTIONS,
+            "model_filter": model or None,
+        }
 
     eleven_api_key = get_elevenlabs_api_key()
     if not eleven_api_key:
@@ -1750,12 +1921,22 @@ async def get_tts_voices(provider: str = DEFAULT_TTS_PROVIDER, model: Optional[s
 @app.get("/api/tts/voices/lookup")
 async def lookup_tts_voice(provider: str = DEFAULT_TTS_PROVIDER, voice_id: str = ""):
     provider = normalize_tts_provider(provider, None)
-    if provider != "elevenlabs":
-        raise HTTPException(status_code=400, detail="Voice lookup is currently supported only for elevenlabs")
-
     voice_id = (voice_id or "").strip()
     if not voice_id:
         raise HTTPException(status_code=400, detail="voice_id is required")
+    if provider == "xai":
+        voice = next((item for item in XAI_VOICE_OPTIONS if item["id"] == voice_id), None)
+        if not voice:
+            raise HTTPException(status_code=404, detail="Voice ID not found in xAI voice catalog")
+        xai_api_key = get_xai_api_key()
+        return {
+            "provider": "xai",
+            "available": bool(xai_api_key),
+            "missing_env": [] if xai_api_key else ["XAI_API_KEY"],
+            "voice": voice,
+        }
+    if provider != "elevenlabs":
+        raise HTTPException(status_code=400, detail="Voice lookup is currently supported only for elevenlabs and xai")
 
     eleven_api_key = get_elevenlabs_api_key()
     if not eleven_api_key:
@@ -4119,14 +4300,22 @@ def _backfill_usage_from_transcript_and_cost(call: CallModel, db: Session) -> bo
 
     call.llm_cost = _compute_llm_cost_usd(model, call.llm_tokens_in or 0, call.llm_tokens_out or 0)
 
+    metadata = ensure_custom_params(call.call_metadata)
+    tts_provider = normalize_tts_provider(metadata.get("tts_provider"), None)
+    if tts_provider == "xai":
+        voice_minutes = max((call.duration_seconds or 0) / 60.0, 0.0)
+        call.llm_cost = 0.0
+        call.stt_cost = 0.0
+        call.tts_cost = max(voice_minutes * XAI_VOICE_SESSION_RATE_PER_MINUTE, 0.001) if voice_minutes > 0 else 0.0
+        call.cost_usd = call.tts_cost or 0.0
+        return True
+
     stt_minutes = (call.stt_duration_ms or 0) / 60000.0
     if stt_minutes > 0:
         stt_model = ensure_custom_params(call.call_metadata).get("stt_model") or "nova-3"
         stt_rate = 0.006 if ("nova-3" in str(stt_model).lower() or "conversationalai" in str(stt_model).lower()) else 0.004
         call.stt_cost = max(stt_minutes * stt_rate, 0.001)
 
-    metadata = ensure_custom_params(call.call_metadata)
-    tts_provider = normalize_tts_provider(metadata.get("tts_provider"), None)
     tts_model_used = metadata.get("tts_model")
     tts_chars = call.tts_characters or 0
     if tts_chars > 0:
@@ -4313,6 +4502,18 @@ async def update_call_usage(call_id: str, usage: CallUsageUpdate, db: Session = 
     # Use actual duration from agent if provided, otherwise keep calculated duration
     if usage.actual_duration_seconds is not None:
         call.duration_seconds = usage.actual_duration_seconds
+
+    current_tts_provider = normalize_tts_provider(metadata.get("tts_provider"), None)
+    if current_tts_provider == "xai":
+        metadata.setdefault("tts_cost_source", "xai_voice_agent_session_minutes")
+        call.call_metadata = metadata
+        voice_minutes = max((call.duration_seconds or 0) / 60.0, 0.0)
+        call.llm_cost = 0.0
+        call.stt_cost = 0.0
+        call.tts_cost = max(voice_minutes * XAI_VOICE_SESSION_RATE_PER_MINUTE, 0.001) if voice_minutes > 0 else 0.0
+        call.cost_usd = call.tts_cost or 0.0
+        db.commit()
+        return {"message": "Usage updated", "total_cost": call.cost_usd}
     
     db.commit()
     return {"message": "Usage updated", "total_cost": call.cost_usd}

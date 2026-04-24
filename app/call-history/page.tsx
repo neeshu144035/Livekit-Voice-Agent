@@ -248,7 +248,8 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
     const ttsProvider = (usage.tts_provider || metadata?.tts_provider || 'deepgram').toLowerCase();
     const ttsModel = usage.tts_model || metadata?.tts_model || null;
     const ttsCostSource = usage.tts_cost_source || metadata?.tts_cost_source || null;
-    const ttsProviderLabel = ttsProvider === 'elevenlabs' ? 'ElevenLabs' : 'Deepgram';
+    const isXaiUnified = ttsProvider === 'xai';
+    const ttsProviderLabel = ttsProvider === 'xai' ? 'xAI' : ttsProvider === 'elevenlabs' ? 'ElevenLabs' : 'Deepgram';
 
     return (
         <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex justify-end" onClick={onClose}>
@@ -433,21 +434,21 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
                                     <div className="flex justify-between items-center">
                                         <span className="text-sm text-gray-600 flex items-center gap-2">
                                             <Cpu className="w-3.5 h-3.5 text-purple-500" />
-                                            LLM ({usage.llm_model || 'Unknown'})
+                                            {isXaiUnified ? `Unified Voice Model (${usage.llm_model || ttsModel || 'xAI'})` : `LLM (${usage.llm_model || 'Unknown'})`}
                                         </span>
                                         <span className="text-sm font-medium text-gray-900">{formatCost(costs.llm_cost)}</span>
                                     </div>
                                     <div className="flex justify-between items-center">
                                         <span className="text-sm text-gray-600 flex items-center gap-2">
                                             <Mic className="w-3.5 h-3.5 text-blue-500" />
-                                            Deepgram STT
+                                            {isXaiUnified ? 'Input Speech (included in xAI session)' : 'Deepgram STT'}
                                         </span>
                                         <span className="text-sm font-medium text-gray-900">{formatCost(costs.stt_cost)}</span>
                                     </div>
                                     <div className="flex justify-between items-center">
                                         <span className="text-sm text-gray-600 flex items-center gap-2">
                                             <Volume2 className="w-3.5 h-3.5 text-teal-500" />
-                                            {ttsProviderLabel} TTS{ttsModel ? ` (${ttsModel})` : ''}
+                                            {isXaiUnified ? `xAI Voice Session${ttsModel ? ` (${ttsModel})` : ''}` : `${ttsProviderLabel} TTS${ttsModel ? ` (${ttsModel})` : ''}`}
                                         </span>
                                         <span className="text-sm font-medium text-gray-900">{formatCost(costs.tts_cost)}</span>
                                     </div>
@@ -496,10 +497,10 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
                                     Average Latency
                                 </h4>
                                 <div className="space-y-3">
-                                    {[
-                                        { label: 'STT (Deepgram)', value: latency.stt_avg_ms, p95: latency.stt_p95_ms, color: 'blue', icon: Mic },
+                                    {[ 
+                                        { label: isXaiUnified ? 'Input Speech' : 'STT (Deepgram)', value: latency.stt_avg_ms, p95: latency.stt_p95_ms, color: 'blue', icon: Mic },
                                         { label: 'LLM', value: latency.llm_avg_ms, p95: latency.llm_p95_ms, color: 'purple', icon: Cpu },
-                                        { label: `TTS (${ttsProviderLabel})`, value: latency.tts_avg_ms, p95: null, color: 'teal', icon: Volume2 },
+                                        { label: isXaiUnified ? 'Voice Output (xAI)' : `TTS (${ttsProviderLabel})`, value: latency.tts_avg_ms, p95: null, color: 'teal', icon: Volume2 },
                                     ].map(item => (
                                         <div key={item.label} className="bg-white rounded-lg p-3 border border-gray-100">
                                             <div className="flex items-center justify-between mb-2">
@@ -774,7 +775,7 @@ export default function CallHistoryPage() {
                                                         {call.agent_name}
                                                     </span>
                                                     <p className="text-[10px] text-gray-400 mt-0.5">
-                                                        TTS: {call.tts_provider === 'elevenlabs' ? 'ElevenLabs' : 'Deepgram'}
+                                                        TTS: {call.tts_provider === 'xai' ? 'xAI' : call.tts_provider === 'elevenlabs' ? 'ElevenLabs' : 'Deepgram'}
                                                         {call.tts_model_used ? ` • ${call.tts_model_used}` : ''}
                                                         {call.tts_fallback_used ? <span className="text-amber-600 ml-1">(fallback)</span> : ''}
                                                     </p>
