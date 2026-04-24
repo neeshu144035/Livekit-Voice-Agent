@@ -116,9 +116,10 @@ export default function Dashboard() {
                 edited_by: 'team.oyik@gmail.com'
             }));
             setAgents(agentsWithMetadata);
-        } catch (err) {
+        } catch (err: any) {
             console.error('Error fetching agents:', err);
             showToast('Failed to load agents', 'error');
+            setAgents([]);
         } finally {
             setLoading(false);
             setRefreshing(false);
