@@ -7,10 +7,11 @@ env_path = Path(__file__).parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
-from backend.models import engine, SessionLocal, Base, get_database
+from backend.models import engine, SessionLocal, Base, get_database, CallModel
 from backend.constants import LIVEKIT_URL
 from backend.logging_config import get_logger, LogContext
 from backend.routers import (
@@ -54,6 +55,20 @@ app.include_router(router_transfer.router)
 app.include_router(router_versions.router)
 app.include_router(router_functions.router)
 app.include_router(router_token.router)
+
+@app.get("/api/call-history")
+async def call_history_alias(
+    page: int = 1,
+    limit: int = 30,
+    agent_id: int = None,
+    db: Session = Depends(get_database)
+):
+    query = db.query(CallModel)
+    if agent_id:
+        query = query.filter(CallModel.agent_id == agent_id)
+    total = query.count()
+    calls = query.order_by(CallModel.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
+    return calls
 
 @app.on_event("startup")
 async def startup_event():
