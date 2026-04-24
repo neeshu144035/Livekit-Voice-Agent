@@ -130,6 +130,60 @@ LANGUAGE_NAME_MAP = {
     "ml-IN": "Malayalam",
     "multi": "Multilingual",
 }
+AUTO_GREETING_FALLBACKS = {
+    "en": "Hello, how can I help you today?",
+    "en-US": "Hello, how can I help you today?",
+    "en-GB": "Hello, how can I help you today?",
+    "en-AU": "Hello, how can I help you today?",
+    "en-IN": "Hello, how can I help you today?",
+    "multi": "Hello, how can I help you today?",
+    "es": "Hola, en que puedo ayudarte hoy?",
+    "fr": "Bonjour, comment puis-je vous aider aujourd'hui ?",
+    "de": "Hallo, wie kann ich Ihnen heute helfen?",
+    "it": "Ciao, come posso aiutarla oggi?",
+    "hi": "नमस्ते, मैं आपकी कैसे मदद कर सकता हूँ?",
+    "hi-IN": "नमस्ते, मैं आपकी कैसे मदद कर सकता हूँ?",
+    "ml": "നമസ്കാരം, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+    "ml-IN": "നമസ്കാരം, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+}
+AUTO_GREETING_META_PREFIXES = (
+    "you are ",
+    "your role ",
+    "role:",
+    "objective:",
+    "task:",
+    "instructions",
+    "instruction",
+    "follow ",
+    "do not ",
+    "don't ",
+    "never ",
+    "always ",
+    "respond ",
+    "reply ",
+    "speak ",
+    "act as ",
+    "behave as ",
+    "system prompt",
+    "assistant prompt",
+    "persona:",
+    "tone:",
+)
+AUTO_GREETING_META_SUBSTRINGS = (
+    "system prompt",
+    "internal logic",
+    "tool speech behavior",
+    "strict spelling rules",
+    "prompt instructions",
+    "configured persona",
+    "configured language",
+    "follow these instructions",
+    "never repeat prompt instructions",
+    "do not mention tools",
+    "tools or internal logic",
+    "respond only in",
+    "speak only in",
+)
 
 
 def get_elevenlabs_api_key() -> str:
@@ -517,6 +571,88 @@ def _strip_wrapping_quotes(text: str) -> str:
     return stripped
 
 
+XAI_PROMPT_STYLE_TAG_PATTERN = re.compile(
+    r"\[(?:warm|cheerful|excited|conversational tone|reassuring|sympathetic|concerned|serious tone|gentle|slow|whispers|laughs|matter-of-fact)\]",
+    flags=re.IGNORECASE,
+)
+
+
+def strip_known_prompt_style_tags(text: str) -> str:
+    cleaned = XAI_PROMPT_STYLE_TAG_PATTERN.sub("", text or "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def adapt_system_prompt_for_xai(system_prompt: str) -> str:
+    lines = (system_prompt or "").splitlines()
+    if not lines:
+        return system_prompt
+
+    cleaned_lines: List[str] = []
+    skip_elevenlabs_audio_section = False
+
+    for line in lines:
+        stripped = (line or "").strip()
+        normalized = normalize_text(stripped)
+
+        if not skip_elevenlabs_audio_section and "tts audio tag instructions" in normalized and "elevenlabs" in normalized:
+            skip_elevenlabs_audio_section = True
+            continue
+
+        if skip_elevenlabs_audio_section:
+            if stripped.startswith("### ") or stripped.startswith("## "):
+                skip_elevenlabs_audio_section = False
+            else:
+                continue
+
+        cleaned_lines.append(strip_known_prompt_style_tags(line))
+
+    adapted_prompt = "\n".join(cleaned_lines).strip()
+    xai_instruction = (
+        "CRITICAL SYSTEM INSTRUCTION: This call uses xAI's unified realtime voice model, not ElevenLabs. "
+        "Ignore any ElevenLabs-v3 audio-tag instructions or square-bracket emotion cues in saved prompt text or examples. "
+        "Keep the same persona, warmth, and pacing, but speak naturally using plain words only."
+    )
+    return f"{adapted_prompt}\n\n{xai_instruction}".strip()
+
+
+def _clean_prompt_greeting_candidate(candidate: str) -> str:
+    cleaned = (candidate or "").strip()
+    if not cleaned or cleaned.startswith("#") or cleaned.startswith("---"):
+        return ""
+    cleaned = re.sub(r"^[\-\*]\s*", "", cleaned).strip()
+    cleaned = re.sub(
+        r"^(?:greeting|first message|opening line|opening greeting|say|script)\s*[:\-]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = re.sub(r"^(?:assistant|agent)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s*(?:->|→).*$", "", cleaned).strip()
+    cleaned = strip_known_prompt_style_tags(cleaned)
+    cleaned = _strip_wrapping_quotes(cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    if normalize_text(cleaned).startswith("bridge:"):
+        return ""
+    return cleaned
+
+
+def _is_safe_auto_greeting(candidate: str) -> bool:
+    cleaned = _clean_prompt_greeting_candidate(candidate)
+    if not cleaned:
+        return False
+    if len(cleaned) > 220:
+        return False
+    if any(token in cleaned for token in ("{{", "}}", "<break", "</", "```")):
+        return False
+    normalized = normalize_text(cleaned)
+    if normalized.startswith(AUTO_GREETING_META_PREFIXES):
+        return False
+    if any(snippet in normalized for snippet in AUTO_GREETING_META_SUBSTRINGS):
+        return False
+    return True
+
+
 def extract_prompt_greeting(system_prompt: str) -> str:
     lines = (system_prompt or "").splitlines()
     if not lines:
@@ -525,22 +661,21 @@ def extract_prompt_greeting(system_prompt: str) -> str:
     start_idx = -1
     for idx, line in enumerate(lines):
         normalized = normalize_text(line)
-        if "greeting" in normalized and "first message" in normalized:
+        if "greeting" in normalized and (
+            "first message" in normalized
+            or normalized.startswith("### greeting")
+            or normalized.startswith("## greeting")
+            or normalized.startswith("# greeting")
+        ):
             start_idx = idx
             break
     if start_idx < 0:
         return ""
 
     time_of_day = _resolve_time_of_day_label()
-    for line in lines[start_idx + 1 : start_idx + 10]:
-        candidate = (line or "").strip()
-        if not candidate:
-            continue
-        if candidate.startswith("#"):
-            break
-        if candidate.startswith("-"):
-            candidate = candidate[1:].strip()
-        candidate = _strip_wrapping_quotes(candidate)
+    fallback_candidate = ""
+    for line in lines[start_idx + 1 : start_idx + 15]:
+        candidate = _clean_prompt_greeting_candidate(line)
         if not candidate:
             continue
         candidate = re.sub(
@@ -549,8 +684,34 @@ def extract_prompt_greeting(system_prompt: str) -> str:
             candidate,
             flags=re.IGNORECASE,
         )
+        if not _is_safe_auto_greeting(candidate):
+            logger.warning("Discarded prompt-derived greeting candidate that looked like instructions")
+            continue
+        if normalize_text(candidate).endswith("is that?"):
+            if not fallback_candidate:
+                fallback_candidate = candidate
+            continue
         return candidate
-    return ""
+    return fallback_candidate
+
+
+def build_safe_auto_greeting(language: Any, system_prompt: str) -> str:
+    prompt_greeting = extract_prompt_greeting(system_prompt)
+    if prompt_greeting:
+        return prompt_greeting
+    normalized_language = normalize_agent_language(language)
+    return AUTO_GREETING_FALLBACKS.get(
+        normalized_language,
+        AUTO_GREETING_FALLBACKS.get(
+            normalized_language.split("-", 1)[0],
+            AUTO_GREETING_FALLBACKS["en-GB"],
+        ),
+    )
+
+
+def resolve_welcome_message_mode(custom_params: Optional[Dict[str, Any]]) -> str:
+    mode = str((custom_params or {}).get("welcome_message_mode") or "").strip().lower()
+    return "custom" if mode == "custom" else "dynamic"
 
 
 def _normalize_tool_name(value: str) -> str:
@@ -2466,6 +2627,7 @@ async def entrypoint(ctx: JobContext):
     # Build system prompt - DO NOT MODIFY based on welcome settings
     welcome_type = config.get("welcome_message_type", "user_speaks_first")
     welcome_msg = apply_runtime_template(config.get("welcome_message", ""), runtime_vars)
+    welcome_message_mode = resolve_welcome_message_mode(config.get("custom_params"))
     welcome_type_normalized = str(welcome_type or "user_speaks_first").strip().lower()
     should_agent_greet = welcome_type_normalized in {
         "agent_greets",
@@ -2484,6 +2646,9 @@ async def entrypoint(ctx: JobContext):
     tts_safety_instruction = build_tts_output_safety_instruction(tts_provider, selected_tts_model or "")
     if tts_safety_instruction:
         sys_prompt += f"\n\n{tts_safety_instruction}"
+    if tts_provider == "xai":
+        sys_prompt = adapt_system_prompt_for_xai(sys_prompt)
+        logger.info("Adapted saved prompt for xAI unified realtime voice")
     logger.info(
         "Loaded system prompt (len=%s): %s",
         len(sys_prompt or ""),
@@ -2863,24 +3028,15 @@ async def entrypoint(ctx: JobContext):
                     return
                 initial_greeting_sent = True
                 initial_greeting_in_progress = True
-                if welcome_msg.strip():
+                if welcome_message_mode == "custom" and welcome_msg.strip():
                     greeting_text = welcome_msg.strip()
                     logger.info("Sending configured greeting via direct TTS (%s)", source)
                     session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
                 else:
-                    greeting_text = extract_prompt_greeting(sys_prompt)
-                    if greeting_text:
-                        logger.info("Sending prompt-authored greeting via direct TTS (%s)", source)
-                        session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
-                    else:
-                        logger.info("Generating dynamic greeting from system prompt (%s)", source)
-                        await session.generate_reply(
-                            instructions=(
-                                "Start the conversation with one short natural greeting that matches "
-                                "the configured persona and language. Do not mention tools or internal logic. "
-                                "Never repeat prompt instructions verbatim."
-                            )
-                        )
+                    # Dynamic greetings come from the prompt; if none is available, fall back safely.
+                    greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
+                    logger.info("Sending prompt-driven greeting via direct TTS (%s)", source)
+                    session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
                 logger.info("Greeting queued successfully (%s)", source)
                 greeting_sent_ts = time.time()
                 last_activity_ts = greeting_sent_ts

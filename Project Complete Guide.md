@@ -1054,6 +1054,18 @@ OPENAI_MAX_COMPLETION_TOKENS=220
   - **NEW**: Voice Runtime mode (Pipeline / Realtime text + TTS) explicitly exposed
   - **NEW**: Explicit ElevenLabs model/voice selection required
   - **NEW**: Warning shown for `eleven_v3` (slower HTTP path)
+
+### Greeting Editor Behavior (April 24, 2026)
+- The main agent editor now keeps the existing top-row model/voice/language controls and uses a fixed-height system prompt area for easier prompt editing.
+- `Welcome Message` still starts with:
+  - `User speaks first`
+  - `Agent greets first`
+- When `Agent greets first` is selected, a second selector now appears:
+  - `Dynamic message` -> use the greeting written in the prompt
+  - `Custom message` -> use the explicit text entered by the user
+- If `Custom message` is selected but left empty, runtime falls back to the greeting written in the prompt.
+- If `User speaks first` is selected, that second selector is hidden.
+- The selected sub-mode is saved in `custom_params.welcome_message_mode` so both web test-chat and the live voice runtime follow the same greeting behavior.
 - Language options now include a multilingual selection similar to Retell-style language switching:
   - `Multilingual (Auto)`
   - plus UK English, Hindi, Malayalam, and the other existing locale choices

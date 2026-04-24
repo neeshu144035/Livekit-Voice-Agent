@@ -248,6 +248,10 @@ const WELCOME_OPTIONS = [
     { value: 'user_speaks_first', label: 'User speaks first' },
     { value: 'agent_greets', label: 'Agent greets first' },
 ];
+const WELCOME_MESSAGE_MODE_OPTIONS = [
+    { value: 'dynamic', label: 'Dynamic message' },
+    { value: 'custom', label: 'Custom message' },
+];
 
 const DEFAULT_VOICE_SPEED = 1.0;
 const MIN_VOICE_SPEED = 0.8;
@@ -298,6 +302,7 @@ export default function AgentDetailPage() {
     const [ttsModels, setTtsModels] = useState<TTSModelOption[]>([]);
     const [ttsLoading, setTtsLoading] = useState(false);
     const [welcomeOption, setWelcomeOption] = useState('user_speaks_first');
+    const [welcomeMessageMode, setWelcomeMessageMode] = useState('dynamic');
     const [welcomeMessage, setWelcomeMessage] = useState('');
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
@@ -553,8 +558,9 @@ export default function AgentDetailPage() {
             setSelectedVoice(data.voice || (provider === 'xai' ? 'eve' : 'jessica'));
             setSelectedLanguage(data.language || 'en-GB');
             setWelcomeOption(data.welcome_message_type || 'user_speaks_first');
-            setWelcomeMessage(data.welcome_message || '');
             const customParams = data.custom_params || {};
+            setWelcomeMessageMode(customParams.welcome_message_mode === 'custom' ? 'custom' : 'dynamic');
+            setWelcomeMessage(data.welcome_message || '');
             setAgentCustomParams(customParams);
             const overrideEnabled = customParams.force_phone_llm_model_override;
             setPhoneLlmOverrideEnabled(overrideEnabled === undefined ? false : Boolean(overrideEnabled));
@@ -720,6 +726,11 @@ export default function AgentDetailPage() {
                 ...(agentCustomParams || {}),
                 voice_speed: voiceSpeed,
             };
+            if (welcomeOption === 'agent_greets') {
+                nextCustomParams.welcome_message_mode = welcomeMessageMode === 'custom' ? 'custom' : 'dynamic';
+            } else {
+                delete nextCustomParams.welcome_message_mode;
+            }
             nextCustomParams.force_phone_llm_model_override = phoneLlmOverrideEnabled;
             if (phoneLlmOverrideEnabled) {
                 nextCustomParams.phone_llm_model = phoneLlmModel;
@@ -763,11 +774,12 @@ export default function AgentDetailPage() {
             setSelectedVoice(persisted.voice || selectedVoice);
             setSelectedLanguage(persisted.language || selectedLanguage);
             setWelcomeOption(persisted.welcome_message_type || welcomeOption);
-            setWelcomeMessage(persisted.welcome_message || '');
             const persistedProvider = inferProviderFromVoice(persisted.voice || selectedVoice, persisted.tts_provider || selectedTtsProvider);
             setSelectedTtsProvider(persistedProvider);
             setSelectedTtsModel(persisted.tts_model || (persistedProvider === 'xai' ? XAI_DEFAULT_MODEL : ''));
             const persistedCustomParams = persisted.custom_params || {};
+            setWelcomeMessageMode(persistedCustomParams.welcome_message_mode === 'custom' ? 'custom' : 'dynamic');
+            setWelcomeMessage(persisted.welcome_message || '');
             setAgentCustomParams(persistedCustomParams);
             const persistedOverride = persistedCustomParams.force_phone_llm_model_override;
             setPhoneLlmOverrideEnabled(persistedOverride === undefined ? false : Boolean(persistedOverride));
@@ -1296,12 +1308,12 @@ export default function AgentDetailPage() {
                         </div>
 
                         {/* Prompt Text Area */}
-                        <div className="flex-1 p-6">
+                        <div className="flex-1 p-6 pt-4">
                             <textarea
                                 value={systemPrompt}
                                 onChange={(e) => setSystemPrompt(e.target.value)}
                                 placeholder="Enter your system prompt here..."
-                                className="w-full h-full px-4 py-0 text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none resize-none leading-relaxed"
+                                className="h-[620px] max-h-[620px] min-h-[620px] w-full resize-none overflow-y-auto rounded-2xl border border-gray-200 bg-white px-4 py-4 text-sm leading-relaxed text-gray-900 placeholder:text-gray-400 focus:outline-none focus:border-gray-400"
                             />
                         </div>
 
@@ -1320,13 +1332,34 @@ export default function AgentDetailPage() {
 
                             {welcomeOption === 'agent_greets' && (
                                 <div className="mt-4">
-                                    <label className="block text-sm font-medium text-gray-700 mb-2">Message to Speak</label>
-                                    <textarea
-                                        value={welcomeMessage}
-                                        onChange={(e) => setWelcomeMessage(e.target.value)}
-                                        placeholder="Leave empty to auto-generate first greeting from system prompt"
-                                        className="w-full h-24 p-3 text-sm text-gray-900 border border-gray-300 rounded-lg placeholder:text-gray-400 focus:outline-none focus:border-blue-500 resize-none leading-relaxed"
-                                    />
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">Message Type</label>
+                                    <select
+                                        value={welcomeMessageMode}
+                                        onChange={(e) => setWelcomeMessageMode(e.target.value)}
+                                        className="w-full px-3 py-2 bg-white border border-gray-300 rounded-lg text-sm text-gray-700 focus:outline-none focus:border-gray-400"
+                                    >
+                                        {WELCOME_MESSAGE_MODE_OPTIONS.map(option => (
+                                            <option key={option.value} value={option.value}>{option.label}</option>
+                                        ))}
+                                    </select>
+                                    {welcomeMessageMode === 'dynamic' ? (
+                                        <p className="mt-2 text-xs text-gray-500">
+                                            Dynamic message uses the greeting written in your prompt.
+                                        </p>
+                                    ) : (
+                                        <>
+                                            <label className="mt-4 block text-sm font-medium text-gray-700 mb-2">Custom Message</label>
+                                            <textarea
+                                                value={welcomeMessage}
+                                                onChange={(e) => setWelcomeMessage(e.target.value)}
+                                                placeholder="Write the exact first sentence to speak"
+                                                className="w-full h-24 p-3 text-sm text-gray-900 border border-gray-300 rounded-lg placeholder:text-gray-400 focus:outline-none focus:border-blue-500 resize-none leading-relaxed"
+                                            />
+                                            <p className="mt-2 text-xs text-gray-500">
+                                                If this is left empty, the runtime will use the greeting written in your prompt.
+                                            </p>
+                                        </>
+                                    )}
                                 </div>
                             )}
                         </div>

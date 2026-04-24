@@ -614,6 +614,96 @@ def normalize_call_direction_for_row(call: "CallModel") -> str:
     return DEFAULT_CALL_DIRECTION
 
 
+def _safe_avg_ms(values: List[Optional[int]]) -> Optional[int]:
+    cleaned = [int(v) for v in values if isinstance(v, (int, float)) and v > 0]
+    if not cleaned:
+        return None
+    return round(sum(cleaned) / len(cleaned))
+
+
+def _safe_p95_ms(values: List[Optional[int]]) -> Optional[int]:
+    cleaned = sorted(int(v) for v in values if isinstance(v, (int, float)) and v > 0)
+    if not cleaned:
+        return None
+    index = min(int(len(cleaned) * 0.95), len(cleaned) - 1)
+    return cleaned[index]
+
+
+def _compute_transcript_reply_gap_latencies_ms(transcripts: List["TranscriptModel"]) -> List[int]:
+    ordered = sorted(
+        [t for t in transcripts if t and t.timestamp],
+        key=lambda item: item.timestamp,
+    )
+    reply_gaps: List[int] = []
+
+    for idx, transcript in enumerate(ordered):
+        role = str(getattr(transcript, "role", "") or "").strip().lower()
+        if role != "user" or not transcript.timestamp:
+            continue
+
+        next_agent = next(
+            (
+                candidate
+                for candidate in ordered[idx + 1 :]
+                if str(getattr(candidate, "role", "") or "").strip().lower() == "agent" and candidate.timestamp
+            ),
+            None,
+        )
+        if not next_agent or not next_agent.timestamp:
+            continue
+
+        gap_ms = int((next_agent.timestamp - transcript.timestamp).total_seconds() * 1000)
+        if 0 < gap_ms <= 30000:
+            reply_gaps.append(gap_ms)
+
+    return reply_gaps
+
+
+def _summarize_call_latency(transcripts: List["TranscriptModel"]) -> Dict[str, Optional[int] | Optional[str]]:
+    stt_latencies = [t.stt_latency_ms for t in transcripts if t.stt_latency_ms]
+    llm_latencies = [t.llm_latency_ms for t in transcripts if t.llm_latency_ms]
+    tts_latencies = [t.tts_latency_ms for t in transcripts if t.tts_latency_ms]
+    reply_gap_latencies = _compute_transcript_reply_gap_latencies_ms(transcripts)
+
+    stt_avg_ms = _safe_avg_ms(stt_latencies)
+    llm_avg_ms = _safe_avg_ms(llm_latencies)
+    tts_avg_ms = _safe_avg_ms(tts_latencies)
+    stt_p95_ms = _safe_p95_ms(stt_latencies)
+    llm_p95_ms = _safe_p95_ms(llm_latencies)
+    tts_p95_ms = _safe_p95_ms(tts_latencies)
+    reply_avg_ms = _safe_avg_ms(reply_gap_latencies)
+    reply_p95_ms = _safe_p95_ms(reply_gap_latencies)
+
+    total_avg_ms = None
+    total_p95_ms = None
+    source = None
+
+    component_avgs = [value for value in (stt_avg_ms, llm_avg_ms, tts_avg_ms) if value]
+    component_p95s = [value for value in (stt_p95_ms, llm_p95_ms, tts_p95_ms) if value]
+    if component_avgs:
+        total_avg_ms = sum(component_avgs)
+        total_p95_ms = sum(component_p95s) if component_p95s else None
+        source = "measured_components"
+    elif reply_avg_ms:
+        total_avg_ms = reply_avg_ms
+        total_p95_ms = reply_p95_ms
+        source = "transcript_reply_gap"
+
+    return {
+        "stt_avg_ms": stt_avg_ms,
+        "llm_avg_ms": llm_avg_ms,
+        "tts_avg_ms": tts_avg_ms,
+        "stt_p95_ms": stt_p95_ms,
+        "llm_p95_ms": llm_p95_ms,
+        "tts_p95_ms": tts_p95_ms,
+        "reply_avg_ms": reply_avg_ms,
+        "reply_p95_ms": reply_p95_ms,
+        "total_avg_ms": total_avg_ms,
+        "total_p95_ms": total_p95_ms,
+        "source": source,
+    }
+
+
 def _is_stale_active_call(call: Optional["CallModel"]) -> bool:
     if not call:
         return False
@@ -801,6 +891,174 @@ def _build_tool_speech_guidance_block(runtime_functions: List[Dict[str, Any]]) -
         "Tool speech behavior (must follow per tool):\n"
         + "\n".join(lines)
     )
+
+
+def _normalize_prompt_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    stripped = (text or "").strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+        return stripped[1:-1].strip()
+    return stripped
+
+
+_PROMPT_STYLE_TAG_PATTERN = re.compile(
+    r"\[(?:warm|cheerful|excited|conversational tone|reassuring|sympathetic|concerned|serious tone|gentle|slow|whispers|laughs|matter-of-fact)\]",
+    flags=re.IGNORECASE,
+)
+_AUTO_GREETING_FALLBACKS = {
+    "en": "Hello, how can I help you today?",
+    "en-US": "Hello, how can I help you today?",
+    "en-GB": "Hello, how can I help you today?",
+    "en-AU": "Hello, how can I help you today?",
+    "en-IN": "Hello, how can I help you today?",
+    "multi": "Hello, how can I help you today?",
+    "es": "Hola, en que puedo ayudarte hoy?",
+    "fr": "Bonjour, comment puis-je vous aider aujourd'hui ?",
+    "de": "Hallo, wie kann ich Ihnen heute helfen?",
+    "it": "Ciao, come posso aiutarla oggi?",
+    "hi": "नमस्ते, मैं आपकी कैसे मदद कर सकता हूँ?",
+    "hi-IN": "नमस्ते, मैं आपकी कैसे मदद कर सकता हूँ?",
+    "ml": "നമസ്കാരം, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+    "ml-IN": "നമസ്കാരം, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+}
+_AUTO_GREETING_META_PREFIXES = (
+    "you are ",
+    "your role ",
+    "role:",
+    "objective:",
+    "task:",
+    "instructions",
+    "instruction",
+    "follow ",
+    "do not ",
+    "don't ",
+    "never ",
+    "always ",
+    "respond ",
+    "reply ",
+    "speak ",
+    "act as ",
+    "behave as ",
+    "system prompt",
+    "assistant prompt",
+    "persona:",
+    "tone:",
+)
+_AUTO_GREETING_META_SUBSTRINGS = (
+    "system prompt",
+    "internal logic",
+    "tool speech behavior",
+    "strict spelling rules",
+    "prompt instructions",
+    "configured persona",
+    "configured language",
+    "follow these instructions",
+    "never repeat prompt instructions",
+    "do not mention tools",
+    "tools or internal logic",
+    "respond only in",
+    "speak only in",
+)
+
+
+def _strip_known_prompt_style_tags(text: str) -> str:
+    cleaned = _PROMPT_STYLE_TAG_PATTERN.sub("", text or "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def _clean_prompt_greeting_candidate(candidate: str) -> str:
+    cleaned = (candidate or "").strip()
+    if not cleaned or cleaned.startswith("#") or cleaned.startswith("---"):
+        return ""
+    cleaned = re.sub(r"^[\-\*]\s*", "", cleaned).strip()
+    cleaned = re.sub(
+        r"^(?:greeting|first message|opening line|opening greeting|say|script)\s*[:\-]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    cleaned = re.sub(r"^(?:assistant|agent)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s*(?:->|â†’).*$", "", cleaned).strip()
+    cleaned = _strip_known_prompt_style_tags(cleaned)
+    cleaned = _strip_wrapping_quotes(cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    if _normalize_prompt_text(cleaned).startswith("bridge:"):
+        return ""
+    return cleaned
+
+
+def _is_safe_auto_greeting(candidate: str) -> bool:
+    cleaned = _clean_prompt_greeting_candidate(candidate)
+    if not cleaned:
+        return False
+    if len(cleaned) > 220:
+        return False
+    if any(token in cleaned for token in ("{{", "}}", "<break", "</", "```")):
+        return False
+    normalized = _normalize_prompt_text(cleaned)
+    if normalized.startswith(_AUTO_GREETING_META_PREFIXES):
+        return False
+    if any(snippet in normalized for snippet in _AUTO_GREETING_META_SUBSTRINGS):
+        return False
+    return True
+
+
+def extract_prompt_greeting(system_prompt: str) -> str:
+    lines = (system_prompt or "").splitlines()
+    if not lines:
+        return ""
+
+    start_idx = -1
+    for idx, line in enumerate(lines):
+        normalized = _normalize_prompt_text(line)
+        if "greeting" in normalized and (
+            "first message" in normalized
+            or normalized.startswith("### greeting")
+            or normalized.startswith("## greeting")
+            or normalized.startswith("# greeting")
+        ):
+            start_idx = idx
+            break
+    if start_idx < 0:
+        return ""
+
+    fallback_candidate = ""
+    for line in lines[start_idx + 1 : start_idx + 15]:
+        candidate = _clean_prompt_greeting_candidate(line)
+        if not candidate:
+            continue
+        if not _is_safe_auto_greeting(candidate):
+            logger.warning("Discarded prompt-derived test-chat greeting candidate that looked like instructions")
+            continue
+        if _normalize_prompt_text(candidate).endswith("is that?"):
+            if not fallback_candidate:
+                fallback_candidate = candidate
+            continue
+        return candidate
+    return fallback_candidate
+
+
+def build_safe_auto_greeting(language: Optional[str], system_prompt: str) -> str:
+    prompt_greeting = extract_prompt_greeting(system_prompt)
+    if prompt_greeting:
+        return prompt_greeting
+    normalized_language = normalize_agent_language(language)
+    return _AUTO_GREETING_FALLBACKS.get(
+        normalized_language,
+        _AUTO_GREETING_FALLBACKS.get(
+            normalized_language.split("-", 1)[0],
+            _AUTO_GREETING_FALLBACKS["en"],
+        ),
+    )
+
+
+def resolve_welcome_message_mode(custom_params: Optional[Dict[str, Any]]) -> str:
+    mode = str(ensure_custom_params(custom_params).get("welcome_message_mode") or "").strip().lower()
+    return "custom" if mode == "custom" else "dynamic"
 
 
 def _build_effective_system_prompt(base_prompt: str, runtime_functions: List[Dict[str, Any]]) -> str:
@@ -2433,30 +2691,7 @@ async def _execute_agent_runtime_tool(func_cfg: Dict[str, Any], args: Dict[str, 
 
 
 async def _generate_dynamic_welcome_text(agent: AgentModel, system_prompt: str) -> str:
-    try:
-        client = _resolve_openai_client_for_agent_model(agent.llm_model or "moonshot-v1-8k")
-        response = _safe_chat_completion_create(
-            client,
-            model=agent.llm_model or "moonshot-v1-8k",
-            messages=[
-                {"role": "system", "content": (system_prompt or "").strip()},
-                {
-                    "role": "user",
-                    "content": (
-                        "Start of conversation. Generate one short natural first greeting "
-                        "that follows your role and tone. Do not mention tools or internal logic."
-                    ),
-                },
-            ],
-            temperature=resolve_agent_llm_temperature(agent),
-            max_tokens=80,
-        )
-        text = (response.choices[0].message.content or "").strip()
-        if text:
-            return text
-    except Exception as e:
-        logger.error(f"Failed to generate dynamic welcome text: {e}")
-    return "Hello."
+    return build_safe_auto_greeting(agent.language, system_prompt)
 
 
 @app.post("/api/chat-agents/", response_model=ChatAgentResponse, status_code=201)
@@ -2576,9 +2811,11 @@ async def test_chat_with_voice_agent(agent_id: int, payload: AgentTestChatReques
     history = payload.history or []
     welcome_type = (agent.welcome_message_type or "user_speaks_first").strip().lower()
     welcome_text = (agent.welcome_message or "").strip()
+    welcome_message_mode = resolve_welcome_message_mode(agent.custom_params)
 
     if payload.start and welcome_type == "agent_greets":
-        first_reply = welcome_text or await _generate_dynamic_welcome_text(agent, effective_system_prompt)
+        use_custom_welcome = welcome_message_mode == "custom" and bool(welcome_text)
+        first_reply = welcome_text if use_custom_welcome else await _generate_dynamic_welcome_text(agent, effective_system_prompt)
         new_history = history + [{"role": "assistant", "content": first_reply}]
         return {"reply": first_reply, "events": [], "history": new_history}
 
@@ -4722,17 +4959,16 @@ async def get_call_history(
     result = []
     for call in calls:
         agent = db.query(AgentModel).filter(AgentModel.id == call.agent_id).first()
+        transcripts = db.query(TranscriptModel).filter(
+            TranscriptModel.call_id == call.call_id
+        ).order_by(TranscriptModel.timestamp).all()
+        latency_summary = _summarize_call_latency(transcripts)
         
         # Calculate duration from timestamps if null
         duration = call.duration_seconds
         if not duration and call.ended_at and call.created_at:
             delta = call.ended_at - call.created_at
             duration = int(delta.total_seconds())
-        
-        # Count transcript entries
-        transcript_count = db.query(TranscriptModel).filter(
-            TranscriptModel.call_id == call.call_id
-        ).count()
         
         result.append({
             "id": call.id,
@@ -4759,9 +4995,11 @@ async def get_call_history(
             "tts_characters": call.tts_characters or 0,
             "tts_provider": ensure_custom_params(call.call_metadata).get("tts_provider", DEFAULT_TTS_PROVIDER),
             "tts_model_used": ensure_custom_params(call.call_metadata).get("tts_model"),
-            "transcript_count": transcript_count,
+            "transcript_count": len(transcripts),
             "transcript_summary": call.transcript_summary,
             "error_message": call.error_message,
+            "latency_ms": latency_summary["total_avg_ms"],
+            "latency_source": latency_summary["source"],
             "created_at": call.created_at.isoformat() if call.created_at else None,
         })
     
@@ -4793,11 +5031,7 @@ async def get_call_details(call_id: str, db: Session = Depends(get_database)):
     transcripts = db.query(TranscriptModel).filter(
         TranscriptModel.call_id == call_id
     ).order_by(TranscriptModel.timestamp).all()
-    
-    # Calculate latency stats
-    stt_latencies = [t.stt_latency_ms for t in transcripts if t.stt_latency_ms]
-    llm_latencies = [t.llm_latency_ms for t in transcripts if t.llm_latency_ms]
-    tts_latencies = [t.tts_latency_ms for t in transcripts if t.tts_latency_ms]
+    latency_summary = _summarize_call_latency(transcripts)
     
     return {
         "call": {
@@ -4834,11 +5068,17 @@ async def get_call_details(call_id: str, db: Session = Depends(get_database)):
             "tts_cost_source": ensure_custom_params(call.call_metadata).get("tts_cost_source"),
         },
         "latency": {
-            "stt_avg_ms": round(sum(stt_latencies) / len(stt_latencies)) if stt_latencies else None,
-            "llm_avg_ms": round(sum(llm_latencies) / len(llm_latencies)) if llm_latencies else None,
-            "tts_avg_ms": round(sum(tts_latencies) / len(tts_latencies)) if tts_latencies else None,
-            "stt_p95_ms": sorted(stt_latencies)[int(len(stt_latencies)*0.95)] if len(stt_latencies) > 1 else (stt_latencies[0] if stt_latencies else None),
-            "llm_p95_ms": sorted(llm_latencies)[int(len(llm_latencies)*0.95)] if len(llm_latencies) > 1 else (llm_latencies[0] if llm_latencies else None),
+            "stt_avg_ms": latency_summary["stt_avg_ms"],
+            "llm_avg_ms": latency_summary["llm_avg_ms"],
+            "tts_avg_ms": latency_summary["tts_avg_ms"],
+            "stt_p95_ms": latency_summary["stt_p95_ms"],
+            "llm_p95_ms": latency_summary["llm_p95_ms"],
+            "tts_p95_ms": latency_summary["tts_p95_ms"],
+            "reply_avg_ms": latency_summary["reply_avg_ms"],
+            "reply_p95_ms": latency_summary["reply_p95_ms"],
+            "total_avg_ms": latency_summary["total_avg_ms"],
+            "total_p95_ms": latency_summary["total_p95_ms"],
+            "source": latency_summary["source"],
         },
         "transcript": [
             {
