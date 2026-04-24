@@ -74,7 +74,7 @@ def serialize_agent(agent: AgentModel) -> Dict[str, Any]:
     return {
         "id": agent.id,
         "name": agent.name,
-        "display_name": agent.display_name or agent.name,
+        "display_name": getattr(agent, "display_name", None) or agent.name,
         "agent_name": agent.agent_name,
         "system_prompt": agent.system_prompt,
         "llm_model": agent.llm_model,

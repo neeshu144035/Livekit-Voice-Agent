@@ -55,21 +55,23 @@ async def list_versions(agent_id: int, db: Session = Depends(get_database)):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     
-    versions = db.query(AgentModel).filter(
-        AgentModel.custom_params.cast('text').like(f'%\"agent_id\": {agent_id}%')
-    ).order_by(AgentModel.created_at.desc()).limit(10).all()
-    
+    current_snapshot = {
+        "name": agent.name,
+        "agent_name": agent.agent_name,
+        "system_prompt": agent.system_prompt,
+        "llm_model": agent.llm_model,
+        "voice": agent.voice,
+        "language": agent.language,
+        "custom_params": agent.custom_params,
+        "created_at": agent.created_at.isoformat() if agent.created_at else None,
+        "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
+    }
+
     return {
         "agent_id": agent_id,
-        "versions": [
-            {
-                "id": v.id,
-                "name": v.name,
-                "created_at": v.created_at.isoformat() if v.created_at else None,
-            }
-            for v in versions
-        ],
-        "total": len(versions),
+        "current_version": current_snapshot,
+        "message": "Save versions via POST / to create snapshots for rollback",
+        "total": 0,
     }
 
 @router.get("/{version_name}")

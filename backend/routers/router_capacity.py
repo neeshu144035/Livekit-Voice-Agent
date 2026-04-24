@@ -25,9 +25,6 @@ async def get_capacity(db: Session = Depends(get_database)):
         "current_concurrent_calls": capacity.current_concurrent_calls,
         "available_slots": max(0, capacity.max_concurrent_calls - capacity.current_concurrent_calls),
         "utilization_percent": round(utilization, 2),
-        "queue_enabled": capacity.queue_enabled,
-        "max_queue_size": capacity.max_queue_size,
-        "current_queue_size": capacity.current_queue_size,
         "avg_call_duration_seconds": capacity.avg_call_duration_seconds,
         "auto_scale_enabled": capacity.auto_scale_enabled,
         "status": "healthy" if utilization < 80 else "warning" if utilization < 95 else "critical",
@@ -42,10 +39,6 @@ async def configure_capacity(config: Dict[str, Any], db: Session = Depends(get_d
     
     if "max_concurrent_calls" in config:
         capacity.max_concurrent_calls = config["max_concurrent_calls"]
-    if "queue_enabled" in config:
-        capacity.queue_enabled = config["queue_enabled"]
-    if "max_queue_size" in config:
-        capacity.max_queue_size = config["max_queue_size"]
     if "auto_scale_enabled" in config:
         capacity.auto_scale_enabled = config["auto_scale_enabled"]
     if "scale_up_threshold" in config:
@@ -57,7 +50,7 @@ async def configure_capacity(config: Dict[str, Any], db: Session = Depends(get_d
     db.commit()
     db.refresh(capacity)
     
-    logger.info(f"Capacity configured: max={capacity.max_concurrent_calls}, queue={capacity.queue_enabled}")
+    logger.info(f"Capacity configured: max={capacity.max_concurrent_calls}, auto_scale={capacity.auto_scale_enabled}")
     return get_capacity(db)
 
 @router.post("/call/start")
