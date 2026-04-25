@@ -700,7 +700,15 @@ def _normalize_agent_published_versions(raw_versions: Any) -> List[Dict[str, Any
 
 def _build_agent_function_snapshots(agent: AgentModel, db: Session) -> List[Dict[str, Any]]:
     rows = db.query(FunctionModel).filter(FunctionModel.agent_id == agent.id).order_by(FunctionModel.created_at.asc()).all()
-    return [_serialize_function_row(row) for row in rows]
+    snapshots: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = _serialize_function_row(row)
+        created_at = payload.get("created_at")
+        updated_at = payload.get("updated_at")
+        payload["created_at"] = created_at.isoformat() if isinstance(created_at, datetime) else created_at
+        payload["updated_at"] = updated_at.isoformat() if isinstance(updated_at, datetime) else updated_at
+        snapshots.append(payload)
+    return snapshots
 
 
 def build_agent_version_snapshot(agent: AgentModel, custom_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -3031,7 +3031,8 @@ async def entrypoint(ctx: JobContext):
         fetch_agent_config(agent_id),
         fetch_agent_functions(agent_id),
     )
-    
+    custom_params = config.get("custom_params", {}) or {}
+
     functions = merge_builtin_functions_into_runtime(functions, config)
     logger.info(f"Agent: {config.get('name')}, Functions: {len(functions)}")
 
