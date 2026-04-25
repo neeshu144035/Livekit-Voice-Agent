@@ -2318,7 +2318,15 @@ async def perform_agent_transfer_handoff(
         return {"success": False, "error": "agent_transfer is only supported during phone calls", "status": "phone_only"}
     if not getattr(agent_obj, "room", None):
         return {"success": False, "error": "Room not available for agent transfer"}
-    if not getattr(agent_obj, "session", None):
+    active_session = None
+    try:
+        active_session = getattr(agent_obj, "session", None)
+    except Exception:
+        active_session = None
+    if active_session is None:
+        active_session = getattr(agent_obj, "_runtime_session", None)
+
+    if not active_session:
         return {"success": False, "error": "Session not available for agent transfer"}
     if getattr(agent_obj, "_agent_transfer_in_progress", False):
         return {"success": False, "error": "Agent transfer is already in progress"}
@@ -2366,7 +2374,7 @@ async def perform_agent_transfer_handoff(
         current_chat_ctx = None
     if current_chat_ctx is None:
         try:
-            current_chat_ctx = getattr(agent_obj.session.agent, "chat_ctx", None)
+            current_chat_ctx = getattr(active_session.agent, "chat_ctx", None)
         except Exception:
             current_chat_ctx = None
 
@@ -2398,7 +2406,7 @@ async def perform_agent_transfer_handoff(
             base_instructions=target_prompt,
             current_room=agent_obj.room,
             call_id=call_id,
-            session=agent_obj.session,
+            session=active_session,
             agent_id=target_payload.get("agent_id"),
             agent_label=target_payload.get("name"),
             is_phone_call=True,
@@ -2409,7 +2417,7 @@ async def perform_agent_transfer_handoff(
             stt_engine=runtime_bundle.get("stt_engine"),
             chat_ctx=new_chat_ctx,
         )
-        agent_obj.session.update_agent(target_agent)
+        active_session.update_agent(target_agent)
         if call_id:
             await report_builtin_action(
                 call_id,
@@ -2430,7 +2438,7 @@ async def perform_agent_transfer_handoff(
         async def _speak_after_transfer():
             await asyncio.sleep(0.05)
             try:
-                agent_obj.session.generate_reply(
+                active_session.generate_reply(
                     instructions=(
                         "You have just taken over this live phone call. "
                         "Greet the caller in your own style and continue from the handoff context. "
@@ -2491,7 +2499,7 @@ class DynamicPropertyAgent(Agent):
         self.functions_config = functions_config
         self.room = room
         self.call_id = call_id
-        self.session = session
+        self._runtime_session = session
         self.agent_id = agent_id
         self.agent_label = agent_label
         self.is_phone_call = is_phone_call
@@ -3658,12 +3666,22 @@ async def entrypoint(ctx: JobContext):
                 initial_greeting_in_progress = True
                 if welcome_message_mode == "custom" and welcome_msg.strip():
                     greeting_text = welcome_msg.strip()
-                    logger.info("Sending configured greeting via direct TTS (%s)", source)
-                    session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
                 else:
-                    # Dynamic greetings come from the prompt; if none is available, fall back safely.
                     greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
-                    logger.info("Sending prompt-driven greeting via direct TTS (%s)", source)
+                # xAI unified realtime and OpenAI realtime paths have no separate
+                # TTS engine, so session.say() would fail with "no TTS model".
+                # Use generate_reply with the greeting as instructions instead.
+                if tts_engine is None:
+                    logger.info("Sending greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
+                    session.generate_reply(
+                        instructions=(
+                            f"Say this greeting to the caller now: \"{greeting_text}\"\n"
+                            "Say exactly this greeting. Do not add anything else."
+                        ),
+                        allow_interruptions=True,
+                    )
+                else:
+                    logger.info("Sending greeting via direct TTS (%s)", source)
                     session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
                 logger.info("Greeting queued successfully (%s)", source)
                 greeting_sent_ts = time.time()

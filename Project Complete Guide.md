@@ -1273,8 +1273,116 @@ docker logs voice-agent 2>&1 | grep "STT config"
 # STT config: model=nova-3 language=multi endpointing_ms=100
 ```
 
+### Last Webcall Verification
+- Recent agent `21` webcalls on April 20, 2026 were verified to use ElevenLabs v3, not v2.5:
+  - `call_21_733f3ec74135435f`
+  - `call_21_a83d9a8012b840ba`
+- An earlier call on the same date still showed `deepgram`, which confirms pre-fix mixed behavior:
+  - `call_21_275da76623d046ff`
+- A fresh token-generated webcall on April 20, 2026 created `call_21_ff7428538e294260`, and its metadata immediately showed:
+  - `tts_provider=elevenlabs`
+  - `tts_model=eleven_v3`
+  - `language=hi`
+  - `voice_speed=1.0`
+  - `llm_temperature=0.85`
+
+### Current Limitation
+- Malayalam TTS is supported with ElevenLabs v3.
+- Malayalam live understanding is still limited by the current real-time STT path.
+- The runtime now falls back to multilingual STT mode for Malayalam, which is better than the old behavior, but it is not yet equal to strong native Malayalam real-time recognition.
+
+### Best Next Improvements
+- Clean saved agent prompts so they use natural spoken punctuation instead of literal tags or placeholder-heavy formatting.
+- Improve multilingual STT if Malayalam understanding needs to be production-grade.
+- Add per-language prompt and pacing presets for more human-sounding delivery.
+
+### Suggested Prompt For A New Chat
+```text
+Continue from the April 20, 2026 LiveKit project state in C:\LiveKit-Project.
+
+Current known state after latest deploy:
+- backend/main.py and agent_retell.py updated so app-selected settings control runtime (voice_runtime_mode, voice_realtime_model, ElevenLabs model, greeting)
+- explicit ElevenLabs tts_model required on create/update; no auto-swapping
+- xAI provider support added with unified realtime voice mode (`grok-voice-think-fast-1.0` default)
+- xAI calls require `XAI_API_KEY` on both backend and voice-agent environments
+- LLM default reverted to moonshot-v1-8k
+- frontend (CreateAgentModal, CreateAgentWizard, agent page) exposes Voice Runtime mode explicitly
+- safe latency wins retained: pooled HTTP clients, parallel config/function fetches
+- Voice agent container rebuilt and restarted
+- PM2 frontend/backend restarted
+- curl health check passed
+
+Prior verified state:
+- agent 21 webcalls use ElevenLabs eleven_v3
+- multilingual mode, Hindi, Malayalam, UK English supported
+- deployment is hybrid: PM2 for frontend/backend, Docker Compose for voice-agent
+
+Please verify with commands:
+- python -m py_compile backend/main.py agent_retell.py
+- npx tsc --noEmit
+- curl http://127.0.0.1:8000/health
+- docker logs --tail 20 voice-agent
+```
+
+---
+
+## Multilingual STT Discovery (April 20, 2026 - Evening)
+
+### The Problem
+- Nova-2 with `language=multi` was NOT detecting Hindi properly
+- STT was returning 0ms processing - no speech detected at all
+
+### The Solution (Nova-3 for Multilingual)
+- **Use Nova-3** with `language=multi` instead of Nova-2
+- Nova-3 has ~21% better multilingual streaming than Nova-2
+- Better code-switching for Hindi-English conversations
+- Faster too!
+
+### Key Settings (agent_retell.py)
+```python
+# Multilingual STT config (line ~2483)
+if stt_language == "multi":
+    stt_model = "nova-3"  # NOT nova-2!
+    stt_kwargs["language"] = "multi"
+    stt_kwargs["endpointing_ms"] = 100  # Faster response
+
+# VAD tuning for speech detection
+VAD_MIN_SILENCE_DURATION = 0.05  # Was 0.08, lower = faster detection
+```
+
+### Verification
+```bash
+# Check STT config in logs
+docker logs voice-agent 2>&1 | grep "STT config"
+
+# Output should show:
+# STT config: model=nova-3 language=multi endpointing_ms=100
+```
+
 ### Summary
 - Nova-3 + language=multi = ✅ Working Hindi detection
 - Nova-2 + language=multi = ❌ Not working
 - Same Deepgram API, different model performance
 - Retell AI and others recommend Nova-3 now for multilingual
+
+---
+
+## Subagent Call Transfer & xAI Unified TTS Greeting Fix (April 25, 2026)
+
+### Implementation Summary
+- **Frontend**: Added `agent_transfer` built-in function to the system function library in the dashboard. Users can bind it to specific subagents.
+- **Backend**: Validates agent handoffs and creates full caller context payloads (memory extraction, recent transcript summary) using the new `/api/calls/{call_id}/agent-handoff-context` endpoint.
+- **Runtime (`agent_retell.py`)**: 
+  - Handles `agent_transfer` system function call, dynamically pulling the subagent's snapshot via backend.
+  - Merges `handoff_context`, maintaining user context (name, history).
+  - Uses `active_session.update_agent(target_agent)` for seamless handover without bridging second PSTN lines.
+
+### The xAI TTS Greeting Bug Fix
+- **The Issue**: Live calls assigned to xAI models (acting as unified realtime speech models) failed on connection with `Failed to send greeting (session_start): trying to generate speech from text without a TTS model`.
+- **The Cause**: The fallback greeting logic called `session.say()`, which strictly requires a separate TTS engine instance. However, xAI unified realtime models handle speech end-to-end and therefore configure their internal session without assigning a separate TTS engine.
+- **The Fix**: `agent_retell.py` was patched to detect when `tts_engine is None`. In this case, it avoids `session.say()` and instead uses `session.generate_reply(instructions=...)` which seamlessly drives the unified realtime model (xAI or OpenAI Realtime) to synthesize the requested greeting directly.
+
+### Verification
+- Agent container rebuilt (`docker compose up -d --build voice-agent`)
+- Backend PM2 restarts processed successfully.
+- Verified VPS `/health` endpoint and call-history API responses reflect the correct context transfer structure.
