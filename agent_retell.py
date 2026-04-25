@@ -2417,6 +2417,9 @@ async def perform_agent_transfer_handoff(
             stt_engine=runtime_bundle.get("stt_engine"),
             chat_ctx=new_chat_ctx,
         )
+        # Simulate a natural transfer/ringing delay before the new agent speaks
+        await asyncio.sleep(4.5)
+
         active_session.update_agent(target_agent)
         if call_id:
             await report_builtin_action(
@@ -2435,22 +2438,6 @@ async def perform_agent_transfer_handoff(
                 },
             )
 
-        async def _speak_after_transfer():
-            await asyncio.sleep(0.05)
-            try:
-                active_session.generate_reply(
-                    instructions=(
-                        "You have just taken over this live phone call. "
-                        "Greet the caller in your own style and continue from the handoff context. "
-                        "Do not re-ask already-known details unless they are missing or unclear."
-                    ),
-                    allow_interruptions=True,
-                    input_modality="text",
-                )
-            except Exception as reply_err:
-                logger.error("Failed to generate first reply after agent transfer: %s", reply_err)
-
-        asyncio.create_task(_speak_after_transfer())
         return {
             "success": True,
             "action": "agent_transfer",
@@ -2458,7 +2445,7 @@ async def perform_agent_transfer_handoff(
             "target_agent_id": target_agent_id,
             "target_agent_name": target_payload.get("name"),
             "resolved_version": target_payload.get("resolved_version"),
-            "message": "Agent switched successfully; the new agent will greet the caller now.",
+            "message": "Transfer completed successfully."
         }
     except Exception as handoff_exc:
         logger.error("agent_transfer handoff failed: %s", handoff_exc)
@@ -3363,6 +3350,9 @@ async def entrypoint(ctx: JobContext):
         is_phone_call=is_phone_call,
         runtime_vars=runtime_vars,
         vad_instance=ctx.proc.userdata["vad"],
+        llm_engine=llm,
+        tts_engine=tts_engine,
+        stt_engine=session_kwargs.get("stt"),
     )
 
     # Track the active speech-input path for usage and post-call diagnostics.
@@ -3666,23 +3656,28 @@ async def entrypoint(ctx: JobContext):
                 initial_greeting_in_progress = True
                 if welcome_message_mode == "custom" and welcome_msg.strip():
                     greeting_text = welcome_msg.strip()
+                    if tts_engine is None:
+                        logger.info("Sending custom greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
+                        session.generate_reply(
+                            instructions=(
+                                f'Say this greeting to the caller now: "{greeting_text}"\\n'
+                                'Say exactly this greeting. Do not add anything else.'
+                            ),
+                            allow_interruptions=True,
+                            input_modality="audio",
+                        )
+                    else:
+                        logger.info("Sending custom greeting via direct TTS (%s)", source)
+                        session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
                 else:
-                    greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
-                # xAI unified realtime and OpenAI realtime paths have no separate
-                # TTS engine, so session.say() would fail with "no TTS model".
-                # Use generate_reply with the greeting as instructions instead.
-                if tts_engine is None:
-                    logger.info("Sending greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
-                    session.generate_reply(
-                        instructions=(
-                            f"Say this greeting to the caller now: \"{greeting_text}\"\n"
-                            "Say exactly this greeting. Do not add anything else."
-                        ),
-                        allow_interruptions=True,
-                    )
-                else:
-                    logger.info("Sending greeting via direct TTS (%s)", source)
-                    session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
+                    if tts_engine is None:
+                        logger.info("Triggering dynamic greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
+                        session.generate_reply(allow_interruptions=True, input_modality="audio")
+                    else:
+                        greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
+                        logger.info("Sending dynamic greeting via direct TTS (%s)", source)
+                        session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
+
                 logger.info("Greeting queued successfully (%s)", source)
                 greeting_sent_ts = time.time()
                 last_activity_ts = greeting_sent_ts

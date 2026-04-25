@@ -14,6 +14,7 @@
 11. [Latest Production Updates (March 2026)](#latest-production-updates-march-2026)
 12. [Explicit Runtime Control (April 2026)](#explicit-runtime-control-april-2026)
 13. [Project State Summary (April 2026)](#project-state-summary-april-2026)
+14. [Agent-to-Agent Handoff Optimization (April 25, 2026)](#agent-to-agent-handoff-optimization-april-25-2026)
 
 ---
 
@@ -873,67 +874,6 @@ redis-cli KEYS "agent:*"
   - `cost_usd` total
 - Usage metadata now also stores applied runtime `voice_speed` and effective LLM temperature behavior for audit/debug.
 
-### Current Deploy Commands (Authoritative)
-
-#### Frontend (`.next` artifact only)
-```powershell
-# Clean and rebuild locally
-cd C:\LiveKit-Project
-Remove-Item -Recurse -Force .next -ErrorAction SilentlyContinue
-npm run build
-
-# Copy to temp and create tar (Linux path /tmp)
-Remove-Item -Recurse -Force C:\Temp\next-deploy -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Path C:\Temp\next-deploy -Force
-Copy-Item -Path .next\* -Destination C:\Temp\next-deploy\ -Recurse -Force
-
-# Create tar.gz in /tmp
-cd /tmp && rm -f next-deploy.tar.gz && tar -czf next-deploy.tar.gz next-deploy
-
-# Upload and deploy
-scp -i C:\LiveKit-Project\livekit-company-key.pem /tmp/next-deploy.tar.gz ubuntu@13.135.81.172:/tmp/
-ssh -i C:\LiveKit-Project\livekit-company-key.pem ubuntu@13.135.81.172 "cd /var/www/html && sudo rm -rf .next && sudo mkdir .next && cd .next && sudo tar -xzf /tmp/next-deploy.tar.gz && sudo mv next-deploy/* . && sudo rm -rf next-deploy && sudo chown -R www-data:www-data . && sudo pm2 restart nextjs"
-
-# Verify
-ssh -i C:\LiveKit-Project\livekit-company-key.pem ubuntu@13.135.81.172 "cat /var/www/html/.next/BUILD_ID"
-```
-
-#### Voice Agent (`agent_retell.py`)
-```bash
-scp -i livekit-company-key.pem agent_retell.py ubuntu@13.135.81.172:~/livekit-agent/agent_retell.py
-ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "cd ~/livekit-agent && docker compose up -d --build voice-agent"
-ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "docker logs --tail 80 voice-agent"
-```
-
-#### Backend API (`backend/main.py`)
-```bash
-scp -i livekit-company-key.pem backend/main.py ubuntu@13.135.81.172:~/livekit-dashboard-api/main.py
-ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "sudo pm2 restart api --update-env"
-ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "curl -s http://127.0.0.1:8000/health"
-```
-
-
-```env
-STRICT_PROTOOL_FILTER=1
-DISCONNECT_GRACE_SEC=20
-CHAT_REPLY_TIMEOUT_SEC=40
-END_CALL_DISCONNECT_DELAY_SEC=1.0
-TRANSFER_HANDOFF_DELAY_SEC=2.5
-SILENCE_REPROMPT_SEC=25
-STT_ENDPOINTING_PHONE_MS=40
-STT_ENDPOINTING_WEB_MS=40
-VAD_MIN_SPEECH_DURATION=0.015
-VAD_MIN_SILENCE_DURATION=0.05
-VAD_PREFIX_PADDING_DURATION=0.12
-ELEVENLABS_STREAMING_LATENCY=1
-ELEVENLABS_AUTO_MODE=1
-OPENAI_REASONING_EFFORT=low
-OPENAI_VERBOSITY=low
-OPENAI_MAX_COMPLETION_TOKENS=220
-```
-
-**Note**: For multilingual, runtime uses Nova-3 with language=multi.
-
 ---
 
 ## References
@@ -953,10 +893,6 @@ OPENAI_MAX_COMPLETION_TOKENS=220
 ### Voice Agent & ElevenLabs v3 Integration
 - **Bug Fix**: Fixed a critical `TypeError` in `agent_retell.py` by ensuring `voice_id` and `model` are passed as strings to the `elevenlabs.TTS` constructor, matching the LiveKit plugin v1.4.2 signature.
 - **Multilingual Deployment**: Added native support for **Hindi** (`hi`) and **Malayalam** (`ml`) across the entire platform.
-    - **Language Enforcement**: Implemented automated system prompt injection in `agent_retell.py` that forces the AI to respond natively in the selected language.
-    - **Full-Stack Update**: 
-        - Backend schemas (`backend/main.py`) updated to validate `hi`, `hi-IN`, `ml`, and `ml-IN`.
-        - Frontend dropdowns (`CreateAgentWizard.tsx` and Agent Detail pages) updated with Hindi/Malayalam options.
 - **Automated Deployment Process**:
     - **Backend**: API logic synced to VPS and restarted via `pm2 restart api`.
     - **Frontend**: Dashboard built locally, zipped, and deployed to VPS `/var/www/html/` with `.next` replacement.
@@ -984,28 +920,9 @@ OPENAI_MAX_COMPLETION_TOKENS=220
 
 - **LLM defaults reverted to Moonshot**:
   - [`backend/main.py:87`](backend/main.py) - `llm_model` defaults to `moonshot-v1-8k`
-  - [`CreateAgentWizard.tsx:227`](components/CreateAgentWizard.tsx) - Default LLM is `moonshot-v1-8k`
-  - [`app/agent/[id]/page.tsx:269`](app/agent/[id]/page.tsx) - Default LLM is `moonshot-v1-8k`
-
-#### Frontend/UI Changes
-- **Voice Runtime mode explicitly exposed**:
-  - [`CreateAgentModal.tsx:541`](components/CreateAgentModal.tsx) - Voice Runtime dropdown (Pipeline / Realtime text + TTS)
-  - [`CreateAgentWizard.tsx:678`](components/CreateAgentWizard.tsx) - Voice Runtime dropdown
-  - [`app/agent/[id]/page.tsx:1116`](app/agent/[id]/page.tsx) - Voice Runtime dropdown
-
-- **Explicit ElevenLabs model/voice selection**:
-  - Users must explicitly select ElevenLabs TTS model and voice
-  - No more auto-switching provider/model behind the user's back
-  - Warning displayed when `eleven_v3` is selected (slower HTTP path vs WebSocket)
 
 #### Important Constraint
 - If the user explicitly selects `eleven_v3`, the backend will honor it, but live latency will still be higher because ElevenLabs v3 uses the slower HTTP/non-WebSocket path.
-
-#### Current Docs Checked (April 20, 2026)
-- LiveKit Realtime plugin
-- OpenAI Realtime VAD
-- ElevenLabs models
-- ElevenLabs WebSockets
 
 ---
 
@@ -1016,373 +933,53 @@ OPENAI_MAX_COMPLETION_TOKENS=220
 
 ---
 
-## Project State Summary (April 20, 2026)
+### Agent-to-Agent Handoff Optimization (April 25, 2026)
+
+#### Implementation Summary
+- **Seamless Transfer Protocol**: Implemented a Retell-style `agent_transfer` system function that allows a live worker to swap the active agent identity mid-call without disconnecting the room or bridging new PSTN lines.
+- **Handoff Context Persistence**: The new subagent automatically receives the full conversational context:
+  - Preserved caller identity (name, phone number)
+  - Recent transcript summary (from the previous agent)
+  - Extracted caller memory (facts gathered during the current call)
+  - Runtime variables (dynamic state)
+- **Concurrency Crash Prevention**: Resolved a critical session instability where simultaneous `generate_reply()` calls during handoff would crash the xAI/OpenAI Realtime websocket. The handoff now relies on a minimal tool return message (`"Transfer completed successfully."`) to naturally trigger the new agent's greeting.
+- **Natural Transfer Hold**: Added a hardcoded **4.5-second ringing pause** in the transfer logic. This simulates a realistic "hold" period before the subagent picks up, preventing the subagent from speaking over the previous agent's closing sentence.
+- **Persona Isolation**: Moved the `update_agent()` call to occur *after* the ringing delay. This ensures the subagent's instructions and personality only become active when it is time to speak, preventing "identity bleed" where the subagent might hallucinate the previous agent's persona.
+
+#### Deployment Note
+- Re-run the voice-agent rebuild command after any changes to `agent_retell.py` transfer logic:
+  ```bash
+  ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "cd ~/livekit-agent && docker compose up -d --build voice-agent"
+  ```
+
+---
+
+### Suggested Prompt For A New Chat
+```text
+Continue from the April 25, 2026 LiveKit project state in C:\LiveKit-Project.
+
+Current known state:
+- Agent-to-agent transfer (handoff) is fully operational.
+- Handoff context (memory, transcript) correctly passed to subagents.
+- Concurrency crash fixed by removing redundant generate_reply and using minimal tool return.
+- Natural 4.5s ringing delay added to the handoff process.
+- Subagent activation moved to AFTER the delay to prevent identity bleed.
+- xAI unified realtime models use generate_reply for greetings instead of session.say().
+
+Please verify with commands:
+- docker logs --tail 50 voice-agent
+- python -m py_compile agent_retell.py
+```
+
+---
+
+## Project State Summary (April 25, 2026)
 
 ### Chat Summary
-- The main goal of the latest work was to make sure the app's selected settings actually control backend/runtime behavior for real-time calls and webcalls, instead of the runtime silently using older defaults.
+- The main goal of the latest work was to fix the agent-to-agent transfer logic to be robust, natural, and free of concurrency crashes.
 - The focus areas were:
-  - deployment documentation cleanup
-  - explicit use of `livekit-company-key.pem` in deploy steps
-  - ElevenLabs v3 verification
-  - multilingual language support
-  - Malayalam support
-  - command-based verification without relying on browser testing
-
-### What Was Updated In Code
-- [`backend/main.py`](backend/main.py)
-  - Call metadata is now populated from the saved agent configuration at call creation time.
-  - Webcalls now persist selected values such as `tts_provider`, `tts_model`, `language`, `voice`, `voice_speed`, and `llm_temperature` immediately.
-  - Usage updates were extended so later syncs can also store effective `language` and `tts_voice_id_used`.
-  - **NEW**: Create/update now require explicit ElevenLabs `tts_model`; no default advertised
-  - **NEW**: LLM default reverted to `moonshot-v1-8k`
-- [`agent_retell.py`](agent_retell.py)
-  - ElevenLabs `eleven_v3` is now the preferred multilingual/expressive TTS path.
-  - Added `multi` language support for multilingual mode.
-  - Added stronger language enforcement so the assistant answers in the chosen language.
-  - Malayalam now falls back through multilingual STT mode rather than staying on a weaker unsupported path.
-  - Added runtime protections to prevent speech output from reading unresolved placeholders like `{{name}}` or raw tags like `<break ...>`.
-  - Reduced forced low-token phone behavior unless explicitly enabled, which should help speech feel less clipped.
-  - **NEW**: `voice_runtime_mode` and `voice_realtime_model` read from saved config only
-  - **NEW**: No auto-swapping of ElevenLabs models - app selection is honored
-  - **NEW**: Greeting uses saved script, no fallback invention
-  - **RETAINED**: Pooled HTTP clients and parallel config/function fetches (latency wins)
-- Frontend/editor-side updates were also made in:
-  - [`app/agent/[id]/page.tsx`](app/agent/[id]/page.tsx)
-  - [`components/CreateAgentWizard.tsx`](components/CreateAgentWizard.tsx)
-  - [`components/CreateAgentModal.tsx`](components/CreateAgentModal.tsx)
-  - [`components/VoiceCallModal.tsx`](components/VoiceCallModal.tsx)
-  - **NEW**: Voice Runtime mode (Pipeline / Realtime text + TTS) explicitly exposed
-  - **NEW**: Explicit ElevenLabs model/voice selection required
-  - **NEW**: Warning shown for `eleven_v3` (slower HTTP path)
-
-### Greeting Editor Behavior (April 24, 2026)
-- The main agent editor now keeps the existing top-row model/voice/language controls and uses a bounded prompt editor so the page behaves more like Retell:
-  - only the prompt editor itself scrolls
-  - `Welcome Message` stays pinned below the prompt editor instead of disappearing off-screen
-  - the system prompt area was reduced from the earlier oversized fixed height
-- `Welcome Message` still starts with:
-  - `User speaks first`
-  - `Agent greets first`
-- When `Agent greets first` is selected, a second selector now appears:
-  - `Dynamic message` -> use the greeting written in the prompt
-  - `Custom message` -> use the explicit text entered by the user
-- If `Custom message` is selected but left empty, runtime falls back to the greeting written in the prompt.
-- If `User speaks first` is selected, that second selector is hidden.
-- The selected sub-mode is saved in `custom_params.welcome_message_mode` so both web test-chat and the live voice runtime follow the same greeting behavior.
-- Live call metadata now also carries `welcome_message_type`, `welcome_message`, and sanitized `custom_params`, so web/phone runtime no longer silently falls back to `user_speaks_first` when the UI was set to `Agent greets first`.
-- The test panel no longer shows the extra `Customize Chat Widget` button in the right-side testing card.
-- Voice runtime helper banners were trimmed so the editor keeps just the controls instead of extra suggestion text.
-- Language options now include a multilingual selection similar to Retell-style language switching:
-  - `Multilingual (Auto)`
-  - plus UK English, Hindi, Malayalam, and the other existing locale choices
-- Built-in transfer function configuration now stays in sync with the page's main agent state after saving, which prevents a later general `Save` action from restoring an older transfer phone number.
-
-### Publish Versioning (April 24, 2026)
-- `Save` and `Publish` now behave differently on the agent editor:
-  - `Save` updates the current draft agent
-  - `Publish` first saves the current draft and then stores a version snapshot in `custom_params.published_versions`
-- Each publish creates a numbered version entry with:
-  - `version`
-  - `published_at`
-  - a snapshot of the saved agent config at publish time
-- The editor header now shows the latest published version and the next publish button label as `Publish vN`.
-
-### Agent Transfer Tools (April 25, 2026)
-- Added a new Retell-style `agent_transfer` system function that is separate from the existing `transfer_call` phone-number handoff.
-- `transfer_call` is still only for sending the caller to another phone number. It was not repurposed.
-- `agent_transfer` now lives in the normal **Functions** area, so one agent can create multiple named handoff tools such as:
-  - `billing_handoff`
-  - `booking_handoff`
-  - `spanish_handoff`
-- Each `agent_transfer` tool stores:
-  - a user-defined tool `name`
-  - a user-defined `description`
-  - `method: SYSTEM`
-  - `url: builtin://agent_transfer`
-  - `system_config.target_agent_id`
-  - `system_config.target_version_mode` (`latest` or `pinned`)
-  - optional `system_config.target_version`
-- Published agent snapshots now include function snapshots too, so a pinned transfer target can resolve a specific published version.
-- Runtime behavior:
-  - v1 is **phone-call-only**
-  - when the prompt calls one of these transfer tools, the live worker swaps to the target agent with `AgentSession.update_agent(...)`
-  - the target agent uses its own prompt, greeting, language, voice, and tools
-  - recent conversation, runtime vars, and caller memory are passed across so the caller does not need to repeat known details
-  - the target agent is instructed to greet normally in its own style, but not re-ask already-known facts unless they are missing or unclear
-- Test-chat/webcall behavior:
-  - `agent_transfer` returns a clear phone-only result instead of pretending the handoff worked
-- Call history behavior:
-  - the same call record continues
-  - call details now include an `handoffs` timeline with source agent, target agent, tool name, version info, summary, and preserved caller-memory keys
-- Frontend/editor behavior:
-  - the agent editor has a dedicated **Agent Transfer** function modal
-  - the target is chosen from existing agents via dropdown
-  - version mode supports `Latest` or a pinned published snapshot
-  - these transfer tools appear in the configured function list alongside webhook functions
-  - the old built-in `transfer_call` / `end_call` cards remain separate
-
-### Deployment And VPS Update
-- The deployment guide was updated to reflect the real hybrid production model:
-  - frontend/backend managed on the VPS with PM2
-  - voice/media stack managed with Docker Compose
-- The deployment section now explicitly mentions the SSH key:
-  - [`livekit-company-key.pem`](livekit-company-key.pem)
-- The currently verified VPS process layout is:
-  - frontend dashboard: `nextjs` under `sudo pm2`, running from `/var/www/html`
-  - backend API: `api` under PM2, running from `~/livekit-dashboard-api`
-  - voice runtime: Docker Compose stack in `~/livekit-agent`, with container `voice-agent`
-- Current VPS frontend expectation:
-  - only one production dashboard port should remain active
-  - the current live dashboard is expected on PM2/Nginx through port `3001`
-  - stale duplicate frontend listeners such as old `3000` processes should be removed instead of left running
-
-### xAI Unified Voice Integration (April 24, 2026)
-- Added `xai` as a first-class speech provider across:
-  - [`backend/main.py`](backend/main.py)
-  - [`agent_retell.py`](agent_retell.py)
-  - [`app/agent/[id]/page.tsx`](app/agent/[id]/page.tsx)
-  - [`components/CreateAgentModal.tsx`](components/CreateAgentModal.tsx)
-  - [`app/call-history/page.tsx`](app/call-history/page.tsx)
-- The xAI path is intentionally **not** the old cascaded pipeline.
-  - It uses a unified realtime voice model through LiveKit's OpenAI-compatible `RealtimeModel`
-  - Base URL: `https://api.x.ai/v1`
-  - Current default model: `grok-voice-think-fast-1.0`
-  - Legacy model still exposed for compatibility: `grok-voice-fast-1.0`
-- Supported xAI voices currently exposed in the dashboard:
-  - `eve`
-  - `ara`
-  - `rex`
-  - `sal`
-  - `leo`
-- xAI language selection in the UI is now provider-aware:
-  - `Multilingual (Auto)` is shown first
-  - the list is restricted to the language set currently supported in this dashboard for xAI (`en-*`, `hi-*`, `ml-*`, `multi`)
-  - switching to xAI automatically normalizes an unsupported previously-selected language instead of silently keeping an invalid combination
-- Runtime behavior:
-  - selecting `tts_provider=xai` automatically forces `voice_runtime_mode=realtime_unified`
-  - the saved `tts_model` is also persisted as `voice_realtime_model`
-  - Deepgram STT and external TTS are skipped for xAI calls
-- Backend create/update validation now also rejects unsupported xAI language selections instead of accepting them and falling back later.
-- Cost handling was updated for xAI voice calls:
-  - fallback cost display uses xAI Voice Agent pricing (`$0.05/min`)
-  - LLM/STT/TTS are not double-counted separately for xAI unified sessions
-- Important deployment requirement:
-  - production must have `XAI_API_KEY` available to both the backend env and the voice-agent env before live xAI calls will work
-  - without `XAI_API_KEY`, the dashboard can still show xAI models/voices, but the live runtime will fail fast instead of silently falling back to another provider
-
-### Verification Completed With Commands
-- Local verification completed successfully:
-  - `python -m py_compile backend/main.py agent_retell.py`
-  - `npx tsc --noEmit`
-  - `npm run build`
-  - custom function JSON/form editor still builds after the new system-function additions
-- backend sanity check with temporary SQLite import context:
-    - `get_tts_models('xai')`
-    - `get_tts_voices('xai')`
-    - `lookup_tts_voice('xai', 'eve')`
-- Remote/VPS verification completed with command-line checks:
-  - `curl http://127.0.0.1:8000/health`
-  - `pm2 status api`
-  - `sudo pm2 status nextjs`
-  - `docker logs --tail 80 voice-agent`
-  - `curl http://127.0.0.1:8000/api/call-history/<call_id>/details`
-
-### Last Webcall Verification
-- Recent agent `21` webcalls on April 20, 2026 were verified to use ElevenLabs v3, not v2.5:
-  - `call_21_733f3ec74135435f`
-  - `call_21_a83d9a8012b840ba`
-- An earlier call on the same date still showed `deepgram`, which confirms pre-fix mixed behavior:
-  - `call_21_275da76623d046ff`
-- A fresh token-generated webcall on April 20, 2026 created `call_21_ff7428538e294260`, and its metadata immediately showed:
-  - `tts_provider=elevenlabs`
-  - `tts_model=eleven_v3`
-  - `language=hi`
-  - `voice_speed=1.0`
-  - `llm_temperature=0.85`
-
-### Current Limitation
-- Malayalam TTS is supported with ElevenLabs v3.
-- Malayalam live understanding is still limited by the current real-time STT path.
-- The runtime now falls back to multilingual STT mode for Malayalam, which is better than the old behavior, but it is not yet equal to strong native Malayalam real-time recognition.
-
-### Best Next Improvements
-- Clean saved agent prompts so they use natural spoken punctuation instead of literal tags or placeholder-heavy formatting.
-- Improve multilingual STT if Malayalam understanding needs to be production-grade.
-- Add per-language prompt and pacing presets for more human-sounding delivery.
-
-### Suggested Prompt For A New Chat
-```text
-Continue from the April 20, 2026 LiveKit project state in C:\LiveKit-Project.
-
-Current known state after latest deploy:
-- backend/main.py and agent_retell.py updated so app-selected settings control runtime (voice_runtime_mode, voice_realtime_model, ElevenLabs model, greeting)
-- explicit ElevenLabs tts_model required on create/update; no auto-swapping
-- xAI provider support added with unified realtime voice mode (`grok-voice-think-fast-1.0` default)
-- xAI calls require `XAI_API_KEY` on both backend and voice-agent environments
-- LLM default reverted to moonshot-v1-8k
-- frontend (CreateAgentModal, CreateAgentWizard, agent page) exposes Voice Runtime mode explicitly
-- safe latency wins retained: pooled HTTP clients, parallel config/function fetches
-- Voice agent container rebuilt and restarted
-- PM2 frontend/backend restarted
-- curl health check passed
-
-Prior verified state:
-- agent 21 webcalls use ElevenLabs eleven_v3
-- multilingual mode, Hindi, Malayalam, UK English supported
-- deployment is hybrid: PM2 for frontend/backend, Docker Compose for voice-agent
-
-Please verify with commands:
-- python -m py_compile backend/main.py agent_retell.py
-- npx tsc --noEmit
-- curl http://127.0.0.1:8000/health
-- docker logs --tail 20 voice-agent
-```
-
----
-
-## Multilingual STT Discovery (April 20, 2026 - Evening)
-
-### The Problem
-- Nova-2 with `language=multi` was NOT detecting Hindi properly
-- STT was returning 0ms processing - no speech detected at all
-
-### The Solution (Nova-3 for Multilingual)
-- **Use Nova-3** with `language=multi` instead of Nova-2
-- Nova-3 has ~21% better multilingual streaming than Nova-2
-- Better code-switching for Hindi-English conversations
-- Faster too!
-
-### Key Settings (agent_retell.py)
-```python
-# Multilingual STT config (line ~2483)
-if stt_language == "multi":
-    stt_model = "nova-3"  # NOT nova-2!
-    stt_kwargs["language"] = "multi"
-    stt_kwargs["endpointing_ms"] = 100  # Faster response
-
-# VAD tuning for speech detection
-VAD_MIN_SILENCE_DURATION = 0.05  # Was 0.08, lower = faster detection
-```
-
-### Verification
-```bash
-# Check STT config in logs
-docker logs voice-agent 2>&1 | grep "STT config"
-
-# Output should show:
-# STT config: model=nova-3 language=multi endpointing_ms=100
-```
-
-### Last Webcall Verification
-- Recent agent `21` webcalls on April 20, 2026 were verified to use ElevenLabs v3, not v2.5:
-  - `call_21_733f3ec74135435f`
-  - `call_21_a83d9a8012b840ba`
-- An earlier call on the same date still showed `deepgram`, which confirms pre-fix mixed behavior:
-  - `call_21_275da76623d046ff`
-- A fresh token-generated webcall on April 20, 2026 created `call_21_ff7428538e294260`, and its metadata immediately showed:
-  - `tts_provider=elevenlabs`
-  - `tts_model=eleven_v3`
-  - `language=hi`
-  - `voice_speed=1.0`
-  - `llm_temperature=0.85`
-
-### Current Limitation
-- Malayalam TTS is supported with ElevenLabs v3.
-- Malayalam live understanding is still limited by the current real-time STT path.
-- The runtime now falls back to multilingual STT mode for Malayalam, which is better than the old behavior, but it is not yet equal to strong native Malayalam real-time recognition.
-
-### Best Next Improvements
-- Clean saved agent prompts so they use natural spoken punctuation instead of literal tags or placeholder-heavy formatting.
-- Improve multilingual STT if Malayalam understanding needs to be production-grade.
-- Add per-language prompt and pacing presets for more human-sounding delivery.
-
-### Suggested Prompt For A New Chat
-```text
-Continue from the April 20, 2026 LiveKit project state in C:\LiveKit-Project.
-
-Current known state after latest deploy:
-- backend/main.py and agent_retell.py updated so app-selected settings control runtime (voice_runtime_mode, voice_realtime_model, ElevenLabs model, greeting)
-- explicit ElevenLabs tts_model required on create/update; no auto-swapping
-- xAI provider support added with unified realtime voice mode (`grok-voice-think-fast-1.0` default)
-- xAI calls require `XAI_API_KEY` on both backend and voice-agent environments
-- LLM default reverted to moonshot-v1-8k
-- frontend (CreateAgentModal, CreateAgentWizard, agent page) exposes Voice Runtime mode explicitly
-- safe latency wins retained: pooled HTTP clients, parallel config/function fetches
-- Voice agent container rebuilt and restarted
-- PM2 frontend/backend restarted
-- curl health check passed
-
-Prior verified state:
-- agent 21 webcalls use ElevenLabs eleven_v3
-- multilingual mode, Hindi, Malayalam, UK English supported
-- deployment is hybrid: PM2 for frontend/backend, Docker Compose for voice-agent
-
-Please verify with commands:
-- python -m py_compile backend/main.py agent_retell.py
-- npx tsc --noEmit
-- curl http://127.0.0.1:8000/health
-- docker logs --tail 20 voice-agent
-```
-
----
-
-## Multilingual STT Discovery (April 20, 2026 - Evening)
-
-### The Problem
-- Nova-2 with `language=multi` was NOT detecting Hindi properly
-- STT was returning 0ms processing - no speech detected at all
-
-### The Solution (Nova-3 for Multilingual)
-- **Use Nova-3** with `language=multi` instead of Nova-2
-- Nova-3 has ~21% better multilingual streaming than Nova-2
-- Better code-switching for Hindi-English conversations
-- Faster too!
-
-### Key Settings (agent_retell.py)
-```python
-# Multilingual STT config (line ~2483)
-if stt_language == "multi":
-    stt_model = "nova-3"  # NOT nova-2!
-    stt_kwargs["language"] = "multi"
-    stt_kwargs["endpointing_ms"] = 100  # Faster response
-
-# VAD tuning for speech detection
-VAD_MIN_SILENCE_DURATION = 0.05  # Was 0.08, lower = faster detection
-```
-
-### Verification
-```bash
-# Check STT config in logs
-docker logs voice-agent 2>&1 | grep "STT config"
-
-# Output should show:
-# STT config: model=nova-3 language=multi endpointing_ms=100
-```
-
-### Summary
-- Nova-3 + language=multi = ✅ Working Hindi detection
-- Nova-2 + language=multi = ❌ Not working
-- Same Deepgram API, different model performance
-- Retell AI and others recommend Nova-3 now for multilingual
-
----
-
-## Subagent Call Transfer & xAI Unified TTS Greeting Fix (April 25, 2026)
-
-### Implementation Summary
-- **Frontend**: Added `agent_transfer` built-in function to the system function library in the dashboard. Users can bind it to specific subagents.
-- **Backend**: Validates agent handoffs and creates full caller context payloads (memory extraction, recent transcript summary) using the new `/api/calls/{call_id}/agent-handoff-context` endpoint.
-- **Runtime (`agent_retell.py`)**: 
-  - Handles `agent_transfer` system function call, dynamically pulling the subagent's snapshot via backend.
-  - Merges `handoff_context`, maintaining user context (name, history).
-  - Uses `active_session.update_agent(target_agent)` for seamless handover without bridging second PSTN lines.
-
-### The xAI TTS Greeting Bug Fix
-- **The Issue**: Live calls assigned to xAI models (acting as unified realtime speech models) failed on connection with `Failed to send greeting (session_start): trying to generate speech from text without a TTS model`.
-- **The Cause**: The fallback greeting logic called `session.say()`, which strictly requires a separate TTS engine instance. However, xAI unified realtime models handle speech end-to-end and therefore configure their internal session without assigning a separate TTS engine.
-- **The Fix**: `agent_retell.py` was patched to detect when `tts_engine is None`. In this case, it avoids `session.say()` and instead uses `session.generate_reply(instructions=...)` which seamlessly drives the unified realtime model (xAI or OpenAI Realtime) to synthesize the requested greeting directly.
-
-### Verification
-- Agent container rebuilt (`docker compose up -d --build voice-agent`)
-- Backend PM2 restarts processed successfully.
-- Verified VPS `/health` endpoint and call-history API responses reflect the correct context transfer structure.
+  - Handoff context serialization and backend retrieval.
+  - Resolving 400 Bad Request errors on duplicate handoff attempts.
+  - Fixing "rt_session not available" crashes during handoff.
+  - Implementing a realistic 4.5s transfer delay.
+  - Ensuring subagents introduce themselves according to their specific prompts.
