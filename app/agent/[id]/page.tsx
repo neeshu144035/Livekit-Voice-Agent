@@ -8,13 +8,14 @@ import {
     ArrowLeft, Bot, Loader2, Save, Phone, Copy, Edit3,
     ChevronDown, Mic, Settings, Wrench, FileText,
     Volume2, Trash2, Play, MessageSquare,
-    Shield, Webhook, Cpu, BookOpen, Activity, Plus,
+    Shield, Webhook, Cpu, BookOpen, Activity, Plus, ArrowRightLeft,
     Home, History, BarChart3, Key, Users, FileCode, PhoneCall, X, Menu
 } from 'lucide-react';
 import { useToast } from '../../../components/ToastProvider';
 import VoiceCallModal from '../../../components/VoiceCallModal';
 import TestChatModal from '../../../components/TestChatModal';
 import FunctionModal from '../../../components/FunctionModal';
+import AgentTransferFunctionModal, { AgentTransferFunctionData } from '../../../components/AgentTransferFunctionModal';
 
 // Simple Sidebar Menu
 const SIDEBAR_MENU = [
@@ -57,6 +58,7 @@ interface PublishedAgentVersion {
 
 interface Function {
     id: number;
+    agent_id?: number;
     name: string;
     description: string | null;
     method: string;
@@ -65,11 +67,19 @@ interface Function {
     headers: Record<string, string>;
     query_params: Record<string, string>;
     parameters_schema: Record<string, any>;
-    variables: Record<string, string>;
+    variables: Record<string, any>;
+    system_type?: string | null;
+    system_config?: Record<string, any> | null;
+    is_system?: boolean;
     speak_during_execution: boolean;
     speak_after_execution: boolean;
     created_at: string;
     updated_at: string;
+}
+
+interface SimpleAgentOption {
+    id: number;
+    name: string;
 }
 
 interface BuiltinFunctionDefinition {
@@ -354,10 +364,13 @@ export default function AgentDetailPage() {
     const [builtinSaved, setBuiltinSaved] = useState(false);
     const [showFunctionModal, setShowFunctionModal] = useState(false);
     const [selectedFunction, setSelectedFunction] = useState<Function | null>(null);
+    const [showAgentTransferModal, setShowAgentTransferModal] = useState(false);
+    const [selectedAgentTransferFunction, setSelectedAgentTransferFunction] = useState<AgentTransferFunctionData | null>(null);
     const [showFunctionSelector, setShowFunctionSelector] = useState(false);
     const [showBuiltinConfigModal, setShowBuiltinConfigModal] = useState(false);
     const [selectedBuiltinFunctionId, setSelectedBuiltinFunctionId] = useState<string | null>(null);
     const [builtinDraftConfig, setBuiltinDraftConfig] = useState<BuiltinFunctionState | null>(null);
+    const [simpleAgents, setSimpleAgents] = useState<SimpleAgentOption[]>([]);
 
     const agentId = params.id as string;
     const compatibleElevenModels = getCompatibleElevenModels(ttsModels, selectedLanguage);
@@ -426,6 +439,42 @@ export default function AgentDetailPage() {
         if (!cleaned) return 'Built-in Function';
 
         return cleaned.replace(/\b\w/g, (char) => char.toUpperCase());
+    };
+
+    const isAgentTransferFunction = (func?: Function | AgentTransferFunctionData | null) =>
+        Boolean(func && (((func as Function).system_type || '').toLowerCase() === 'agent_transfer' || func.url === 'builtin://agent_transfer'));
+
+    const getSimpleAgentName = (targetAgentId?: number | null) => {
+        if (!targetAgentId) return '';
+        return simpleAgents.find((agent) => agent.id === Number(targetAgentId))?.name || `Agent #${targetAgentId}`;
+    };
+
+    const formatAgentTransferVersion = (systemConfig?: Record<string, any> | null) => {
+        if (!systemConfig || typeof systemConfig !== 'object') return 'Latest';
+        const targetVersionMode = systemConfig.target_version_mode === 'pinned' ? 'Pinned' : 'Latest';
+        if (targetVersionMode === 'Pinned' && systemConfig.target_version) {
+            return `v${systemConfig.target_version}`;
+        }
+        return 'Latest';
+    };
+
+    const getAgentTransferSubtitle = (func: Function) => {
+        const systemConfig = func.system_config && typeof func.system_config === 'object' ? func.system_config : {};
+        const targetAgentId = Number(systemConfig.target_agent_id || 0) || undefined;
+        const targetAgentName = getSimpleAgentName(targetAgentId);
+        const versionLabel = formatAgentTransferVersion(systemConfig);
+        if (!targetAgentName) return `${versionLabel} • Phone calls only`;
+        return `${targetAgentName} • ${versionLabel} • Phone calls only`;
+    };
+
+    const openFunctionEditor = (func: Function | null) => {
+        if (func && isAgentTransferFunction(func)) {
+            setSelectedAgentTransferFunction(func as AgentTransferFunctionData);
+            setShowAgentTransferModal(true);
+            return;
+        }
+        setSelectedFunction(func);
+        setShowFunctionModal(true);
     };
 
     const openBuiltinConfigModal = (funcId: string) => {
@@ -534,6 +583,7 @@ export default function AgentDetailPage() {
     useEffect(() => {
         fetchAgent();
         fetchFunctions();
+        fetchSimpleAgents();
     }, [agentId]);
 
     useEffect(() => {
@@ -664,6 +714,15 @@ export default function AgentDetailPage() {
             await fetchBuiltinFunctionsConfig();
         } catch (err) {
             console.error('Failed to load builtin functions config:', err);
+        }
+    };
+
+    const fetchSimpleAgents = async () => {
+        try {
+            const res = await axios.get<SimpleAgentOption[]>(`${API_URL}agents/list-simple`);
+            setSimpleAgents(Array.isArray(res.data) ? res.data : []);
+        } catch (err) {
+            console.error('Failed to load agent list:', err);
         }
     };
 
@@ -1498,37 +1557,53 @@ export default function AgentDetailPage() {
                                                             })}
 
                                                             {/* Custom Functions */}
-                                                            {functions.map((func) => (
-                                                                <div key={func.id} className="flex items-center justify-between bg-gray-50 rounded-lg p-3">
-                                                                    <div className="flex items-center gap-3">
-                                                                        {func.method === 'POST' || func.method === 'GET' ? (
-                                                                            <svg className="w-5 h-5 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                                                <path d="M13 10V3L4 14h7v7l9-11h-7z" />
-                                                                            </svg>
-                                                                        ) : (
-                                                                            <Phone className="w-5 h-5 text-gray-500" />
-                                                                        )}
-                                                                        <span className="text-sm font-medium text-gray-900">{func.name}</span>
+                                                            {functions.map((func) => {
+                                                                const agentTransfer = isAgentTransferFunction(func);
+                                                                return (
+                                                                    <div key={func.id} className="flex items-center justify-between rounded-lg bg-gray-50 p-3">
+                                                                        <div className="flex min-w-0 items-center gap-3">
+                                                                            {agentTransfer ? (
+                                                                                <ArrowRightLeft className="h-5 w-5 flex-shrink-0 text-violet-500" />
+                                                                            ) : func.method === 'POST' || func.method === 'GET' ? (
+                                                                                <svg className="w-5 h-5 text-gray-500 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                                                    <path d="M13 10V3L4 14h7v7l9-11h-7z" />
+                                                                                </svg>
+                                                                            ) : (
+                                                                                <Phone className="w-5 h-5 text-gray-500 flex-shrink-0" />
+                                                                            )}
+                                                                            <div className="min-w-0">
+                                                                                <div className="flex items-center gap-2">
+                                                                                    <span className="truncate text-sm font-medium text-gray-900">{func.name}</span>
+                                                                                    {agentTransfer && (
+                                                                                        <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-700">
+                                                                                            Agent Transfer
+                                                                                        </span>
+                                                                                    )}
+                                                                                </div>
+                                                                                <p className="truncate text-xs text-gray-500">
+                                                                                    {agentTransfer
+                                                                                        ? getAgentTransferSubtitle(func)
+                                                                                        : func.description || `${func.method} webhook`}
+                                                                                </p>
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="flex items-center gap-2">
+                                                                            <button
+                                                                                onClick={() => openFunctionEditor(func)}
+                                                                                className="p-1.5 text-gray-400 hover:text-blue-600 transition-colors"
+                                                                            >
+                                                                                <Edit3 className="w-4 h-4" />
+                                                                            </button>
+                                                                            <button
+                                                                                onClick={() => handleDeleteFunction(func.id)}
+                                                                                className="p-1.5 text-gray-400 hover:text-red-600 transition-colors"
+                                                                            >
+                                                                                <Trash2 className="w-4 h-4" />
+                                                                            </button>
+                                                                        </div>
                                                                     </div>
-                                                                    <div className="flex items-center gap-2">
-                                                                        <button
-                                                                            onClick={() => {
-                                                                                setSelectedFunction(func);
-                                                                                setShowFunctionModal(true);
-                                                                            }}
-                                                                            className="p-1.5 text-gray-400 hover:text-blue-600 transition-colors"
-                                                                        >
-                                                                            <Edit3 className="w-4 h-4" />
-                                                                        </button>
-                                                                        <button
-                                                                            onClick={() => handleDeleteFunction(func.id)}
-                                                                            className="p-1.5 text-gray-400 hover:text-red-600 transition-colors"
-                                                                        >
-                                                                            <Trash2 className="w-4 h-4" />
-                                                                        </button>
-                                                                    </div>
-                                                                </div>
-                                                            ))}
+                                                                );
+                                                            })}
                                                         </div>
                                                     )}
 
@@ -1640,7 +1715,7 @@ export default function AgentDetailPage() {
 
                             <div className="flex items-start gap-2 mt-4 text-xs text-gray-500 bg-blue-50 border border-blue-100 rounded-lg p-3">
                                 <span className="text-blue-500 mt-0.5">ⓘ</span>
-                                <span>Please note call transfer is not supported in Webcall.</span>
+                                <span>Phone-only tools like call transfer and agent transfer are not supported in Webcall.</span>
                             </div>
 
                             <button
@@ -1670,10 +1745,26 @@ export default function AgentDetailPage() {
                 {/* Function Modal */}
                 <FunctionModal
                     isOpen={showFunctionModal}
-                    onClose={() => setShowFunctionModal(false)}
+                    onClose={() => {
+                        setShowFunctionModal(false);
+                        setSelectedFunction(null);
+                    }}
                     agentId={parseInt(agentId)}
                     functionData={selectedFunction}
                     onSuccess={fetchFunctions}
+                />
+                <AgentTransferFunctionModal
+                    isOpen={showAgentTransferModal}
+                    onClose={() => {
+                        setShowAgentTransferModal(false);
+                        setSelectedAgentTransferFunction(null);
+                    }}
+                    agentId={parseInt(agentId)}
+                    functionData={selectedAgentTransferFunction}
+                    onSuccess={() => {
+                        void fetchFunctions();
+                        void fetchSimpleAgents();
+                    }}
                 />
 
                 {showBuiltinConfigModal && selectedBuiltinFunctionId && builtinDraftConfig && (
@@ -1833,6 +1924,25 @@ export default function AgentDetailPage() {
                                         </button>
                                     );
                                 })}
+
+                                <button
+                                    onClick={() => {
+                                        setShowFunctionSelector(false);
+                                        setSelectedAgentTransferFunction(null);
+                                        setShowAgentTransferModal(true);
+                                    }}
+                                    className="w-full text-left p-3 rounded-lg border border-violet-200 bg-violet-50 hover:bg-violet-100 transition-colors"
+                                >
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-8 h-8 rounded-full bg-violet-500 flex items-center justify-center">
+                                            <ArrowRightLeft className="w-4 h-4 text-white" />
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-medium text-gray-900">Agent Transfer</p>
+                                            <p className="text-xs text-gray-500">Create a named subagent handoff tool for phone calls</p>
+                                        </div>
+                                    </div>
+                                </button>
 
                                 {/* Custom Function Option */}
                                 <button

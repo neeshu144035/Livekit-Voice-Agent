@@ -25,7 +25,7 @@ interface FunctionData {
   headers: Record<string, string>;
   query_params: Record<string, string>;
   parameters_schema: Record<string, any>;
-  variables: Record<string, string>;
+  variables: Record<string, any>;
   speak_during_execution: boolean;
   speak_after_execution: boolean;
 }
@@ -123,9 +123,9 @@ export default function FunctionModal({ isOpen, onClose, agentId, functionData, 
           ...functionData,
           ...normalizeSpeechFlags(functionData),
         });
-        setHeaders(Object.entries(functionData.headers || {}).map(([key, value]) => ({ key, value })));
-        setQueryParams(Object.entries(functionData.query_params || {}).map(([key, value]) => ({ key, value })));
-        setVariables(Object.entries(functionData.variables || {}).map(([key, value]) => ({ key, value })));
+        setHeaders(Object.entries(functionData.headers || {}).map(([key, value]) => ({ key, value: String(value ?? '') })));
+        setQueryParams(Object.entries(functionData.query_params || {}).map(([key, value]) => ({ key, value: String(value ?? '') })));
+        setVariables(Object.entries(functionData.variables || {}).map(([key, value]) => ({ key, value: String(value ?? '') })));
         const schema = functionData.parameters_schema || {};
         setParametersJson(JSON.stringify(schema, null, 2));
         setFormParameters(jsonToFormParams(schema));

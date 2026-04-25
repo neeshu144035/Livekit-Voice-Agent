@@ -9,7 +9,7 @@ import {
     Search, Filter, RefreshCw, Loader2, X, Sparkles,
     ArrowUpRight, ArrowDownLeft, Globe, Mic, Volume2,
     Cpu, Zap, AlertCircle, CheckCircle, XCircle, Timer,
-    ChevronRight, ChevronLeft, Eye, Home, BookOpen, BarChart3,
+    ChevronRight, ChevronLeft, Eye, Home, BookOpen, BarChart3, ArrowRightLeft,
     Key, Settings
 } from 'lucide-react';
 
@@ -46,6 +46,8 @@ interface CallRecord {
     transcript_count: number;
     transcript_summary: string | null;
     error_message: string | null;
+    latency_ms?: number | null;
+    latency_source?: string | null;
     created_at: string | null;
 }
 
@@ -60,6 +62,21 @@ interface TranscriptEntry {
         llm_ms: number | null;
         tts_ms: number | null;
     };
+}
+
+interface HandoffEntry {
+    timestamp?: string | null;
+    tool_name?: string | null;
+    source_agent_id?: number | null;
+    source_agent_name?: string | null;
+    target_agent_id?: number | null;
+    target_agent_name?: string | null;
+    target_version_mode?: string | null;
+    target_version?: number | null;
+    resolved_version?: number | null;
+    handoff_summary?: string | null;
+    caller_memory?: Record<string, any>;
+    recent_transcript?: Array<Record<string, any>>;
 }
 
 interface CallDetails {
@@ -102,8 +119,15 @@ interface CallDetails {
         tts_avg_ms: number | null;
         stt_p95_ms: number | null;
         llm_p95_ms: number | null;
+        tts_p95_ms?: number | null;
+        reply_avg_ms?: number | null;
+        reply_p95_ms?: number | null;
+        total_avg_ms?: number | null;
+        total_p95_ms?: number | null;
+        source?: string | null;
     };
     transcript: TranscriptEntry[];
+    handoffs: HandoffEntry[];
     metadata: Record<string, any>;
 }
 
@@ -129,6 +153,19 @@ function formatCost(cost: number): string {
     return `$${cost.toFixed(2)}`;
 }
 
+function formatLatency(latencyMs: number | null | undefined): string {
+    if (!latencyMs || latencyMs <= 0) return '-';
+    if (latencyMs < 1000) return `${Math.round(latencyMs)}ms`;
+    if (latencyMs < 10000) return `${(latencyMs / 1000).toFixed(1)}s`;
+    return `${Math.round(latencyMs / 1000)}s`;
+}
+
+function latencySourceLabel(source: string | null | undefined): string {
+    if (source === 'measured_components') return 'measured';
+    if (source === 'transcript_reply_gap') return 'reply gap';
+    return 'unavailable';
+}
+
 function formatDate(dateStr: string | null): string {
     if (!dateStr) return '—';
     const date = new Date(dateStr);
@@ -149,6 +186,37 @@ function formatTime(dateStr: string | null): string {
         second: '2-digit',
         hour12: false,
     });
+}
+
+function isAgentTranscriptRole(role: string): boolean {
+    const normalized = (role || '').toLowerCase();
+    return normalized === 'agent' || normalized === 'assistant';
+}
+
+function isUserTranscriptRole(role: string): boolean {
+    const normalized = (role || '').toLowerCase();
+    return normalized === 'user' || normalized === 'caller';
+}
+
+function formatTranscriptRoleLabel(role: string): string {
+    const normalized = (role || '').toLowerCase();
+    if (normalized === 'tool_call') return 'Tool Call';
+    if (normalized === 'tool_response' || normalized === 'tool_result') return 'Tool Result';
+    if (normalized === 'tool_invocation') return 'Tool Invocation';
+    if (normalized === 'assistant' || normalized === 'agent') return 'Agent';
+    if (normalized === 'user' || normalized === 'caller') return 'Caller';
+    if (normalized === 'system') return 'System';
+    return normalized ? normalized.replace(/_/g, ' ') : 'Event';
+}
+
+function formatHandoffVersion(entry: HandoffEntry): string {
+    if (entry.target_version_mode === 'pinned' && entry.target_version) {
+        return `Pinned v${entry.target_version}`;
+    }
+    if (entry.resolved_version) {
+        return `Latest (resolved v${entry.resolved_version})`;
+    }
+    return 'Latest';
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -243,13 +311,17 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
         );
     }
 
-    const { call, costs, usage, latency, transcript, metadata } = details;
+    const { call, costs, usage, latency, transcript, metadata, handoffs } = details;
     const normalizedCallDirection = (call.direction || '').toLowerCase();
     const ttsProvider = (usage.tts_provider || metadata?.tts_provider || 'deepgram').toLowerCase();
     const ttsModel = usage.tts_model || metadata?.tts_model || null;
     const ttsCostSource = usage.tts_cost_source || metadata?.tts_cost_source || null;
     const isXaiUnified = ttsProvider === 'xai';
     const ttsProviderLabel = ttsProvider === 'xai' ? 'xAI' : ttsProvider === 'elevenlabs' ? 'ElevenLabs' : 'Deepgram';
+    const latencyHeadlineMs = latency.total_avg_ms || latency.reply_avg_ms || null;
+    const latencyHeadlineLabel = latency.source === 'transcript_reply_gap'
+        ? 'Average reply gap'
+        : 'Average response pipeline';
 
     return (
         <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50 flex justify-end" onClick={onClose}>
@@ -377,6 +449,46 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
                 <div className="px-6 py-4">
                     {activeTab === 'transcript' && (
                         <div className="space-y-3">
+                            {handoffs.length > 0 && (
+                                <div className="rounded-xl border border-violet-200 bg-violet-50 p-4">
+                                    <div className="mb-3 flex items-center gap-2">
+                                        <ArrowRightLeft className="h-4 w-4 text-violet-600" />
+                                        <h4 className="text-sm font-semibold text-violet-900">Agent Handoffs</h4>
+                                    </div>
+                                    <div className="space-y-3">
+                                        {handoffs.map((handoff, index) => {
+                                            const memoryKeys = Object.entries(handoff.caller_memory || {})
+                                                .filter(([, value]) => value !== null && value !== '')
+                                                .map(([key]) => key);
+                                            return (
+                                                <div key={`${handoff.timestamp || 'handoff'}-${index}`} className="rounded-lg border border-violet-200 bg-white p-3">
+                                                    <div className="flex flex-wrap items-center gap-2 text-sm text-gray-800">
+                                                        <span className="font-medium">{handoff.source_agent_name || 'Current Agent'}</span>
+                                                        <ChevronRight className="h-4 w-4 text-violet-400" />
+                                                        <span className="font-medium">{handoff.target_agent_name || `Agent #${handoff.target_agent_id}`}</span>
+                                                        <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-700">
+                                                            {handoff.tool_name || 'agent_transfer'}
+                                                        </span>
+                                                    </div>
+                                                    <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-gray-500">
+                                                        <span>{formatHandoffVersion(handoff)}</span>
+                                                        <span>{formatTime(handoff.timestamp || null)}</span>
+                                                        <span>Same call continued</span>
+                                                    </div>
+                                                    {handoff.handoff_summary && (
+                                                        <p className="mt-2 text-sm text-gray-700">{handoff.handoff_summary}</p>
+                                                    )}
+                                                    {memoryKeys.length > 0 && (
+                                                        <p className="mt-2 text-xs text-gray-500">
+                                                            Preserved caller context: {memoryKeys.join(', ')}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            )}
                             {transcript.length === 0 ? (
                                 <div className="text-center py-8">
                                     <MessageSquare className="w-10 h-10 text-gray-300 mx-auto mb-2" />
@@ -384,40 +496,59 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
                                     <p className="text-gray-400 text-xs mt-1">Transcripts are stored when a call is made</p>
                                 </div>
                             ) : (
-                                transcript.map((entry, i) => (
-                                    <div
-                                        key={i}
-                                        className={`flex gap-3 ${entry.role === 'agent' ? '' : 'flex-row-reverse'}`}
-                                    >
-                                        <div className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 ${entry.role === 'agent' ? 'bg-violet-100' : 'bg-blue-100'
-                                            }`}>
-                                            {entry.role === 'agent' ? (
-                                                <Bot className="w-3.5 h-3.5 text-violet-600" />
-                                            ) : (
-                                                <Mic className="w-3.5 h-3.5 text-blue-600" />
-                                            )}
-                                        </div>
-                                        <div className={`max-w-[80%] ${entry.role === 'agent' ? '' : 'text-right'}`}>
-                                            <div className={`inline-block px-3 py-2 rounded-2xl text-sm ${entry.role === 'agent'
-                                                ? 'bg-gray-100 text-gray-800 rounded-tl-sm'
-                                                : 'bg-violet-500 text-white rounded-tr-sm'
+                                transcript.map((entry, i) => {
+                                    const isAgentMessage = isAgentTranscriptRole(entry.role);
+                                    const isUserMessage = isUserTranscriptRole(entry.role);
+                                    if (!isAgentMessage && !isUserMessage) {
+                                        return (
+                                            <div key={i} className="flex justify-center">
+                                                <div className="w-full max-w-[92%] rounded-xl border border-amber-200 bg-amber-50 px-3 py-2">
+                                                    <div className="flex flex-wrap items-center gap-2 text-[11px] font-medium uppercase tracking-wide text-amber-700">
+                                                        <Sparkles className="h-3.5 w-3.5" />
+                                                        <span>{formatTranscriptRoleLabel(entry.role)}</span>
+                                                        <span className="normal-case tracking-normal text-amber-600">{formatTime(entry.timestamp)}</span>
+                                                    </div>
+                                                    <p className="mt-1 whitespace-pre-wrap text-sm text-gray-700">{entry.content}</p>
+                                                </div>
+                                            </div>
+                                        );
+                                    }
+
+                                    return (
+                                        <div
+                                            key={i}
+                                            className={`flex gap-3 ${isAgentMessage ? '' : 'flex-row-reverse'}`}
+                                        >
+                                            <div className={`w-7 h-7 rounded-full flex items-center justify-center flex-shrink-0 ${isAgentMessage ? 'bg-violet-100' : 'bg-blue-100'
                                                 }`}>
-                                                {entry.content}
+                                                {isAgentMessage ? (
+                                                    <Bot className="w-3.5 h-3.5 text-violet-600" />
+                                                ) : (
+                                                    <Mic className="w-3.5 h-3.5 text-blue-600" />
+                                                )}
                                             </div>
-                                            <div className="flex items-center gap-2 mt-0.5 px-1">
-                                                <span className="text-[10px] text-gray-400">
-                                                    {formatTime(entry.timestamp)}
-                                                </span>
-                                                {entry.latency?.stt_ms && (
-                                                    <span className="text-[10px] text-gray-400">STT: {entry.latency.stt_ms}ms</span>
-                                                )}
-                                                {entry.latency?.llm_ms && (
-                                                    <span className="text-[10px] text-gray-400">LLM: {entry.latency.llm_ms}ms</span>
-                                                )}
+                                            <div className={`max-w-[80%] ${isAgentMessage ? '' : 'text-right'}`}>
+                                                <div className={`inline-block px-3 py-2 rounded-2xl text-sm ${isAgentMessage
+                                                    ? 'bg-gray-100 text-gray-800 rounded-tl-sm'
+                                                    : 'bg-violet-500 text-white rounded-tr-sm'
+                                                    }`}>
+                                                    {entry.content}
+                                                </div>
+                                                <div className="mt-0.5 flex items-center gap-2 px-1">
+                                                    <span className="text-[10px] text-gray-400">
+                                                        {formatTime(entry.timestamp)}
+                                                    </span>
+                                                    {entry.latency?.stt_ms && (
+                                                        <span className="text-[10px] text-gray-400">STT: {entry.latency.stt_ms}ms</span>
+                                                    )}
+                                                    {entry.latency?.llm_ms && (
+                                                        <span className="text-[10px] text-gray-400">LLM: {entry.latency.llm_ms}ms</span>
+                                                    )}
+                                                </div>
                                             </div>
                                         </div>
-                                    </div>
-                                ))
+                                    );
+                                })
                             )}
                         </div>
                     )}
@@ -497,10 +628,25 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
                                     Average Latency
                                 </h4>
                                 <div className="space-y-3">
+                                    <div className="bg-white rounded-lg p-3 border border-gray-100">
+                                        <div className="flex items-center justify-between mb-2">
+                                            <span className="text-sm text-gray-600 flex items-center gap-2">
+                                                <Zap className="w-3.5 h-3.5 text-yellow-500" />
+                                                {latencyHeadlineLabel}
+                                            </span>
+                                            <span className="text-sm font-bold text-gray-900">
+                                                {formatLatency(latencyHeadlineMs)}
+                                            </span>
+                                        </div>
+                                        <p className="text-[10px] text-gray-400">
+                                            Source: {latencySourceLabel(latency.source)}
+                                            {latency.total_p95_ms ? ` • P95 ${formatLatency(latency.total_p95_ms)}` : ''}
+                                        </p>
+                                    </div>
                                     {[ 
                                         { label: isXaiUnified ? 'Input Speech' : 'STT (Deepgram)', value: latency.stt_avg_ms, p95: latency.stt_p95_ms, color: 'blue', icon: Mic },
                                         { label: 'LLM', value: latency.llm_avg_ms, p95: latency.llm_p95_ms, color: 'purple', icon: Cpu },
-                                        { label: isXaiUnified ? 'Voice Output (xAI)' : `TTS (${ttsProviderLabel})`, value: latency.tts_avg_ms, p95: null, color: 'teal', icon: Volume2 },
+                                        { label: isXaiUnified ? 'Voice Output (xAI)' : `TTS (${ttsProviderLabel})`, value: latency.tts_avg_ms, p95: latency.tts_p95_ms || null, color: 'teal', icon: Volume2 },
                                     ].map(item => (
                                         <div key={item.label} className="bg-white rounded-lg p-3 border border-gray-100">
                                             <div className="flex items-center justify-between mb-2">
@@ -748,6 +894,7 @@ export default function CallHistoryPage() {
                                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Direction</th>
                                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
                                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Duration</th>
+                                        <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Latency</th>
                                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Cost</th>
                                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
                                         <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider"></th>
@@ -789,6 +936,14 @@ export default function CallHistoryPage() {
                                             </td>
                                             <td className="px-4 py-3">
                                                 <span className="text-sm text-gray-700">{formatDuration(call.duration_seconds)}</span>
+                                            </td>
+                                            <td className="px-4 py-3">
+                                                <div>
+                                                    <span className="text-sm text-gray-700">{formatLatency(call.latency_ms)}</span>
+                                                    <p className="text-[10px] text-gray-400 mt-0.5">
+                                                        {latencySourceLabel(call.latency_source)}
+                                                    </p>
+                                                </div>
                                             </td>
                                             <td className="px-4 py-3">
                                                 <span className="text-sm font-medium text-green-600">{formatCost(call.cost_usd)}</span>

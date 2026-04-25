@@ -1087,13 +1087,50 @@ OPENAI_MAX_COMPLETION_TOKENS=220
   - a snapshot of the saved agent config at publish time
 - The editor header now shows the latest published version and the next publish button label as `Publish vN`.
 
+### Agent Transfer Tools (April 25, 2026)
+- Added a new Retell-style `agent_transfer` system function that is separate from the existing `transfer_call` phone-number handoff.
+- `transfer_call` is still only for sending the caller to another phone number. It was not repurposed.
+- `agent_transfer` now lives in the normal **Functions** area, so one agent can create multiple named handoff tools such as:
+  - `billing_handoff`
+  - `booking_handoff`
+  - `spanish_handoff`
+- Each `agent_transfer` tool stores:
+  - a user-defined tool `name`
+  - a user-defined `description`
+  - `method: SYSTEM`
+  - `url: builtin://agent_transfer`
+  - `system_config.target_agent_id`
+  - `system_config.target_version_mode` (`latest` or `pinned`)
+  - optional `system_config.target_version`
+- Published agent snapshots now include function snapshots too, so a pinned transfer target can resolve a specific published version.
+- Runtime behavior:
+  - v1 is **phone-call-only**
+  - when the prompt calls one of these transfer tools, the live worker swaps to the target agent with `AgentSession.update_agent(...)`
+  - the target agent uses its own prompt, greeting, language, voice, and tools
+  - recent conversation, runtime vars, and caller memory are passed across so the caller does not need to repeat known details
+  - the target agent is instructed to greet normally in its own style, but not re-ask already-known facts unless they are missing or unclear
+- Test-chat/webcall behavior:
+  - `agent_transfer` returns a clear phone-only result instead of pretending the handoff worked
+- Call history behavior:
+  - the same call record continues
+  - call details now include an `handoffs` timeline with source agent, target agent, tool name, version info, summary, and preserved caller-memory keys
+- Frontend/editor behavior:
+  - the agent editor has a dedicated **Agent Transfer** function modal
+  - the target is chosen from existing agents via dropdown
+  - version mode supports `Latest` or a pinned published snapshot
+  - these transfer tools appear in the configured function list alongside webhook functions
+  - the old built-in `transfer_call` / `end_call` cards remain separate
+
 ### Deployment And VPS Update
 - The deployment guide was updated to reflect the real hybrid production model:
   - frontend/backend managed on the VPS with PM2
   - voice/media stack managed with Docker Compose
 - The deployment section now explicitly mentions the SSH key:
   - [`livekit-company-key.pem`](livekit-company-key.pem)
-- Backend and worker code were synced to the VPS and restarted successfully during verification.
+- The currently verified VPS process layout is:
+  - frontend dashboard: `nextjs` under `sudo pm2`, running from `/var/www/html`
+  - backend API: `api` under PM2, running from `~/livekit-dashboard-api`
+  - voice runtime: Docker Compose stack in `~/livekit-agent`, with container `voice-agent`
 - Current VPS frontend expectation:
   - only one production dashboard port should remain active
   - the current live dashboard is expected on PM2/Nginx through port `3001`
@@ -1138,15 +1175,17 @@ OPENAI_MAX_COMPLETION_TOKENS=220
   - `python -m py_compile backend/main.py agent_retell.py`
   - `npx tsc --noEmit`
   - `npm run build`
-  - backend sanity check with temporary SQLite import context:
+  - custom function JSON/form editor still builds after the new system-function additions
+- backend sanity check with temporary SQLite import context:
     - `get_tts_models('xai')`
     - `get_tts_voices('xai')`
     - `lookup_tts_voice('xai', 'eve')`
 - Remote/VPS verification completed with command-line checks:
-  - `curl http://127.0.0.1:8000/api/agents/21`
-  - `curl http://127.0.0.1:8000/api/token/21`
+  - `curl http://127.0.0.1:8000/health`
+  - `pm2 status api`
+  - `sudo pm2 status nextjs`
+  - `docker logs --tail 80 voice-agent`
   - `curl http://127.0.0.1:8000/api/call-history/<call_id>/details`
-  - `docker compose up -d --build voice-agent`
 
 ### Last Webcall Verification
 - Recent agent `21` webcalls on April 20, 2026 were verified to use ElevenLabs v3, not v2.5:

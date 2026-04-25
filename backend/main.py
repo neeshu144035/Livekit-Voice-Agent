@@ -432,6 +432,10 @@ AGENT_PUBLISHED_VERSIONS_KEY = "published_versions"
 AGENT_LAST_PUBLISHED_VERSION_KEY = "last_published_version"
 AGENT_LAST_PUBLISHED_AT_KEY = "last_published_at"
 MAX_AGENT_PUBLISHED_VERSIONS = 25
+SYSTEM_FUNCTION_META_KEY = "__system_function_meta__"
+SYSTEM_FUNCTION_AGENT_TRANSFER = "agent_transfer"
+SYSTEM_FUNCTION_TARGET_VERSION_LATEST = "latest"
+SYSTEM_FUNCTION_TARGET_VERSION_PINNED = "pinned"
 
 
 def get_elevenlabs_api_key() -> Optional[str]:
@@ -478,6 +482,167 @@ def normalize_voice_runtime_mode(mode: Optional[str], provider: Optional[str]) -
 
 def ensure_custom_params(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return dict(data or {})
+
+
+def _normalize_system_function_type(value: Any) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _normalize_tool_identifier(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _extract_function_system_meta(raw_variables: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    variables = raw_variables if isinstance(raw_variables, dict) else {}
+    meta = variables.get(SYSTEM_FUNCTION_META_KEY)
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _strip_function_system_meta(raw_variables: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    variables = ensure_custom_params(raw_variables)
+    variables.pop(SYSTEM_FUNCTION_META_KEY, None)
+    return variables
+
+
+def _build_function_storage_variables(
+    variables: Optional[Dict[str, Any]] = None,
+    *,
+    system_type: Optional[str] = None,
+    system_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    next_variables = _strip_function_system_meta(variables)
+    normalized_system_type = _normalize_system_function_type(system_type)
+    if normalized_system_type:
+        next_variables[SYSTEM_FUNCTION_META_KEY] = {
+            "system_type": normalized_system_type,
+            "system_config": ensure_custom_params(system_config),
+        }
+    return next_variables
+
+
+def _serialize_function_row(row: "FunctionModel") -> Dict[str, Any]:
+    system_meta = _extract_function_system_meta(row.variables)
+    system_type = _normalize_system_function_type(system_meta.get("system_type"))
+    return {
+        "id": row.id,
+        "agent_id": row.agent_id,
+        "name": row.name,
+        "description": row.description,
+        "method": row.method,
+        "url": row.url,
+        "timeout_ms": row.timeout_ms,
+        "headers": row.headers or {},
+        "query_params": row.query_params or {},
+        "parameters_schema": row.parameters_schema or {},
+        "variables": _strip_function_system_meta(row.variables),
+        "system_type": system_type or None,
+        "system_config": ensure_custom_params(system_meta.get("system_config")) if system_type else None,
+        "is_system": bool(system_type),
+        "speak_during_execution": row.speak_during_execution,
+        "speak_after_execution": row.speak_after_execution,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def _normalize_agent_transfer_system_config(
+    raw_config: Any,
+    *,
+    source_agent_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
+    config = raw_config if isinstance(raw_config, dict) else {}
+    try:
+        target_agent_id = int(config.get("target_agent_id"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Agent transfer requires a valid target_agent_id")
+
+    if source_agent_id and target_agent_id == source_agent_id:
+        raise HTTPException(status_code=400, detail="Agent transfer target cannot be the same as the current agent")
+
+    target_version_mode = str(
+        config.get("target_version_mode") or SYSTEM_FUNCTION_TARGET_VERSION_LATEST
+    ).strip().lower()
+    if target_version_mode not in {
+        SYSTEM_FUNCTION_TARGET_VERSION_LATEST,
+        SYSTEM_FUNCTION_TARGET_VERSION_PINNED,
+    }:
+        raise HTTPException(status_code=400, detail="target_version_mode must be 'latest' or 'pinned'")
+
+    target_version: Optional[int] = None
+    raw_target_version = config.get("target_version")
+    if target_version_mode == SYSTEM_FUNCTION_TARGET_VERSION_PINNED:
+        try:
+            target_version = int(raw_target_version)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Pinned agent transfer requires a valid target_version")
+        if target_version <= 0:
+            raise HTTPException(status_code=400, detail="Pinned target_version must be greater than 0")
+
+    if db is not None:
+        target_agent = db.query(AgentModel).filter(AgentModel.id == target_agent_id).first()
+        if not target_agent:
+            raise HTTPException(status_code=400, detail="Target agent not found")
+        if target_version_mode == SYSTEM_FUNCTION_TARGET_VERSION_PINNED:
+            custom_params = ensure_custom_params(target_agent.custom_params)
+            versions = _normalize_agent_published_versions(custom_params.get(AGENT_PUBLISHED_VERSIONS_KEY))
+            if not any(int(entry.get("version", 0)) == target_version for entry in versions):
+                raise HTTPException(status_code=400, detail="Pinned target_version was not found on the target agent")
+
+    normalized = {
+        "target_agent_id": target_agent_id,
+        "target_version_mode": target_version_mode,
+    }
+    if target_version_mode == SYSTEM_FUNCTION_TARGET_VERSION_PINNED and target_version is not None:
+        normalized["target_version"] = target_version
+    return normalized
+
+
+def _validate_function_payload_or_400(
+    *,
+    agent_id: int,
+    function_name: str,
+    method: str,
+    url: str,
+    system_config: Optional[Dict[str, Any]],
+    db: Session,
+    function_id: Optional[int] = None,
+) -> tuple[str, str, Optional[str], Optional[Dict[str, Any]]]:
+    normalized_method = str(method or "").strip().upper()
+    normalized_url = str(url or "").strip()
+    normalized_name = _normalize_tool_identifier(function_name)
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="Function name must include at least one letter or number")
+
+    builtin_tool_names = {"transfer_call", "call_transfer", "end_call"}
+    if normalized_name in builtin_tool_names:
+        raise HTTPException(status_code=400, detail=f"Function name '{normalized_name}' is reserved")
+
+    duplicate_query = db.query(FunctionModel).filter(FunctionModel.agent_id == agent_id)
+    if function_id is not None:
+        duplicate_query = duplicate_query.filter(FunctionModel.id != function_id)
+    existing_rows = duplicate_query.all()
+    existing_names = {_normalize_tool_identifier(row.name) for row in existing_rows}
+    if normalized_name in existing_names:
+        raise HTTPException(status_code=400, detail=f"A function named '{normalized_name}' already exists on this agent")
+
+    system_type: Optional[str] = None
+    normalized_system_config: Optional[Dict[str, Any]] = None
+    if normalized_method == "SYSTEM":
+        system_type = _normalize_system_function_type(
+            normalized_url.replace("builtin://", "", 1) if normalized_url.startswith("builtin://") else normalized_url
+        )
+        if normalized_url != f"builtin://{SYSTEM_FUNCTION_AGENT_TRANSFER}" or system_type != SYSTEM_FUNCTION_AGENT_TRANSFER:
+            raise HTTPException(status_code=400, detail="Only builtin://agent_transfer is supported for SYSTEM functions")
+        normalized_system_config = _normalize_agent_transfer_system_config(
+            system_config,
+            source_agent_id=agent_id,
+            db=db,
+        )
+    elif system_config:
+        raise HTTPException(status_code=400, detail="system_config is only supported for SYSTEM functions")
+
+    return normalized_name, normalized_url, system_type, normalized_system_config
 
 
 def normalize_welcome_message_type(value: Optional[str]) -> str:
@@ -533,6 +698,11 @@ def _normalize_agent_published_versions(raw_versions: Any) -> List[Dict[str, Any
     return normalized
 
 
+def _build_agent_function_snapshots(agent: AgentModel, db: Session) -> List[Dict[str, Any]]:
+    rows = db.query(FunctionModel).filter(FunctionModel.agent_id == agent.id).order_by(FunctionModel.created_at.asc()).all()
+    return [_serialize_function_row(row) for row in rows]
+
+
 def build_agent_version_snapshot(agent: AgentModel, custom_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     tts = extract_agent_tts_settings(agent)
     snapshot_custom_params = _sanitize_agent_custom_params_for_snapshot(custom_params if custom_params is not None else agent.custom_params)
@@ -552,6 +722,7 @@ def build_agent_version_snapshot(agent: AgentModel, custom_params: Optional[Dict
         "enable_recording": agent.enable_recording,
         "webhook_url": agent.webhook_url,
         "custom_params": snapshot_custom_params,
+        "functions": [],
         "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
     }
 
@@ -562,11 +733,13 @@ def publish_agent_snapshot(agent: AgentModel, db: Session) -> Dict[str, Any]:
     highest_existing_version = max((entry.get("version", 0) for entry in existing_versions), default=0)
     next_version = highest_existing_version + 1
     published_at = datetime.utcnow().isoformat() + "Z"
+    snapshot = build_agent_version_snapshot(agent, custom_params)
+    snapshot["functions"] = _build_agent_function_snapshots(agent, db)
 
     new_entry = {
         "version": next_version,
         "published_at": published_at,
-        "snapshot": build_agent_version_snapshot(agent, custom_params),
+        "snapshot": snapshot,
     }
     next_versions = [new_entry, *existing_versions][:MAX_AGENT_PUBLISHED_VERSIONS]
     custom_params[AGENT_PUBLISHED_VERSIONS_KEY] = next_versions
@@ -1398,7 +1571,8 @@ class FunctionCreate(BaseModel):
     headers: Dict[str, str] = {}
     query_params: Dict[str, str] = {}
     parameters_schema: Dict[str, Any] = {}
-    variables: Dict[str, str] = {}
+    variables: Dict[str, Any] = {}
+    system_config: Optional[Dict[str, Any]] = None
     speak_during_execution: bool = False
     speak_after_execution: bool = True
 
@@ -1414,7 +1588,10 @@ class FunctionResponse(BaseModel):
     headers: Dict[str, str]
     query_params: Dict[str, str]
     parameters_schema: Dict[str, Any]
-    variables: Dict[str, str]
+    variables: Dict[str, Any]
+    system_type: Optional[str] = None
+    system_config: Optional[Dict[str, Any]] = None
+    is_system: bool = False
     speak_during_execution: bool
     speak_after_execution: bool
     created_at: datetime
@@ -2458,6 +2635,14 @@ class AgentTestChatRequest(BaseModel):
     start: bool = False
 
 
+class AgentHandoffContextRequest(BaseModel):
+    source_agent_id: Optional[int] = None
+    tool_name: str
+    target_agent_id: int
+    target_version_mode: str = SYSTEM_FUNCTION_TARGET_VERSION_LATEST
+    target_version: Optional[int] = None
+
+
 def _resolve_openai_client_for_agent_model(model_name: str):
     import openai
 
@@ -2477,24 +2662,31 @@ def _load_agent_runtime_functions(agent: AgentModel, db: Session) -> List[Dict[s
     runtime_functions: List[Dict[str, Any]] = []
 
     for row in rows:
+        serialized = _serialize_function_row(row)
         speak_during, speak_after = _normalize_tool_speech_flags(
             row.speak_during_execution,
             row.speak_after_execution,
             fallback_after=True,
         )
-        runtime_functions.append(
-            {
-                "name": row.name,
-                "description": row.description or "",
-                "url": row.url or "",
-                "method": (row.method or "POST").upper(),
-                "timeout_ms": int(row.timeout_ms or 120000),
-                "headers": row.headers or {},
-                "parameters_schema": row.parameters_schema or {"type": "object", "properties": {}},
-                "speak_during_execution": speak_during,
-                "speak_after_execution": speak_after,
-            }
-        )
+        runtime_entry = {
+            "name": row.name,
+            "description": row.description or "",
+            "url": row.url or "",
+            "method": (row.method or "POST").upper(),
+            "timeout_ms": int(row.timeout_ms or 120000),
+            "headers": row.headers or {},
+            "query_params": row.query_params or {},
+            "parameters_schema": row.parameters_schema or {"type": "object", "properties": {}},
+            "variables": serialized.get("variables") or {},
+            "is_system": bool(serialized.get("is_system")),
+            "system_type": serialized.get("system_type"),
+            "system_config": serialized.get("system_config") or None,
+            "speak_during_execution": speak_during,
+            "speak_after_execution": speak_after,
+        }
+        if runtime_entry["is_system"] and runtime_entry["system_type"] == SYSTEM_FUNCTION_AGENT_TRANSFER:
+            runtime_entry["parameters_schema"] = {"type": "object", "properties": {}}
+        runtime_functions.append(runtime_entry)
 
     custom_params = ensure_custom_params(agent.custom_params)
     builtin_cfg = custom_params.get("builtin_functions", {})
@@ -2651,6 +2843,183 @@ def _filter_runtime_functions_by_prompt(
             removed_names,
         )
     return filtered
+
+
+def _normalize_call_handoffs(raw_handoffs: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_handoffs, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in raw_handoffs:
+        if not isinstance(item, dict):
+            continue
+        normalized.append(dict(item))
+    return normalized
+
+
+def _recent_transcript_entries(
+    transcripts: List["TranscriptModel"],
+    *,
+    max_entries: int = 12,
+) -> List[Dict[str, Any]]:
+    window = transcripts[-max_entries:] if max_entries > 0 else transcripts
+    entries: List[Dict[str, Any]] = []
+    for item in window:
+        role = str(getattr(item, "role", "") or "").strip()
+        content = str(getattr(item, "content", "") or "").strip()
+        if not role or not content:
+            continue
+        entries.append(
+            {
+                "role": role,
+                "content": content,
+                "timestamp": item.timestamp.isoformat() if getattr(item, "timestamp", None) else None,
+            }
+        )
+    return entries
+
+
+def _extract_caller_memory(
+    call: CallModel,
+    transcripts: List["TranscriptModel"],
+) -> Dict[str, Any]:
+    metadata = ensure_custom_params(call.call_metadata)
+    runtime_vars = normalize_runtime_vars(metadata.get("runtime_vars"))
+    memory: Dict[str, Any] = {}
+    for key in (
+        "name",
+        "first_name",
+        "last_name",
+        "full_name",
+        "customer_name",
+        "user_name",
+        "email",
+        "phone",
+        "company_name",
+        "issue",
+        "problem",
+        "pain",
+        "reason",
+        "booking_id",
+        "order_id",
+    ):
+        value = runtime_vars.get(key)
+        if value not in (None, ""):
+            memory[key] = value
+
+    for transcript in transcripts:
+        role = str(getattr(transcript, "role", "") or "").strip().lower()
+        if role != "user":
+            continue
+        content = str(getattr(transcript, "content", "") or "").strip()
+        if not content:
+            continue
+
+        if "name" not in memory:
+            match = re.search(r"\b(?:my name is|i am|this is)\s+([A-Za-z][A-Za-z .'-]{1,60})", content, re.IGNORECASE)
+            if match:
+                memory["name"] = match.group(1).strip(" .,-")
+
+        if "email" not in memory:
+            match = re.search(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", content, re.IGNORECASE)
+            if match:
+                memory["email"] = match.group(0)
+
+        if "issue" not in memory and len(content.split()) >= 5:
+            lowered = content.lower()
+            if any(token in lowered for token in ("issue", "problem", "help", "pain", "need", "trouble", "billing", "booking", "appointment")):
+                memory["issue"] = content[:240]
+
+    if call.from_number and "phone" not in memory:
+        memory["phone"] = call.from_number
+    return memory
+
+
+def _build_handoff_summary(
+    *,
+    source_agent_name: str,
+    target_agent_name: str,
+    caller_memory: Dict[str, Any],
+    recent_transcript: List[Dict[str, Any]],
+) -> str:
+    pieces: List[str] = []
+    if caller_memory.get("name"):
+        pieces.append(f"Caller name: {caller_memory.get('name')}")
+    if caller_memory.get("company_name"):
+        pieces.append(f"Company: {caller_memory.get('company_name')}")
+    if caller_memory.get("issue"):
+        pieces.append(f"Current issue: {caller_memory.get('issue')}")
+
+    user_lines = [
+        entry.get("content", "")
+        for entry in recent_transcript
+        if str(entry.get("role", "")).strip().lower() == "user" and entry.get("content")
+    ]
+    if user_lines:
+        pieces.append(f"Recent caller context: {' | '.join(user_lines[-3:])[:400]}")
+
+    if not pieces:
+        pieces.append("Continue the current call without re-asking for already-known details.")
+
+    return f"Handoff from {source_agent_name or 'source agent'} to {target_agent_name or 'target agent'}. " + " ".join(pieces)
+
+
+def _resolve_agent_transfer_target_snapshot(
+    db: Session,
+    *,
+    target_agent_id: int,
+    target_version_mode: str,
+    target_version: Optional[int] = None,
+) -> Dict[str, Any]:
+    target_agent = db.query(AgentModel).filter(AgentModel.id == target_agent_id).first()
+    if not target_agent:
+        raise HTTPException(status_code=404, detail="Target agent not found")
+
+    normalized_mode = str(target_version_mode or SYSTEM_FUNCTION_TARGET_VERSION_LATEST).strip().lower()
+    if normalized_mode == SYSTEM_FUNCTION_TARGET_VERSION_PINNED:
+        custom_params = ensure_custom_params(target_agent.custom_params)
+        versions = _normalize_agent_published_versions(custom_params.get(AGENT_PUBLISHED_VERSIONS_KEY))
+        if target_version is None:
+            raise HTTPException(status_code=400, detail="Pinned target_version is required")
+        selected_entry = next((entry for entry in versions if int(entry.get("version", 0)) == int(target_version)), None)
+        if not selected_entry:
+            raise HTTPException(status_code=404, detail="Pinned target version not found")
+        snapshot = selected_entry.get("snapshot") if isinstance(selected_entry.get("snapshot"), dict) else {}
+        functions_snapshot = snapshot.get("functions")
+        if not isinstance(functions_snapshot, list):
+            raise HTTPException(
+                status_code=400,
+                detail="Pinned target version does not include function snapshot data. Republish the target agent first.",
+            )
+        return {
+            "agent_id": target_agent.id,
+            "name": snapshot.get("name") or target_agent.name,
+            "display_name": snapshot.get("name") or target_agent.name,
+            "agent_name": snapshot.get("agent_name") or target_agent.agent_name,
+            "system_prompt": snapshot.get("system_prompt") or target_agent.system_prompt,
+            "llm_model": snapshot.get("llm_model") or target_agent.llm_model,
+            "voice": snapshot.get("voice") or target_agent.voice,
+            "tts_provider": snapshot.get("tts_provider") or extract_agent_tts_settings(target_agent)["tts_provider"],
+            "tts_model": snapshot.get("tts_model") or extract_agent_tts_settings(target_agent)["tts_model"],
+            "language": snapshot.get("language") or target_agent.language,
+            "welcome_message_type": snapshot.get("welcome_message_type") or target_agent.welcome_message_type,
+            "welcome_message": snapshot.get("welcome_message") or target_agent.welcome_message,
+            "max_call_duration": snapshot.get("max_call_duration") or target_agent.max_call_duration,
+            "enable_recording": snapshot.get("enable_recording") if snapshot.get("enable_recording") is not None else target_agent.enable_recording,
+            "webhook_url": snapshot.get("webhook_url") or target_agent.webhook_url,
+            "custom_params": ensure_custom_params(snapshot.get("custom_params")),
+            "functions": functions_snapshot,
+            "resolved_version_mode": SYSTEM_FUNCTION_TARGET_VERSION_PINNED,
+            "resolved_version": int(selected_entry.get("version", 0)),
+            "published_at": selected_entry.get("published_at"),
+        }
+
+    latest_payload = serialize_agent(target_agent)
+    latest_payload["functions"] = _load_agent_runtime_functions(target_agent, db)
+    latest_payload["resolved_version_mode"] = SYSTEM_FUNCTION_TARGET_VERSION_LATEST
+    latest_payload["resolved_version"] = ensure_custom_params(target_agent.custom_params).get(
+        AGENT_LAST_PUBLISHED_VERSION_KEY
+    )
+    return latest_payload
 
 
 def _is_missing_runtime_arg(value: Any) -> bool:
@@ -2829,6 +3198,17 @@ async def _execute_agent_runtime_tool(func_cfg: Dict[str, Any], args: Dict[str, 
             "action": "transfer_call",
             "phone_number": target_phone,
             "status": "test_chat_simulated",
+        }
+
+    if tool_name == SYSTEM_FUNCTION_AGENT_TRANSFER:
+        system_config = ensure_custom_params(func_cfg.get("system_config"))
+        target_agent_id = system_config.get("target_agent_id")
+        return {
+            "success": False,
+            "action": SYSTEM_FUNCTION_AGENT_TRANSFER,
+            "target_agent_id": target_agent_id,
+            "error": "agent_transfer is only supported during live phone calls",
+            "status": "phone_only",
         }
 
     if tool_name == "end_call":
@@ -3231,6 +3611,61 @@ async def add_transcript(call_id: str, entry: TranscriptEntry, db: Session = Dep
     return {"message": "Transcript added"}
 
 
+@app.post("/api/calls/{call_id}/agent-handoff-context")
+async def build_agent_handoff_context(
+    call_id: str,
+    request: AgentHandoffContextRequest,
+    db: Session = Depends(get_database),
+):
+    call = db.query(CallModel).filter(CallModel.call_id == call_id).first()
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    normalized_config = _normalize_agent_transfer_system_config(
+        {
+            "target_agent_id": request.target_agent_id,
+            "target_version_mode": request.target_version_mode,
+            "target_version": request.target_version,
+        },
+        source_agent_id=request.source_agent_id or call.agent_id,
+        db=db,
+    )
+
+    target_payload = _resolve_agent_transfer_target_snapshot(
+        db,
+        target_agent_id=normalized_config["target_agent_id"],
+        target_version_mode=normalized_config["target_version_mode"],
+        target_version=normalized_config.get("target_version"),
+    )
+    source_agent = db.query(AgentModel).filter(AgentModel.id == (request.source_agent_id or call.agent_id)).first()
+    transcripts = db.query(TranscriptModel).filter(
+        TranscriptModel.call_id == call_id
+    ).order_by(TranscriptModel.timestamp).all()
+    recent_transcript = _recent_transcript_entries(transcripts)
+    caller_memory = _extract_caller_memory(call, transcripts)
+    handoff_summary = _build_handoff_summary(
+        source_agent_name=source_agent.name if source_agent else "Source Agent",
+        target_agent_name=str(target_payload.get("name") or "Target Agent"),
+        caller_memory=caller_memory,
+        recent_transcript=recent_transcript,
+    )
+
+    return {
+        "call_id": call_id,
+        "tool_name": request.tool_name,
+        "source_agent": {
+            "id": source_agent.id if source_agent else call.agent_id,
+            "name": source_agent.name if source_agent else f"Agent {call.agent_id}",
+        },
+        "target_agent": target_payload,
+        "handoff_summary": handoff_summary,
+        "caller_memory": caller_memory,
+        "recent_transcript": recent_transcript,
+        "runtime_vars": normalize_runtime_vars(ensure_custom_params(call.call_metadata).get("runtime_vars")),
+        "metadata": ensure_custom_params(call.call_metadata),
+    }
+
+
 @app.get("/api/token/{agent_id}")
 async def get_token(agent_id: int, db: Session = Depends(get_database)):
     agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
@@ -3447,7 +3882,7 @@ async def get_webhook_logs(call_id: Optional[str] = None, event_type: Optional[s
 
 @app.post("/api/calls/{call_id}/builtin-action")
 async def execute_builtin_action(call_id: str, action: dict, db: Session = Depends(get_database)):
-    """Execute a built-in system action (end_call, transfer_call)"""
+    """Execute a built-in system action (end_call, transfer_call, agent_transfer)"""
     call = db.query(CallModel).filter(CallModel.call_id == call_id).first()
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
@@ -3484,6 +3919,55 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
             "call_id": call_id,
             "transfer_to": phone_number,
             "message": f"Call transfer initiated to {phone_number}"
+        }
+
+    elif action_type == SYSTEM_FUNCTION_AGENT_TRANSFER:
+        normalized_config = _normalize_agent_transfer_system_config(
+            {
+                "target_agent_id": params.get("target_agent_id"),
+                "target_version_mode": params.get("target_version_mode"),
+                "target_version": params.get("target_version"),
+            },
+            source_agent_id=params.get("source_agent_id") or call.agent_id,
+            db=db,
+        )
+        target_payload = _resolve_agent_transfer_target_snapshot(
+            db,
+            target_agent_id=normalized_config["target_agent_id"],
+            target_version_mode=normalized_config["target_version_mode"],
+            target_version=normalized_config.get("target_version"),
+        )
+        metadata = ensure_custom_params(call.call_metadata)
+        handoffs = _normalize_call_handoffs(metadata.get("agent_handoffs"))
+        handoff_event = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "tool_name": str(params.get("tool_name") or "").strip(),
+            "source_agent_id": params.get("source_agent_id") or call.agent_id,
+            "source_agent_name": str(params.get("source_agent_name") or "").strip() or None,
+            "target_agent_id": normalized_config["target_agent_id"],
+            "target_agent_name": target_payload.get("name"),
+            "target_version_mode": normalized_config["target_version_mode"],
+            "target_version": normalized_config.get("target_version"),
+            "resolved_version": target_payload.get("resolved_version"),
+            "handoff_summary": str(params.get("handoff_summary") or "").strip(),
+            "caller_memory": ensure_custom_params(params.get("caller_memory")),
+            "recent_transcript": params.get("recent_transcript") if isinstance(params.get("recent_transcript"), list) else [],
+        }
+        handoffs.append(handoff_event)
+        metadata["agent_handoffs"] = handoffs
+        metadata["active_agent_id"] = normalized_config["target_agent_id"]
+        metadata["active_agent_name"] = target_payload.get("name")
+        metadata["last_agent_handoff_at"] = handoff_event["timestamp"]
+        call.call_metadata = metadata
+        flag_modified(call, "call_metadata")
+        db.commit()
+
+        return {
+            "success": True,
+            "action": SYSTEM_FUNCTION_AGENT_TRANSFER,
+            "call_id": call_id,
+            "handoff": handoff_event,
+            "message": f"Agent transfer initiated to {target_payload.get('name')}",
         }
     
     else:
@@ -3552,11 +4036,20 @@ async def create_function(agent_id: int, function: FunctionCreate, db: Session =
     agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    
-    valid_methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
+
+    valid_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "SYSTEM"]
     if function.method.upper() not in valid_methods:
         raise HTTPException(status_code=400, detail=f"Invalid method. Must be one of: {', '.join(valid_methods)}")
-    
+
+    _, normalized_url, system_type, normalized_system_config = _validate_function_payload_or_400(
+        agent_id=agent_id,
+        function_name=function.name,
+        method=function.method,
+        url=function.url,
+        system_config=function.system_config,
+        db=db,
+    )
+
     speak_during_execution, speak_after_execution = _validate_tool_speech_flags_or_400(
         function.speak_during_execution,
         function.speak_after_execution,
@@ -3567,19 +4060,23 @@ async def create_function(agent_id: int, function: FunctionCreate, db: Session =
         name=function.name,
         description=function.description,
         method=function.method.upper(),
-        url=function.url,
+        url=normalized_url,
         timeout_ms=function.timeout_ms,
         headers=function.headers,
         query_params=function.query_params,
-        parameters_schema=function.parameters_schema,
-        variables=function.variables,
+        parameters_schema=function.parameters_schema if function.method.upper() != "SYSTEM" else {"type": "object", "properties": {}},
+        variables=_build_function_storage_variables(
+            function.variables,
+            system_type=system_type,
+            system_config=normalized_system_config,
+        ),
         speak_during_execution=speak_during_execution,
         speak_after_execution=speak_after_execution,
     )
     db.add(db_function)
     db.commit()
     db.refresh(db_function)
-    return db_function
+    return _serialize_function_row(db_function)
 
 
 @app.get("/api/agents/{agent_id}/functions", response_model=List[FunctionResponse])
@@ -3587,8 +4084,9 @@ async def list_functions(agent_id: int, db: Session = Depends(get_database)):
     agent = db.query(AgentModel).filter(AgentModel.id == agent_id).first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    
-    return db.query(FunctionModel).filter(FunctionModel.agent_id == agent_id).order_by(FunctionModel.created_at.desc()).all()
+
+    rows = db.query(FunctionModel).filter(FunctionModel.agent_id == agent_id).order_by(FunctionModel.created_at.desc()).all()
+    return [_serialize_function_row(row) for row in rows]
 
 
 @app.get("/api/agents/{agent_id}/builtin-functions")
@@ -3751,8 +4249,8 @@ async def get_function(agent_id: int, function_id: int, db: Session = Depends(ge
     
     if not function:
         raise HTTPException(status_code=404, detail="Function not found")
-    
-    return function
+
+    return _serialize_function_row(function)
 
 
 @app.patch("/api/agents/{agent_id}/functions/{function_id}", response_model=FunctionResponse)
@@ -3769,9 +4267,19 @@ async def update_function(agent_id: int, function_id: int, function_update: Func
     if not function:
         raise HTTPException(status_code=404, detail="Function not found")
     
-    valid_methods = ["GET", "POST", "PUT", "DELETE", "PATCH"]
+    valid_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "SYSTEM"]
     if function_update.method and function_update.method.upper() not in valid_methods:
         raise HTTPException(status_code=400, detail=f"Invalid method. Must be one of: {', '.join(valid_methods)}")
+
+    _, normalized_url, system_type, normalized_system_config = _validate_function_payload_or_400(
+        agent_id=agent_id,
+        function_name=function_update.name,
+        method=function_update.method,
+        url=function_update.url,
+        system_config=function_update.system_config,
+        db=db,
+        function_id=function_id,
+    )
 
     speak_during_execution, speak_after_execution = _validate_tool_speech_flags_or_400(
         function_update.speak_during_execution,
@@ -3782,6 +4290,18 @@ async def update_function(agent_id: int, function_id: int, function_update: Func
         if value is not None:
             if field == "method":
                 value = value.upper()
+            if field == "url":
+                value = normalized_url
+            if field == "parameters_schema" and function_update.method.upper() == "SYSTEM":
+                value = {"type": "object", "properties": {}}
+            if field == "variables":
+                value = _build_function_storage_variables(
+                    function_update.variables,
+                    system_type=system_type,
+                    system_config=normalized_system_config,
+                )
+            if field == "system_config":
+                continue
             setattr(function, field, value)
 
     function.speak_during_execution = speak_during_execution
@@ -3790,7 +4310,7 @@ async def update_function(agent_id: int, function_id: int, function_update: Func
     function.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(function)
-    return function
+    return _serialize_function_row(function)
 
 
 @app.delete("/api/agents/{agent_id}/functions/{function_id}")
@@ -5198,6 +5718,8 @@ async def get_call_details(call_id: str, db: Session = Depends(get_database)):
         TranscriptModel.call_id == call_id
     ).order_by(TranscriptModel.timestamp).all()
     latency_summary = _summarize_call_latency(transcripts)
+    metadata = ensure_custom_params(call.call_metadata)
+    handoffs = _normalize_call_handoffs(metadata.get("agent_handoffs"))
     
     return {
         "call": {
@@ -5246,6 +5768,7 @@ async def get_call_details(call_id: str, db: Session = Depends(get_database)):
             "total_p95_ms": latency_summary["total_p95_ms"],
             "source": latency_summary["source"],
         },
+        "handoffs": handoffs,
         "transcript": [
             {
                 "role": t.role,
@@ -5261,7 +5784,7 @@ async def get_call_details(call_id: str, db: Session = Depends(get_database)):
             }
             for t in transcripts
         ],
-        "metadata": call.call_metadata,
+        "metadata": metadata,
     }
 
 

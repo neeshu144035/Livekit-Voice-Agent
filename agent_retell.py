@@ -1319,6 +1319,146 @@ async def report_builtin_action(call_id: str, action: str, parameters: Dict[str,
         return {"success": False, "error": str(e)}
 
 
+async def fetch_agent_handoff_context(call_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not call_id:
+        return {"success": False, "error": "Missing call_id"}
+    try:
+        resp = await get_dashboard_api_client().post(
+            f"{DASHBOARD_API_URL}/api/calls/{call_id}/agent-handoff-context",
+            json=payload,
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            return {"success": False, "error": "Invalid handoff context response"}
+        data["success"] = True
+        return data
+    except Exception as e:
+        logger.error(f"Error fetching handoff context for {call_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def merge_builtin_functions_into_runtime(
+    functions: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    runtime_functions = list(functions or [])
+    existing_names = {
+        _normalize_tool_name(entry.get("name", ""))
+        for entry in runtime_functions
+        if entry.get("name")
+    }
+    custom_params = config.get("custom_params", {}) or {}
+    builtin_funcs = custom_params.get("builtin_functions", {}) or {}
+
+    if builtin_funcs.get('builtin_transfer_call', {}).get('enabled') and "transfer_call" not in existing_names:
+        transfer_entry = builtin_funcs['builtin_transfer_call']
+        transfer_cfg = transfer_entry.get('config', {})
+        phone_number = transfer_cfg.get('phone_number', '')
+        transfer_speak_during, transfer_speak_after = _normalize_tool_speech_flags(
+            transfer_entry.get('speak_during_execution', True),
+            transfer_entry.get('speak_after_execution', False),
+            fallback_after=False,
+        )
+        if not transfer_speak_during and not transfer_speak_after:
+            transfer_speak_during, transfer_speak_after = True, False
+        runtime_functions.append({
+            'name': 'transfer_call',
+            'description': (
+                'Use ONLY when caller explicitly asks to transfer/escalate/connect to a human. '
+                'Do not call this for normal conversation.'
+            ),
+            'url': '',
+            'method': 'POST',
+            'parameters_schema': {
+                'type': 'object',
+                'properties': {
+                    'phone_number': {'type': 'string', 'description': 'Target phone number in E.164 format, e.g. +447123456789'}
+                },
+                'required': ['phone_number']
+            },
+            'phone_number': phone_number,
+            'speak_during_execution': transfer_speak_during,
+            'speak_after_execution': transfer_speak_after,
+        })
+        logger.info(f"Added builtin transfer_call function with phone: {phone_number}")
+        existing_names.add("transfer_call")
+
+    if builtin_funcs.get('builtin_end_call', {}).get('enabled') and "end_call" not in existing_names:
+        end_entry = builtin_funcs['builtin_end_call']
+        end_speak_during, end_speak_after = _normalize_tool_speech_flags(
+            end_entry.get('speak_during_execution', False),
+            end_entry.get('speak_after_execution', True),
+            fallback_after=True,
+        )
+        runtime_functions.append({
+            'name': 'end_call',
+            'description': 'Use ONLY when caller explicitly asks to end/stop/hang up.',
+            'url': '',
+            'method': 'POST',
+            'parameters_schema': {'type': 'object', 'properties': {}},
+            'speak_during_execution': end_speak_during,
+            'speak_after_execution': end_speak_after,
+        })
+        logger.info("Added builtin end_call function")
+        existing_names.add("end_call")
+
+    return runtime_functions
+
+
+def build_effective_runtime_prompt(
+    config: Dict[str, Any],
+    functions: List[Dict[str, Any]],
+    runtime_vars: Dict[str, Any],
+) -> tuple[str, List[Dict[str, Any]]]:
+    agent_lang = normalize_agent_language(config.get("language", "en-GB"))
+    tts_provider = normalize_tts_provider(config)
+    selected_tts_model = (
+        config.get("tts_model")
+        or (config.get("custom_params") or {}).get("tts_model")
+    )
+
+    sys_prompt = apply_runtime_template(
+        config.get("system_prompt", "You are a helpful voice assistant."),
+        runtime_vars,
+    )
+    language_instruction = build_language_enforcement_instruction(agent_lang)
+    if language_instruction:
+        sys_prompt += f"\n\n{language_instruction}"
+    tts_safety_instruction = build_tts_output_safety_instruction(tts_provider, selected_tts_model or "")
+    if tts_safety_instruction:
+        sys_prompt += f"\n\n{tts_safety_instruction}"
+    if tts_provider == "xai":
+        sys_prompt = adapt_system_prompt_for_xai(sys_prompt)
+        logger.info("Adapted saved prompt for xAI unified realtime voice")
+
+    logger.info(
+        "Loaded system prompt (len=%s): %s",
+        len(sys_prompt or ""),
+        (sys_prompt or "").replace("\n", " ")[:180],
+    )
+    filtered_functions = list(functions or [])
+    if STRICT_PROMPT_TOOL_FILTER:
+        initial_tool_count = len(filtered_functions)
+        filtered_functions = filter_functions_by_prompt(filtered_functions, sys_prompt)
+        logger.info(
+            "Prompt tool filter enabled: kept=%s removed=%s",
+            len(filtered_functions),
+            max(initial_tool_count - len(filtered_functions), 0),
+        )
+
+    tool_speech_guidance = build_tool_speech_guidance(filtered_functions)
+    if tool_speech_guidance:
+        sys_prompt = f"{sys_prompt}\n\n{tool_speech_guidance}" if sys_prompt else tool_speech_guidance
+        logger.info("Applied tool speech guidance block to runtime prompt")
+
+    if EMAIL_SPELLING_POLICY:
+        sys_prompt = f"{sys_prompt}\n\n{EMAIL_SPELLING_POLICY}" if sys_prompt else EMAIL_SPELLING_POLICY
+
+    return sys_prompt, filtered_functions
+
+
 def _normalize_phone(value: Optional[str]) -> str:
     if not value:
         return ""
@@ -1492,22 +1632,58 @@ def _get_room_participant_by_identity(room: Any, participant_identity: str) -> O
     return None
 
 
-def _participant_has_audio_track(participant: Any) -> bool:
-    publications = getattr(participant, "track_publications", None)
-    if not publications:
+def _participant_identity(participant: Any) -> str:
+    try:
+        return (getattr(participant, "identity", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _participant_is_sip(participant: Any) -> bool:
+    if not participant:
         return False
 
-    values = publications.values() if hasattr(publications, "values") else publications
-    for publication in values:
-        if getattr(publication, "track", None) is not None:
+    identity = _participant_identity(participant).lower()
+    if identity.startswith("sip_") or "sip" in identity:
+        return True
+
+    kind = str(getattr(participant, "kind", "") or "").lower()
+    if "sip" in kind:
+        return True
+
+    attrs = getattr(participant, "attributes", None) or {}
+    for key in (
+        "sip.callID",
+        "sip.callStatus",
+        "sip.trunkID",
+        "sip.phoneNumber",
+        "sip.twilio.callSid",
+    ):
+        if str(attrs.get(key, "") or "").strip():
             return True
 
-        kind = str(getattr(publication, "kind", "") or "").lower()
-        source = str(getattr(publication, "source", "") or "").lower()
-        name = str(getattr(publication, "name", "") or "").lower()
-        if "audio" in kind or "microphone" in source or "audio" in name:
-            return True
     return False
+
+
+def detect_primary_sip_participant(room: Any) -> Optional[Any]:
+    if not room:
+        return None
+
+    fallback = None
+    try:
+        for participant in room.remote_participants.values():
+            if not _participant_is_sip(participant):
+                continue
+            identity = _participant_identity(participant).lower()
+            if identity.startswith("transfer_"):
+                continue
+            if identity.startswith("sip_"):
+                return participant
+            if fallback is None:
+                fallback = participant
+    except Exception:
+        return fallback
+    return fallback
 
 
 def _participant_sip_state(participant: Any) -> str:
@@ -1540,10 +1716,8 @@ async def wait_for_transfer_established(
             sip_state = _participant_sip_state(participant)
             if sip_state:
                 last_state = sip_state
-            if sip_state in {"active", "answered", "bridged", "connected", "confirmed", "complete", "completed", "in-progress", "in_progress"}:
+            if sip_state in {"active", "automation", "answered", "bridged", "connected", "confirmed", "complete", "completed", "in-progress", "in_progress"}:
                 return {"ready": True, "reason": f"sip_state:{sip_state}"}
-            if _participant_has_audio_track(participant):
-                return {"ready": True, "reason": "audio_track"}
         await asyncio.sleep(0.25)
 
     return {"ready": False, "reason": last_state or "timeout"}
@@ -1554,8 +1728,9 @@ async def resolve_transfer_outbound_trunk_id(
     default_trunk_id: str,
 ) -> tuple[str, str]:
     """
-    Resolve outbound trunk for transfer by matching active call's from_number
-    to configured phone number records; fallback to provided default trunk.
+    Resolve outbound trunk for transfer by matching the live call's configured
+    trunk phone number (preferred) or fallback call numbers to a configured
+    phone record that has an outbound trunk.
     """
     if not call_id:
         return default_trunk_id, "default:first_trunk"
@@ -1566,9 +1741,25 @@ async def resolve_transfer_outbound_trunk_id(
             if details_resp.status_code != 200:
                 return default_trunk_id, f"fallback:call_details_http_{details_resp.status_code}"
             details = details_resp.json() or {}
-            from_number = _normalize_phone((details.get("call") or {}).get("from_number"))
-            if not from_number:
-                return default_trunk_id, "fallback:no_from_number"
+            call_data = details.get("call") or {}
+            metadata = details.get("metadata") or {}
+            sip_attrs = metadata.get("sip_attributes") or {}
+
+            candidate_numbers: List[tuple[str, str]] = []
+            seen_numbers = set()
+            for label, raw_value in (
+                ("sip_trunk_phone_number", sip_attrs.get("sip.trunkPhoneNumber")),
+                ("resolved_called_number", metadata.get("resolved_called_number")),
+                ("call_to_number", call_data.get("to_number")),
+                ("call_from_number", call_data.get("from_number")),
+            ):
+                normalized_value = _normalize_phone(raw_value)
+                if normalized_value and normalized_value not in seen_numbers:
+                    candidate_numbers.append((label, normalized_value))
+                    seen_numbers.add(normalized_value)
+
+            if not candidate_numbers:
+                return default_trunk_id, "fallback:no_phone_candidates"
 
             phones_resp = await client.get(f"{DASHBOARD_API_URL}/api/phone-numbers/")
             if phones_resp.status_code != 200:
@@ -1578,16 +1769,84 @@ async def resolve_transfer_outbound_trunk_id(
                 return default_trunk_id, f"fallback:phone_numbers_http_{phones_resp.status_code}"
 
             phone_rows = phones_resp.json() or []
-            for row in phone_rows:
-                row_num = _normalize_phone(row.get("phone_number"))
-                trunk_id = str(row.get("livekit_outbound_trunk_id") or "").strip()
-                if row_num == from_number and trunk_id:
-                    return trunk_id, f"matched_phone:{from_number}"
+            for label, candidate_number in candidate_numbers:
+                for row in phone_rows:
+                    row_num = _normalize_phone(row.get("phone_number"))
+                    trunk_id = str(row.get("livekit_outbound_trunk_id") or "").strip()
+                    if row_num == candidate_number and trunk_id:
+                        return trunk_id, f"matched_phone:{label}:{candidate_number}"
 
-            return default_trunk_id, f"fallback:no_phone_match:{from_number}"
+            return default_trunk_id, "fallback:no_phone_match"
     except Exception as e:
         logger.warning(f"Failed to resolve transfer trunk from call context: {e}")
         return default_trunk_id, "fallback:exception"
+
+
+async def transfer_room_sip_participant(
+    room: Any,
+    phone_number: str,
+) -> Dict[str, Any]:
+    """Use SIP REFER to transfer the active phone participant out of the LiveKit room."""
+    if not room:
+        return {"success": False, "error": "Room not available for SIP transfer"}
+
+    phone_number = _normalize_phone(phone_number)
+    is_valid, validation_error = _validate_transfer_phone(phone_number)
+    if not is_valid:
+        return {"success": False, "error": validation_error}
+
+    sip_participant = detect_primary_sip_participant(room)
+    participant_identity = _participant_identity(sip_participant)
+    if not participant_identity:
+        return {"success": False, "error": "No active SIP participant available for transfer"}
+
+    try:
+        from livekit import api as livekit_api
+        from livekit.protocol.sip import TransferSIPParticipantRequest
+
+        lk_url = os.getenv("LIVEKIT_URL", "ws://livekit-server:7880").replace("wss://", "https://").replace("ws://", "http://")
+        lk_api = livekit_api.LiveKitAPI(
+            url=lk_url,
+            api_key=os.getenv("LIVEKIT_API_KEY", "devkey"),
+            api_secret=os.getenv("LIVEKIT_API_SECRET", "secret12345678"),
+        )
+        try:
+            await lk_api.sip.transfer_sip_participant(
+                TransferSIPParticipantRequest(
+                    participant_identity=participant_identity,
+                    room_name=room.name,
+                    transfer_to=f"tel:{phone_number}",
+                    play_dialtone=False,
+                )
+            )
+            return {
+                "success": True,
+                "action": "transfer_call",
+                "phone_number": phone_number,
+                "status": "transferred",
+                "participant_identity": participant_identity,
+                "transfer_mode": "sip_refer",
+                "transfer_established": True,
+                "establishment_reason": "sip_refer",
+            }
+        finally:
+            await lk_api.aclose()
+    except Exception as e:
+        metadata = getattr(e, "metadata", None) or {}
+        sip_code = str(metadata.get("sip_status_code") or "").strip()
+        sip_status = str(metadata.get("sip_status") or "").strip()
+        error_text = str(e)
+        if sip_code or sip_status:
+            error_text = f"{error_text} (SIP {sip_code} {sip_status})".strip()
+        logger.error(f"SIP REFER transfer failed: {error_text}")
+        return {
+            "success": False,
+            "action": "transfer_call",
+            "phone_number": phone_number,
+            "participant_identity": participant_identity,
+            "transfer_mode": "sip_refer",
+            "error": error_text,
+        }
 
 
 async def start_sip_transfer(
@@ -1630,6 +1889,7 @@ async def start_sip_transfer(
                     room_name=room_name,
                     participant_identity=participant_identity,
                     play_ringtone=True,
+                    wait_until_answered=True,
                 )
             )
 
@@ -1733,6 +1993,16 @@ async def run_transfer_handoff(
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
 
+    sip_participant = detect_primary_sip_participant(room)
+    if sip_participant:
+        transfer_result = await transfer_room_sip_participant(room, target_phone)
+        transfer_result["agent_removed"] = {
+            "success": True,
+            "skipped": True,
+            "reason": "sip_refer_transfer",
+        }
+        return transfer_result
+
     transfer_result = await start_sip_transfer(room.name, target_phone, call_id, room)
     if not transfer_result.get("success"):
         return transfer_result
@@ -1801,24 +2071,441 @@ async def run_end_call_handoff(
     return result
 
 
-def create_dynamic_agent_class(functions_config, base_instructions, current_room=None, call_id=None):
+def build_runtime_engines_for_config(
+    config: Dict[str, Any],
+    *,
+    is_phone_call: bool,
+    vad_instance: Any,
+) -> Dict[str, Any]:
+    custom_params = config.get("custom_params", {}) or {}
+    agent_lang = normalize_agent_language(config.get("language", "en-GB"))
+    selected_voice = config.get("voice", "jessica")
+    tts_provider = normalize_tts_provider(config)
+    if tts_provider == "elevenlabs":
+        selected_voice = ELEVENLABS_VOICE_MAP.get(str(selected_voice).lower(), selected_voice)
+    elif tts_provider == "xai":
+        selected_voice = str(selected_voice or "eve").strip().lower() or "eve"
+        if selected_voice not in XAI_VOICE_IDS:
+            logger.warning("Unsupported xAI voice '%s'; falling back to eve", selected_voice)
+            selected_voice = "eve"
+    selected_tts_model = (
+        config.get("tts_model")
+        or custom_params.get("tts_model")
+    )
+    llm_temperature = resolve_llm_temperature(config)
+    voice_speed = resolve_voice_speed(config)
+    reasoning_effort = resolve_openai_reasoning_effort(config)
+    verbosity = resolve_openai_verbosity(config)
+    max_completion_tokens = resolve_openai_max_completion_tokens(config)
+    voice_runtime_mode = resolve_voice_runtime_mode(config)
+    voice_realtime_model = resolve_voice_realtime_model(config)
+
+    tts_engine = None
+    resolved_voice_id = selected_voice
+    if tts_provider == "xai":
+        selected_tts_model = voice_realtime_model or selected_tts_model or DEFAULT_XAI_REALTIME_MODEL
+    if tts_provider == "elevenlabs":
+        eleven_key = get_elevenlabs_api_key()
+        selected_tts_model = resolve_elevenlabs_tts_model_for_language(selected_tts_model, agent_lang)
+        if not eleven_key:
+            raise RuntimeError("ElevenLabs selected but ELEVEN_API_KEY / ELEVENLABS_API_KEY is not set")
+
+        is_v3_model = "v3" in selected_tts_model.lower() and "flash" not in selected_tts_model.lower()
+        enable_ssml_parsing = _coerce_setting_bool(
+            custom_params.get("elevenlabs_enable_ssml_parsing"),
+            not is_v3_model,
+        )
+        eleven_kwargs: Dict[str, Any] = {
+            "voice_id": selected_voice,
+            "model": selected_tts_model,
+            "api_key": eleven_key,
+            "enable_ssml_parsing": enable_ssml_parsing,
+            "enable_logging": True,
+        }
+        if _callable_supports_kwarg(elevenlabs.TTS, "voice_settings"):
+            voice_settings = build_elevenlabs_voice_settings(
+                config,
+                voice_speed,
+                include_extended_settings=not is_v3_model,
+            )
+            if voice_settings is not None:
+                eleven_kwargs["voice_settings"] = voice_settings
+        if not is_v3_model and _callable_supports_kwarg(elevenlabs.TTS, "streaming_latency"):
+            eleven_kwargs["streaming_latency"] = _coerce_setting_int(ELEVENLABS_STREAMING_LATENCY, default=2, min_value=0, max_value=4)
+        if not is_v3_model and _callable_supports_kwarg(elevenlabs.TTS, "auto_mode"):
+            eleven_kwargs["auto_mode"] = ELEVENLABS_AUTO_MODE
+
+        if is_v3_model:
+            from livekit.agents import tts as lk_tts
+            from livekit.agents import tokenize as lk_tokenize
+            base_tts = elevenlabs.TTS(**eleven_kwargs)
+            tts_engine = lk_tts.StreamAdapter(tts=base_tts, sentence_tokenizer=lk_tokenize.basic.SentenceTokenizer())
+        else:
+            tts_engine = elevenlabs.TTS(**eleven_kwargs)
+        resolved_voice_id = selected_voice
+    elif tts_provider == "deepgram":
+        mapped_voice = DEEPGRAM_VOICE_MAP.get(str(selected_voice).lower(), selected_voice)
+        tts_engine = deepgram.TTS(model=mapped_voice)
+        resolved_voice_id = mapped_voice
+        selected_tts_model = None
+
+    llm_model = config.get("llm_model", "gpt-4o-mini")
+    enable_phone_model_override = _coerce_setting_bool(
+        custom_params.get("force_phone_llm_model_override"),
+        False,
+    )
+    if is_phone_call and enable_phone_model_override:
+        requested_model = str(llm_model or "").strip().lower()
+        target_model = str(custom_params.get("phone_llm_model") or "").strip()
+        if target_model and requested_model != target_model.lower():
+            logger.info("Applying phone LLM model override during agent transfer: %s -> %s", llm_model, target_model)
+            llm_model = target_model
+
+    enable_phone_token_cap = _coerce_setting_bool(
+        custom_params.get("force_phone_llm_token_cap"),
+        False,
+    )
+    if is_phone_call and enable_phone_token_cap:
+        max_completion_tokens = min(max_completion_tokens, PHONE_LOW_LATENCY_MAX_TOKENS)
+
+    runtime_llm_model = llm_model
+    is_moonshot = "moonshot" in llm_model.lower() or "kimi" in llm_model.lower() or "moonlight" in llm_model.lower()
+    is_gpt5_family = str(llm_model or "").strip().lower().startswith("gpt-5")
+    supports_custom_temperature = model_supports_custom_temperature(llm_model)
+    effective_llm_temperature = llm_temperature if supports_custom_temperature else 1.0
+
+    base_url = "https://api.moonshot.cn/v1" if is_moonshot else None
+    raw_key = os.getenv("MOONSHOT_API_KEY") if is_moonshot else os.getenv("OPENAI_API_KEY")
+    api_key = raw_key.strip() if raw_key else ""
+    if not api_key:
+        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    xai_api_key = get_xai_api_key()
+
+    llm = None
+    use_realtime_llm = False
+    use_unified_realtime_audio = False
+    if tts_provider == "xai":
+        if not voice_realtime_model:
+            raise RuntimeError("xAI selected but no realtime model was saved in the app")
+        if not xai_api_key:
+            raise RuntimeError("xAI selected but XAI_API_KEY is not set")
+        if not hasattr(openai, "realtime") or not hasattr(openai.realtime, "RealtimeModel"):
+            raise RuntimeError("xAI unified voice path requires livekit-plugins-openai RealtimeModel support")
+        realtime_kwargs: Dict[str, Any] = {
+            "model": voice_realtime_model,
+            "api_key": xai_api_key,
+            "base_url": XAI_REALTIME_BASE_URL,
+            "voice": selected_voice,
+            "modalities": ["audio"],
+        }
+        turn_detection = _build_openai_realtime_turn_detection()
+        if turn_detection is not None:
+            realtime_kwargs["turn_detection"] = turn_detection
+        llm = openai.realtime.RealtimeModel(**realtime_kwargs)
+        runtime_llm_model = voice_realtime_model
+        use_realtime_llm = True
+        use_unified_realtime_audio = True
+    elif (
+        voice_runtime_mode == "realtime_text_tts"
+        and voice_realtime_model
+        and tts_engine is not None
+        and openai_api_key
+        and hasattr(openai, "realtime")
+        and hasattr(openai.realtime, "RealtimeModel")
+    ):
+        realtime_kwargs: Dict[str, Any] = {
+            "model": voice_realtime_model,
+            "api_key": openai_api_key,
+            "modalities": ["text"],
+        }
+        turn_detection = _build_openai_realtime_turn_detection()
+        if turn_detection is not None:
+            realtime_kwargs["turn_detection"] = turn_detection
+        llm = openai.realtime.RealtimeModel(**realtime_kwargs)
+        runtime_llm_model = voice_realtime_model
+        use_realtime_llm = True
+
+    if llm is None:
+        llm_kwargs: Dict[str, Any] = {"api_key": api_key, "base_url": base_url, "model": llm_model}
+        if _callable_supports_kwarg(openai.LLM, "temperature") and supports_custom_temperature:
+            llm_kwargs["temperature"] = effective_llm_temperature
+        elif not supports_custom_temperature:
+            logger.info("Skipping temperature override for model=%s during agent transfer.", llm_model)
+        if not is_moonshot:
+            if is_gpt5_family and _callable_supports_kwarg(openai.LLM, "reasoning_effort"):
+                llm_kwargs["reasoning_effort"] = reasoning_effort
+            if is_gpt5_family and _callable_supports_kwarg(openai.LLM, "verbosity"):
+                llm_kwargs["verbosity"] = verbosity
+            if _callable_supports_kwarg(openai.LLM, "max_completion_tokens"):
+                llm_kwargs["max_completion_tokens"] = max_completion_tokens
+        llm = openai.LLM(**llm_kwargs)
+        if supports_custom_temperature and "temperature" not in llm_kwargs and hasattr(llm, "temperature"):
+            try:
+                setattr(llm, "temperature", effective_llm_temperature)
+            except Exception:
+                pass
+
+    stt_model = "xai-voice-agent-native" if use_unified_realtime_audio else "openai-realtime-native"
+    stt_engine = None
+    if not use_realtime_llm:
+        stt_language = resolve_stt_language(agent_lang)
+        stt_model = "nova-2" if stt_language == "multi" else "nova-3"
+        stt_kwargs: Dict[str, Any] = {
+            "language": stt_language,
+            "model": stt_model,
+        }
+        if _callable_supports_kwarg(deepgram.STT, "interim_results"):
+            stt_kwargs["interim_results"] = True
+        if _callable_supports_kwarg(deepgram.STT, "smart_format"):
+            stt_kwargs["smart_format"] = True
+        if _callable_supports_kwarg(deepgram.STT, "punctuate"):
+            stt_kwargs["punctuate"] = True
+        if _callable_supports_kwarg(deepgram.STT, "endpointing_ms"):
+            raw_endpointing = STT_ENDPOINTING_PHONE_MS if is_phone_call else STT_ENDPOINTING_WEB_MS
+            stt_kwargs["endpointing_ms"] = _coerce_setting_int(raw_endpointing, default=120 if is_phone_call else 80, min_value=25, max_value=1500)
+        if _callable_supports_kwarg(deepgram.STT, "no_delay"):
+            stt_kwargs["no_delay"] = True
+        stt_engine = deepgram.STT(**stt_kwargs)
+
+    return {
+        "llm": llm,
+        "tts_engine": tts_engine,
+        "stt_engine": stt_engine,
+        "stt_model": stt_model,
+        "tts_provider": tts_provider,
+        "tts_model": selected_tts_model,
+        "tts_voice_id": selected_voice if tts_provider in {"elevenlabs", "xai"} else resolved_voice_id,
+        "runtime_llm_model": runtime_llm_model,
+        "llm_temperature": effective_llm_temperature,
+        "voice_speed": voice_speed,
+        "language": agent_lang,
+        "vad": vad_instance,
+    }
+
+
+def build_transfer_handoff_developer_note(
+    handoff_summary: str,
+    caller_memory: Dict[str, Any],
+) -> str:
+    memory_bits = ", ".join(
+        f"{key}={value}" for key, value in caller_memory.items() if value not in (None, "")
+    ) or "none"
+    return (
+        "TRANSFER HANDOFF CONTEXT:\n"
+        f"- Summary: {handoff_summary or 'Continue the current call without repeating known details.'}\n"
+        f"- Caller memory: {memory_bits}\n"
+        "- You are taking over an active phone call.\n"
+        "- Greet the caller in your own tone and continue naturally.\n"
+        "- Do not re-ask already-known details such as name or issue unless they are missing, ambiguous, or contradicted."
+    )
+
+
+async def perform_agent_transfer_handoff(
+    agent_obj: Any,
+    tool_name: str,
+    func_cfg: Dict[str, Any],
+    speech_mode: str,
+) -> Dict[str, Any]:
+    system_config = func_cfg.get("system_config") or {}
+    target_agent_id = system_config.get("target_agent_id")
+    target_version_mode = str(system_config.get("target_version_mode") or "latest").strip().lower() or "latest"
+    target_version = system_config.get("target_version")
+
+    if not target_agent_id:
+        return {"success": False, "error": "Target agent is not configured"}
+    if not getattr(agent_obj, "is_phone_call", False):
+        return {"success": False, "error": "agent_transfer is only supported during phone calls", "status": "phone_only"}
+    if not getattr(agent_obj, "room", None):
+        return {"success": False, "error": "Room not available for agent transfer"}
+    if not getattr(agent_obj, "session", None):
+        return {"success": False, "error": "Session not available for agent transfer"}
+    if getattr(agent_obj, "_agent_transfer_in_progress", False):
+        return {"success": False, "error": "Agent transfer is already in progress"}
+
+    call_id = getattr(agent_obj, "call_id", None)
+    if not call_id:
+        return {"success": False, "error": "Missing call_id"}
+
+    handoff_payload = {
+        "source_agent_id": getattr(agent_obj, "agent_id", None),
+        "tool_name": tool_name,
+        "target_agent_id": target_agent_id,
+        "target_version_mode": target_version_mode,
+        "target_version": target_version,
+    }
+    handoff_context = await fetch_agent_handoff_context(call_id, handoff_payload)
+    if not handoff_context.get("success"):
+        return {"success": False, "error": handoff_context.get("error") or "Failed to build handoff context"}
+
+    target_payload = handoff_context.get("target_agent") or {}
+    if not isinstance(target_payload, dict) or not str(target_payload.get("system_prompt", "")).strip():
+        return {"success": False, "error": "Target agent runtime payload is incomplete"}
+
+    merged_runtime_vars = dict(getattr(agent_obj, "runtime_vars", {}) or {})
+    merged_runtime_vars.update(handoff_context.get("runtime_vars") or {})
+    target_functions = merge_builtin_functions_into_runtime(
+        list(target_payload.get("functions") or []),
+        target_payload,
+    )
+    target_prompt, target_functions = build_effective_runtime_prompt(
+        target_payload,
+        target_functions,
+        merged_runtime_vars,
+    )
+    runtime_bundle = build_runtime_engines_for_config(
+        target_payload,
+        is_phone_call=True,
+        vad_instance=getattr(agent_obj, "vad_instance", None),
+    )
+
+    current_chat_ctx = None
+    try:
+        current_chat_ctx = agent_obj.chat_ctx if hasattr(agent_obj, "chat_ctx") else None
+    except Exception:
+        current_chat_ctx = None
+    if current_chat_ctx is None:
+        try:
+            current_chat_ctx = getattr(agent_obj.session.agent, "chat_ctx", None)
+        except Exception:
+            current_chat_ctx = None
+
+    new_chat_ctx = llm_module.ChatContext.empty()
+    new_chat_ctx.add_message(
+        role="developer",
+        content=build_transfer_handoff_developer_note(
+            str(handoff_context.get("handoff_summary") or "").strip(),
+            handoff_context.get("caller_memory") or {},
+        ),
+    )
+    if current_chat_ctx is not None:
+        try:
+            copied_ctx = current_chat_ctx.copy(
+                exclude_instructions=True,
+                exclude_function_call=True,
+                exclude_handoff=True,
+                exclude_config_update=True,
+            )
+            copied_ctx.truncate(max_items=30)
+            new_chat_ctx.merge(copied_ctx, exclude_instructions=True, exclude_function_call=True, exclude_config_update=True)
+        except Exception as chat_ctx_err:
+            logger.warning("Failed to merge chat context for agent transfer: %s", chat_ctx_err)
+
+    agent_obj._agent_transfer_in_progress = True
+    try:
+        target_agent = create_dynamic_agent_class(
+            functions_config=target_functions,
+            base_instructions=target_prompt,
+            current_room=agent_obj.room,
+            call_id=call_id,
+            session=agent_obj.session,
+            agent_id=target_payload.get("agent_id"),
+            agent_label=target_payload.get("name"),
+            is_phone_call=True,
+            runtime_vars=merged_runtime_vars,
+            vad_instance=runtime_bundle.get("vad"),
+            llm_engine=runtime_bundle.get("llm"),
+            tts_engine=runtime_bundle.get("tts_engine"),
+            stt_engine=runtime_bundle.get("stt_engine"),
+            chat_ctx=new_chat_ctx,
+        )
+        agent_obj.session.update_agent(target_agent)
+        if call_id:
+            await report_builtin_action(
+                call_id,
+                "agent_transfer",
+                {
+                    "tool_name": tool_name,
+                    "source_agent_id": getattr(agent_obj, "agent_id", None),
+                    "source_agent_name": getattr(agent_obj, "agent_label", None),
+                    "target_agent_id": target_agent_id,
+                    "target_version_mode": target_version_mode,
+                    "target_version": target_version,
+                    "handoff_summary": str(handoff_context.get("handoff_summary") or "").strip(),
+                    "caller_memory": handoff_context.get("caller_memory") or {},
+                    "recent_transcript": handoff_context.get("recent_transcript") or [],
+                },
+            )
+
+        async def _speak_after_transfer():
+            await asyncio.sleep(0.05)
+            try:
+                agent_obj.session.generate_reply(
+                    instructions=(
+                        "You have just taken over this live phone call. "
+                        "Greet the caller in your own style and continue from the handoff context. "
+                        "Do not re-ask already-known details unless they are missing or unclear."
+                    ),
+                    allow_interruptions=True,
+                    input_modality="text",
+                )
+            except Exception as reply_err:
+                logger.error("Failed to generate first reply after agent transfer: %s", reply_err)
+
+        asyncio.create_task(_speak_after_transfer())
+        return {
+            "success": True,
+            "action": "agent_transfer",
+            "status": "agent_switched",
+            "target_agent_id": target_agent_id,
+            "target_agent_name": target_payload.get("name"),
+            "resolved_version": target_payload.get("resolved_version"),
+            "message": "Agent switched successfully; the new agent will greet the caller now.",
+        }
+    except Exception as handoff_exc:
+        logger.error("agent_transfer handoff failed: %s", handoff_exc)
+        return {"success": False, "error": str(handoff_exc)}
+    finally:
+        agent_obj._agent_transfer_in_progress = False
+
+
+def create_dynamic_agent_class(
+    functions_config,
+    base_instructions,
+    current_room=None,
+    call_id=None,
+    session=None,
+    agent_id=None,
+    agent_label=None,
+    is_phone_call=False,
+    runtime_vars=None,
+    vad_instance=None,
+    llm_engine=None,
+    tts_engine=None,
+    stt_engine=None,
+    chat_ctx=None,
+):
     if not functions_config:
-        return Agent(instructions=base_instructions)
+        return Agent(
+            instructions=base_instructions,
+            chat_ctx=chat_ctx,
+            llm=llm_engine,
+            tts=tts_engine,
+            stt=stt_engine,
+            vad=vad_instance,
+        )
 
     class_def = f"""
 class DynamicPropertyAgent(Agent):
-    def __init__(self, instructions, functions_config, room=None, call_id=None):
+    def __init__(self, instructions, functions_config, room=None, call_id=None, session=None, agent_id=None, agent_label=None, is_phone_call=False, runtime_vars=None, vad_instance=None, llm_engine=None, tts_engine=None, stt_engine=None, chat_ctx=None):
         self.functions_config = functions_config
         self.room = room
         self.call_id = call_id
+        self.session = session
+        self.agent_id = agent_id
+        self.agent_label = agent_label
+        self.is_phone_call = is_phone_call
+        self.runtime_vars = runtime_vars or {{}}
+        self.vad_instance = vad_instance
         self._transfer_in_progress = False
+        self._agent_transfer_in_progress = False
         self._pending_end_call_after_speech = False
         self._end_call_handoff_started = False
-        super().__init__(instructions=instructions)
+        super().__init__(instructions=instructions, chat_ctx=chat_ctx, llm=llm_engine, tts=tts_engine, stt=stt_engine, vad=vad_instance)
 """
 
     for func in functions_config:
-        func_name = func.get("name", "").strip().replace(" ", "_").lower()
+        func_name = _normalize_tool_name(func.get("name", ""))
         if not func_name:
             continue
 
@@ -1869,7 +2556,7 @@ class DynamicPropertyAgent(Agent):
         # This prevents model-provided numbers from overriding configured transfer target.
         if normalized_tool_name in ("call_transfer", "transfer_call"):
             for _cfg in self.functions_config:
-                if _cfg.get("name", "").strip().replace(" ", "_").lower() == normalized_tool_name:
+                if _normalize_tool_name(_cfg.get("name", "")) == normalized_tool_name:
                     _configured_phone = str(_cfg.get("phone_number", "")).strip()
                     if _configured_phone:
                         payload["phone_number"] = _configured_phone
@@ -1897,12 +2584,13 @@ class DynamicPropertyAgent(Agent):
         result = {{"error": "Tool execution failed"}}
 
         for func_cfg in self.functions_config:
-            if func_cfg.get("name", "").strip().replace(" ", "_").lower() == "{func_name}":
-                normalized_name = func_cfg.get("name", "").strip().replace(" ", "_").lower()
+            if _normalize_tool_name(func_cfg.get("name", "")) == "{func_name}":
+                normalized_name = _normalize_tool_name(func_cfg.get("name", ""))
                 url = func_cfg.get("url", "")
                 method = func_cfg.get("method", "POST").upper()
                 timeout_ms = func_cfg.get("timeout_ms", 120000)
                 headers = func_cfg.get("headers", {{}})
+                system_type = _normalize_tool_name(func_cfg.get("system_type", ""))
 
                 payload, validation_errors = _validate_and_normalize_tool_payload(payload, func_cfg)
                 if validation_errors:
@@ -1956,6 +2644,13 @@ class DynamicPropertyAgent(Agent):
                                 "status": "handoff_queued",
                                 "message": "Handoff queued; announce transfer to caller now.",
                             }}
+                elif system_type == "agent_transfer" or url == "builtin://agent_transfer":
+                    result = await perform_agent_transfer_handoff(
+                        self,
+                        normalized_tool_name,
+                        func_cfg,
+                        speech_mode,
+                    )
                 elif normalized_name == "end_call":
                     if hasattr(self, "call_id") and self.call_id:
                         result = await report_builtin_action(
@@ -2025,15 +2720,29 @@ class DynamicPropertyAgent(Agent):
     local_vars = {}
     exec(class_def, globals(), local_vars)
     AgentClass = local_vars["DynamicPropertyAgent"]
-    return AgentClass(instructions=base_instructions, functions_config=functions_config, room=current_room, call_id=call_id)
+    return AgentClass(
+        instructions=base_instructions,
+        functions_config=functions_config,
+        room=current_room,
+        call_id=call_id,
+        session=session,
+        agent_id=agent_id,
+        agent_label=agent_label,
+        is_phone_call=is_phone_call,
+        runtime_vars=runtime_vars,
+        vad_instance=vad_instance,
+        llm_engine=llm_engine,
+        tts_engine=tts_engine,
+        stt_engine=stt_engine,
+        chat_ctx=chat_ctx,
+    )
 
 
 # ==================== SIP Detection ====================
 
 def detect_sip_participant(room):
     for participant in room.remote_participants.values():
-        identity = participant.identity or ""
-        if identity.startswith("sip_") or "sip" in identity.lower():
+        if _participant_is_sip(participant):
             return participant
     return None
 
@@ -2323,60 +3032,7 @@ async def entrypoint(ctx: JobContext):
         fetch_agent_functions(agent_id),
     )
     
-    # Add builtin functions from custom_params
-    custom_params = config.get('custom_params', {})
-    builtin_funcs = custom_params.get('builtin_functions', {})
-    
-    if builtin_funcs.get('builtin_transfer_call', {}).get('enabled'):
-        transfer_entry = builtin_funcs['builtin_transfer_call']
-        transfer_cfg = transfer_entry.get('config', {})
-        phone_number = transfer_cfg.get('phone_number', '')
-        transfer_speak_during, transfer_speak_after = _normalize_tool_speech_flags(
-            transfer_entry.get('speak_during_execution', True),
-            transfer_entry.get('speak_after_execution', False),
-            fallback_after=False,
-        )
-        if not transfer_speak_during and not transfer_speak_after:
-            transfer_speak_during, transfer_speak_after = True, False
-        functions.append({
-            'name': 'transfer_call',
-            'description': (
-                'Use ONLY when caller explicitly asks to transfer/escalate/connect to a human. '
-                'Do not call this for normal conversation.'
-            ),
-            'url': '',
-            'method': 'POST',
-            'parameters_schema': {
-                'type': 'object',
-                'properties': {
-                    'phone_number': {'type': 'string', 'description': 'Target phone number in E.164 format, e.g. +447123456789'}
-                },
-                'required': ['phone_number']
-            },
-            'phone_number': phone_number,
-            'speak_during_execution': transfer_speak_during,
-            'speak_after_execution': transfer_speak_after,
-        })
-        logger.info(f"Added builtin transfer_call function with phone: {phone_number}")
-    
-    if builtin_funcs.get('builtin_end_call', {}).get('enabled'):
-        end_entry = builtin_funcs['builtin_end_call']
-        end_speak_during, end_speak_after = _normalize_tool_speech_flags(
-            end_entry.get('speak_during_execution', False),
-            end_entry.get('speak_after_execution', True),
-            fallback_after=True,
-        )
-        functions.append({
-            'name': 'end_call',
-            'description': 'Use ONLY when caller explicitly asks to end/stop/hang up.',
-            'url': '',
-            'method': 'POST',
-            'parameters_schema': {'type': 'object', 'properties': {}},
-            'speak_during_execution': end_speak_during,
-            'speak_after_execution': end_speak_after,
-        })
-        logger.info(f"Added builtin end_call function")
-    
+    functions = merge_builtin_functions_into_runtime(functions, config)
     logger.info(f"Agent: {config.get('name')}, Functions: {len(functions)}")
 
     is_phone_call = bool(
@@ -2635,48 +3291,7 @@ async def entrypoint(ctx: JobContext):
         "agent_speaks_first",
     }
     logger.info(f"Welcome type: {welcome_type}, Welcome msg: {welcome_msg}, Direction: {direction}")
-    sys_prompt = apply_runtime_template(
-        config.get("system_prompt", "You are a helpful voice assistant."),
-        runtime_vars,
-    )
-    
-    language_instruction = build_language_enforcement_instruction(agent_lang)
-    if language_instruction:
-        sys_prompt += f"\n\n{language_instruction}"
-    tts_safety_instruction = build_tts_output_safety_instruction(tts_provider, selected_tts_model or "")
-    if tts_safety_instruction:
-        sys_prompt += f"\n\n{tts_safety_instruction}"
-    if tts_provider == "xai":
-        sys_prompt = adapt_system_prompt_for_xai(sys_prompt)
-        logger.info("Adapted saved prompt for xAI unified realtime voice")
-    logger.info(
-        "Loaded system prompt (len=%s): %s",
-        len(sys_prompt or ""),
-        (sys_prompt or "").replace("\n", " ")[:180],
-    )
-    if STRICT_PROMPT_TOOL_FILTER:
-        initial_tool_count = len(functions)
-        functions = filter_functions_by_prompt(functions, sys_prompt)
-        logger.info(
-            "Prompt tool filter enabled: kept=%s removed=%s",
-            len(functions),
-            max(initial_tool_count - len(functions), 0),
-        )
-
-    tool_speech_guidance = build_tool_speech_guidance(functions)
-    if tool_speech_guidance:
-        sys_prompt = f"{sys_prompt}\n\n{tool_speech_guidance}" if sys_prompt else tool_speech_guidance
-        logger.info("Applied tool speech guidance block to runtime prompt")
-
-    if EMAIL_SPELLING_POLICY:
-        sys_prompt = f"{sys_prompt}\n\n{EMAIL_SPELLING_POLICY}" if sys_prompt else EMAIL_SPELLING_POLICY
-
-    agent = create_dynamic_agent_class(
-        functions_config=functions,
-        base_instructions=sys_prompt,
-        current_room=ctx.room,
-        call_id=call_id
-    )
+    sys_prompt, functions = build_effective_runtime_prompt(config, functions, runtime_vars)
 
     is_phone_call = bool(
         from_number
@@ -2728,6 +3343,18 @@ async def entrypoint(ctx: JobContext):
             logger.info("Realtime voice path enabled: using OpenAI Realtime for speech understanding and turn detection")
 
     session = AgentSession(**session_kwargs)
+    agent = create_dynamic_agent_class(
+        functions_config=functions,
+        base_instructions=sys_prompt,
+        current_room=ctx.room,
+        call_id=call_id,
+        session=session,
+        agent_id=agent_id,
+        agent_label=config.get("name"),
+        is_phone_call=is_phone_call,
+        runtime_vars=runtime_vars,
+        vad_instance=ctx.proc.userdata["vad"],
+    )
 
     # Track the active speech-input path for usage and post-call diagnostics.
     usage.stt_model = stt_model
