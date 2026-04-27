@@ -42,18 +42,147 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
         }
     };
 
-    const handleImport = () => {
+    const importRetellAgent = async (jsonData: any) => {
+        if (!jsonData.agent_name && !jsonData.retellLlmData) {
+            throw new Error('Invalid Retell agent JSON format');
+        }
+
+        const agentData = {
+            name: jsonData.agent_name || 'Imported Agent',
+            agent_name: 'sarah',
+            system_prompt: jsonData.retellLlmData?.general_prompt || jsonData.system_prompt || '',
+            llm_model: jsonData.retellLlmData?.model || 'gpt-4o',
+            voice: 'ara',
+            language: 'multi',
+            tts_provider: 'xai',
+            tts_model: 'grok-voice-think-fast-1.0',
+            max_call_duration: Math.floor((jsonData.max_call_duration_ms || 3600000) / 1000),
+            welcome_message_type: 'agent_greets', // Always greet first for better responsiveness
+            welcome_message: jsonData.begin_message || '',
+            enable_recording: true,
+            custom_params: {
+                voice_runtime_mode: 'realtime_unified',
+                voice_realtime_model: 'grok-voice-think-fast-1.0',
+                welcome_message_mode: 'custom',
+                interruption_sensitivity: jsonData.interruption_sensitivity || 0.8,
+                llm_temperature: jsonData.voice_temperature || 0.2,
+            }
+        };
+
+        const agentResponse = await fetch('/api/agents/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(agentData),
+        });
+        
+        if (!agentResponse.ok) {
+            const error = await agentResponse.json();
+            throw new Error(error.detail || 'Failed to create agent');
+        }
+        
+        const newAgent = await agentResponse.json();
+        const agentId = newAgent.id;
+
+        const tools = jsonData.retellLlmData?.general_tools || jsonData.tools || [];
+        const builtinFunctions: any = {};
+
+        for (const tool of tools) {
+            const dest = tool.transfer_destination;
+            const phone = (typeof dest === 'object' ? dest?.number : dest) || tool.phone_number || '';
+
+            if (tool.type === 'transfer_call' || tool.type === 'agent_transfer') {
+                // Always create as a System Function to support multiple transfer destinations
+                const isAgentTransfer = tool.type === 'agent_transfer';
+                const functionPayload = {
+                    name: tool.name,
+                    description: tool.description || (isAgentTransfer ? `Transfer to agent ${tool.agent_id || tool.target_agent_id}` : `Transfer call to ${phone}`),
+                    url: isAgentTransfer ? 'builtin://agent_transfer' : 'builtin://transfer_call',
+                    method: 'SYSTEM',
+                    system_type: isAgentTransfer ? 'agent_transfer' : 'transfer_call',
+                    system_config: isAgentTransfer ? { 
+                        target_agent_id: tool.agent_id || tool.target_agent_id,
+                        target_version_mode: 'latest'
+                    } : { phone_number: phone },
+                    phone_number: isAgentTransfer ? '' : phone, // Set at top level for agent runtime reliability
+                    parameters_schema: { type: 'object', properties: {} },
+                    speak_during_execution: true,
+                    speak_after_execution: false,
+                };
+                const fnResp = await fetch(`/api/agents/${agentId}/functions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(functionPayload),
+                });
+                if (!fnResp.ok) {
+                    console.warn(`Failed to create transfer function ${tool.name}:`, await fnResp.text());
+                }
+            } else if (tool.type === 'end_call') {
+                builtinFunctions['builtin_end_call'] = {
+                    enabled: true,
+                    config: {},
+                    speak_during_execution: false,
+                    speak_after_execution: true,
+                };
+            } else {
+                const functionPayload = {
+                    name: tool.name || 'custom_tool',
+                    description: tool.description || '',
+                    url: tool.url || tool.webhook_url || '',
+                    method: tool.method || 'POST',
+                    timeout_ms: tool.timeout_ms || 120000,
+                    headers: tool.headers || {},
+                    query_params: tool.query_params || {},
+                    parameters_schema: tool.parameters || tool.parameters_schema || { type: 'object', properties: {} },
+                    variables: tool.variables || {},
+                    speak_during_execution: tool.speak_during_execution || false,
+                    speak_after_execution: tool.speak_after_execution !== undefined ? tool.speak_after_execution : true,
+                };
+                await fetch(`/api/agents/${agentId}/functions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(functionPayload),
+                });
+            }
+        }
+
+        if (Object.keys(builtinFunctions).length > 0) {
+            await fetch(`/api/agents/${agentId}/builtin-functions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(builtinFunctions),
+            });
+        }
+
+        return newAgent;
+    };
+
+    const handleImport = async () => {
         if (!selectedFile) {
             showToast('Please select a file first', 'error');
             return;
         }
         
-        showToast(`Importing ${selectedFile.name}...`, 'info');
-        setTimeout(() => {
-            showToast('Import completed successfully!', 'success');
-            onClose();
-            setSelectedFile(null);
-        }, 2000);
+        try {
+            if (selectedFile.name.endsWith('.json')) {
+                const text = await selectedFile.text();
+                const jsonData = JSON.parse(text);
+                
+                showToast(`Importing agent: ${jsonData.agent_name || selectedFile.name}...`, 'info');
+                
+                await importRetellAgent(jsonData);
+                
+                showToast('Agent imported successfully!', 'success');
+                onClose();
+                setSelectedFile(null);
+                // Force a page refresh to show the new agent
+                window.location.reload();
+            } else {
+                showToast('CSV import is not yet implemented. Please use JSON.', 'error');
+            }
+        } catch (error: any) {
+            console.error('Import failed:', error);
+            showToast(`Import failed: ${error.message}`, 'error');
+        }
     };
 
     return (

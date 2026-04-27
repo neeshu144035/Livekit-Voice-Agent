@@ -9,13 +9,14 @@ import {
     ChevronDown, Mic, Settings, Wrench, FileText,
     Volume2, Trash2, Play, MessageSquare,
     Shield, Webhook, Cpu, BookOpen, Activity, Plus, ArrowRightLeft,
-    Home, History, BarChart3, Key, Users, FileCode, PhoneCall, X, Menu
+    Home, History, BarChart3, Key, Users, FileCode, PhoneCall, X, Menu, PhoneForwarded
 } from 'lucide-react';
 import { useToast } from '../../../components/ToastProvider';
 import VoiceCallModal from '../../../components/VoiceCallModal';
 import TestChatModal from '../../../components/TestChatModal';
 import FunctionModal from '../../../components/FunctionModal';
 import AgentTransferFunctionModal, { AgentTransferFunctionData } from '../../../components/AgentTransferFunctionModal';
+import CallTransferFunctionModal from '../../../components/CallTransferFunctionModal';
 
 // Simple Sidebar Menu
 const SIDEBAR_MENU = [
@@ -366,6 +367,8 @@ export default function AgentDetailPage() {
     const [selectedFunction, setSelectedFunction] = useState<Function | null>(null);
     const [showAgentTransferModal, setShowAgentTransferModal] = useState(false);
     const [selectedAgentTransferFunction, setSelectedAgentTransferFunction] = useState<AgentTransferFunctionData | null>(null);
+    const [showCallTransferModal, setShowCallTransferModal] = useState(false);
+    const [selectedCallTransferFunction, setSelectedCallTransferFunction] = useState<any | null>(null);
     const [showFunctionSelector, setShowFunctionSelector] = useState(false);
     const [showBuiltinConfigModal, setShowBuiltinConfigModal] = useState(false);
     const [selectedBuiltinFunctionId, setSelectedBuiltinFunctionId] = useState<string | null>(null);
@@ -458,6 +461,16 @@ export default function AgentDetailPage() {
         return 'Latest';
     };
 
+    const isCallTransferFunction = (func?: Function | any | null) =>
+        func?.method === 'SYSTEM' && (func?.url === 'builtin://transfer_call' || func?.system_type === 'transfer_call');
+
+    const getCallTransferSubtitle = (func: Function) => {
+        const systemConfig = typeof func.system_config === 'string'
+            ? JSON.parse(func.system_config)
+            : func.system_config || {};
+        return systemConfig.phone_number ? `Transfer to ${systemConfig.phone_number} • Phone calls only` : 'PSTN Call Transfer';
+    };
+
     const getAgentTransferSubtitle = (func: Function) => {
         const systemConfig = func.system_config && typeof func.system_config === 'object' ? func.system_config : {};
         const targetAgentId = Number(systemConfig.target_agent_id || 0) || undefined;
@@ -471,6 +484,11 @@ export default function AgentDetailPage() {
         if (func && isAgentTransferFunction(func)) {
             setSelectedAgentTransferFunction(func as AgentTransferFunctionData);
             setShowAgentTransferModal(true);
+            return;
+        }
+        if (func && isCallTransferFunction(func)) {
+            setSelectedCallTransferFunction(func);
+            setShowCallTransferModal(true);
             return;
         }
         setSelectedFunction(func);
@@ -1559,11 +1577,14 @@ export default function AgentDetailPage() {
                                                             {/* Custom Functions */}
                                                             {functions.map((func) => {
                                                                 const agentTransfer = isAgentTransferFunction(func);
+                                                                const callTransfer = isCallTransferFunction(func);
                                                                 return (
                                                                     <div key={func.id} className="flex items-center justify-between rounded-lg bg-gray-50 p-3">
                                                                         <div className="flex min-w-0 items-center gap-3">
                                                                             {agentTransfer ? (
                                                                                 <ArrowRightLeft className="h-5 w-5 flex-shrink-0 text-violet-500" />
+                                                                            ) : callTransfer ? (
+                                                                                <PhoneForwarded className="h-5 w-5 flex-shrink-0 text-green-500" />
                                                                             ) : func.method === 'POST' || func.method === 'GET' ? (
                                                                                 <svg className="w-5 h-5 text-gray-500 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                                                                     <path d="M13 10V3L4 14h7v7l9-11h-7z" />
@@ -1579,10 +1600,22 @@ export default function AgentDetailPage() {
                                                                                             Agent Transfer
                                                                                         </span>
                                                                                     )}
+                                                                                    {callTransfer && (
+                                                                                        <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-green-700">
+                                                                                            PSTN Transfer
+                                                                                        </span>
+                                                                                    )}
+                                                                                    {func.method === 'SYSTEM' && !agentTransfer && !callTransfer && (
+                                                                                        <div className="flex h-5 w-5 items-center justify-center rounded bg-blue-600 text-[9px] font-semibold text-white flex-shrink-0">
+                                                                                            BI
+                                                                                        </div>
+                                                                                    )}
                                                                                 </div>
                                                                                 <p className="truncate text-xs text-gray-500">
                                                                                     {agentTransfer
                                                                                         ? getAgentTransferSubtitle(func)
+                                                                                        : callTransfer
+                                                                                        ? getCallTransferSubtitle(func)
                                                                                         : func.description || `${func.method} webhook`}
                                                                                 </p>
                                                                             </div>
@@ -1767,6 +1800,19 @@ export default function AgentDetailPage() {
                     }}
                 />
 
+                <CallTransferFunctionModal
+                    isOpen={showCallTransferModal}
+                    onClose={() => {
+                        setShowCallTransferModal(false);
+                        setSelectedCallTransferFunction(null);
+                    }}
+                    agentId={parseInt(agentId)}
+                    functionData={selectedCallTransferFunction}
+                    onSuccess={() => {
+                        void fetchFunctions();
+                    }}
+                />
+
                 {showBuiltinConfigModal && selectedBuiltinFunctionId && builtinDraftConfig && (
                     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
                         <div className="mx-4 w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl">
@@ -1876,7 +1922,7 @@ export default function AgentDetailPage() {
 
                             <div className="space-y-2">
                                 {/* Built-in Functions */}
-                                {builtinFunctions.map((func) => {
+                                {builtinFunctions.filter(f => f.name !== 'transfer_call').map((func) => {
                                     const isSelected = allBuiltinFunctions[func.id]?.enabled;
                                     return (
                                         <button
@@ -1940,6 +1986,25 @@ export default function AgentDetailPage() {
                                         <div>
                                             <p className="text-sm font-medium text-gray-900">Agent Transfer</p>
                                             <p className="text-xs text-gray-500">Create a named subagent handoff tool for phone calls</p>
+                                        </div>
+                                    </div>
+                                </button>
+
+                                <button
+                                    onClick={() => {
+                                        setShowFunctionSelector(false);
+                                        setSelectedCallTransferFunction(null);
+                                        setShowCallTransferModal(true);
+                                    }}
+                                    className="w-full text-left p-3 rounded-lg border border-green-200 bg-green-50 hover:bg-green-100 transition-colors"
+                                >
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-8 h-8 rounded-full bg-green-500 flex items-center justify-center">
+                                            <PhoneForwarded className="h-4 w-4 text-white" />
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-medium text-gray-900">Call Transfer</p>
+                                            <p className="text-xs text-gray-500">Create a named PSTN handoff tool to external numbers</p>
                                         </div>
                                     </div>
                                 </button>

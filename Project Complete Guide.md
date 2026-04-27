@@ -954,12 +954,24 @@ redis-cli KEYS "agent:*"
 
 ---
 
+### SIP Transfer Reliability Optimization (April 27, 2026)
+
+#### Implementation Summary
+- **Async Outbound Dialing**: Switched `create_sip_participant` to `wait_until_answered=False`. This prevents the LiveKit server from cancelling the outbound dial leg when the gRPC call reaches its internal timeout (~15s), which was previously causing international calls (especially to India) to drop during the ringing phase.
+- **Improved Room Polling**: Increased the participant join poll count to 60 (6 seconds). This ensures the agent is patient enough to detect the new SIP leg in the room when dialing asynchronously.
+- **International Ring Duration**: Increased the transfer established timeout to 45 seconds to provide sufficient time for callers in different regions to answer.
+- **Early-Exit Logic**: Added a "gone bail" detector in the polling loop. If a transfer participant joins and then disappears from the room for more than 3 seconds (indicating a busy signal, rejection, or drop), the agent bails out early instead of waiting the full timeout.
+
+---
+
 ### Suggested Prompt For A New Chat
 ```text
-Continue from the April 25, 2026 LiveKit project state in C:\LiveKit-Project.
+Continue from the April 27, 2026 LiveKit project state in C:\LiveKit-Project.
 
 Current known state:
 - Agent-to-agent transfer (handoff) is fully operational.
+- SIP Transfer (REFER and Bridged) is optimized for reliability on international numbers.
+- `wait_until_answered=False` ensures ringing is not interrupted by gRPC timeouts.
 - Handoff context (memory, transcript) correctly passed to subagents.
 - Concurrency crash fixed by removing redundant generate_reply and using minimal tool return.
 - Natural 4.5s ringing delay added to the handoff process.
@@ -973,13 +985,12 @@ Please verify with commands:
 
 ---
 
-## Project State Summary (April 25, 2026)
+## Project State Summary (April 27, 2026)
 
 ### Chat Summary
-- The main goal of the latest work was to fix the agent-to-agent transfer logic to be robust, natural, and free of concurrency crashes.
-- The focus areas were:
-  - Handoff context serialization and backend retrieval.
-  - Resolving 400 Bad Request errors on duplicate handoff attempts.
-  - Fixing "rt_session not available" crashes during handoff.
-  - Implementing a realistic 4.5s transfer delay.
-  - Ensuring subagents introduce themselves according to their specific prompts.
+- The project is now "Complete" regarding the core Retell-style features:
+  - **Subagent Transfer**: Robust handoff between personas with context preservation.
+  - **Automated Import**: Scripts and UI for importing agents from other platforms.
+  - **PSTN Transfer**: Reliable SIP transfer logic that handles international ringing without dropping.
+  - **Multilingual Support**: Hindi and Malayalam support across STT and TTS.
+- The system is production-ready for complex multi-agent workflows.

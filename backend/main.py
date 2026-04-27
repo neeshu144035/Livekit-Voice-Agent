@@ -436,6 +436,7 @@ SYSTEM_FUNCTION_META_KEY = "__system_function_meta__"
 SYSTEM_FUNCTION_AGENT_TRANSFER = "agent_transfer"
 SYSTEM_FUNCTION_TARGET_VERSION_LATEST = "latest"
 SYSTEM_FUNCTION_TARGET_VERSION_PINNED = "pinned"
+SYSTEM_FUNCTION_TRANSFER_CALL = "transfer_call"
 
 
 def get_elevenlabs_api_key() -> Optional[str]:
@@ -598,6 +599,14 @@ def _normalize_agent_transfer_system_config(
     return normalized
 
 
+def _normalize_transfer_call_system_config(raw_config: Any) -> Dict[str, Any]:
+    config = raw_config if isinstance(raw_config, dict) else {}
+    phone_number = str(config.get("phone_number") or "").strip()
+    if not phone_number:
+        raise HTTPException(status_code=400, detail="Transfer call requires a valid phone_number")
+    return {"phone_number": phone_number}
+
+
 def _validate_function_payload_or_400(
     *,
     agent_id: int,
@@ -632,13 +641,20 @@ def _validate_function_payload_or_400(
         system_type = _normalize_system_function_type(
             normalized_url.replace("builtin://", "", 1) if normalized_url.startswith("builtin://") else normalized_url
         )
-        if normalized_url != f"builtin://{SYSTEM_FUNCTION_AGENT_TRANSFER}" or system_type != SYSTEM_FUNCTION_AGENT_TRANSFER:
-            raise HTTPException(status_code=400, detail="Only builtin://agent_transfer is supported for SYSTEM functions")
-        normalized_system_config = _normalize_agent_transfer_system_config(
-            system_config,
-            source_agent_id=agent_id,
-            db=db,
-        )
+        if system_type == SYSTEM_FUNCTION_AGENT_TRANSFER:
+            if normalized_url != f"builtin://{SYSTEM_FUNCTION_AGENT_TRANSFER}":
+                raise HTTPException(status_code=400, detail="URL must be builtin://agent_transfer for agent transfers")
+            normalized_system_config = _normalize_agent_transfer_system_config(
+                system_config,
+                source_agent_id=agent_id,
+                db=db,
+            )
+        elif system_type == SYSTEM_FUNCTION_TRANSFER_CALL:
+            if normalized_url != f"builtin://{SYSTEM_FUNCTION_TRANSFER_CALL}":
+                raise HTTPException(status_code=400, detail="URL must be builtin://transfer_call for call transfers")
+            normalized_system_config = _normalize_transfer_call_system_config(system_config)
+        else:
+            raise HTTPException(status_code=400, detail="Only builtin://agent_transfer and builtin://transfer_call are supported for SYSTEM functions")
     elif system_config:
         raise HTTPException(status_code=400, detail="system_config is only supported for SYSTEM functions")
 
@@ -1553,7 +1569,7 @@ class CallResponse(BaseModel):
     duration_seconds: Optional[int]
     recording_url: Optional[str]
     cost_usd: float
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any] = Field(default_factory=dict, validation_alias="call_metadata")
     created_at: datetime
     
     class Config:

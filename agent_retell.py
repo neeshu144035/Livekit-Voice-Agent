@@ -1709,15 +1709,32 @@ async def wait_for_transfer_established(
 ) -> Dict[str, Any]:
     deadline = time.monotonic() + max(timeout_sec, 0.5)
     last_state = ""
+    # Track how long the participant has been absent from the room after having
+    # first joined. This lets us bail out early on no-answer / busy / rejected
+    # instead of spinning for the full timeout_sec.
+    ever_joined = False
+    gone_since: Optional[float] = None
+    GONE_BAIL_SEC = 3.0  # if absent for this long after joining → treat as dropped
 
     while time.monotonic() < deadline:
         participant = _get_room_participant_by_identity(room, participant_identity)
         if participant:
+            ever_joined = True
+            gone_since = None  # reset — it's back in the room
             sip_state = _participant_sip_state(participant)
             if sip_state:
                 last_state = sip_state
             if sip_state in {"active", "automation", "answered", "bridged", "connected", "confirmed", "complete", "completed", "in-progress", "in_progress"}:
                 return {"ready": True, "reason": f"sip_state:{sip_state}"}
+        else:
+            if ever_joined:
+                # Participant was in the room but has now left — could be a
+                # transient SIP re-INVITE or a permanent no-answer/busy drop.
+                now = time.monotonic()
+                if gone_since is None:
+                    gone_since = now
+                elif now - gone_since >= GONE_BAIL_SEC:
+                    return {"ready": False, "reason": "participant_left"}
         await asyncio.sleep(0.25)
 
     return {"ready": False, "reason": last_state or "timeout"}
@@ -1882,6 +1899,12 @@ async def start_sip_transfer(
                 f"Transfer dialing request: room={room_name}, to={phone_number}, trunk_id={trunk_id}, source={trunk_source}"
             )
             participant_identity = f"transfer_{uuid.uuid4().hex[:8]}"
+            # wait_until_answered=False: return immediately after dial is initiated.
+            # With wait_until_answered=True the gRPC call blocks until answered and
+            # LiveKit *cancels the outbound leg* when it hits its internal timeout
+            # (~15s). That kills ringing to international numbers before they can
+            # answer. Instead we let the dial run asynchronously and detect answer
+            # via the room-participant polling + wait_for_transfer_established below.
             await lk_api.sip.create_sip_participant(
                 livekit_api.CreateSIPParticipantRequest(
                     sip_trunk_id=trunk_id,
@@ -1889,13 +1912,17 @@ async def start_sip_transfer(
                     room_name=room_name,
                     participant_identity=participant_identity,
                     play_ringtone=True,
-                    wait_until_answered=True,
+                    wait_until_answered=False,
                 )
             )
 
             if room:
                 joined = False
-                for _ in range(25):
+                # Poll for up to 6 seconds (60 × 0.1s) for the transfer leg to
+                # appear in the room. With wait_until_answered=False the SDK
+                # returns before the participant is visible, so we need a bit
+                # more patience here.
+                for _ in range(60):
                     if _room_has_participant_identity(room, participant_identity):
                         joined = True
                         break
@@ -1925,7 +1952,8 @@ async def start_sip_transfer(
                         "participant_identity": participant_identity,
                     }
 
-                established = await wait_for_transfer_established(room, participant_identity)
+                # Give international numbers (e.g. India) up to 45 s to answer.
+                established = await wait_for_transfer_established(room, participant_identity, timeout_sec=45.0)
                 if not established.get("ready"):
                     return {
                         "success": True,
@@ -1996,13 +2024,17 @@ async def run_transfer_handoff(
     sip_participant = detect_primary_sip_participant(room)
     if sip_participant:
         transfer_result = await transfer_room_sip_participant(room, target_phone)
-        transfer_result["agent_removed"] = {
-            "success": True,
-            "skipped": True,
-            "reason": "sip_refer_transfer",
-        }
-        return transfer_result
-
+        if transfer_result.get("success"):
+            transfer_result["agent_removed"] = {
+                "success": True,
+                "skipped": True,
+                "reason": "sip_refer_transfer",
+            }
+            return transfer_result
+        else:
+            logger.warning(f"SIP REFER transfer failed: {transfer_result.get('error')}. Falling back to bridged transfer.")
+    
+    # Fallback or primary: start a new SIP leg and bridge
     transfer_result = await start_sip_transfer(room.name, target_phone, call_id, room)
     if not transfer_result.get("success"):
         return transfer_result
@@ -2549,13 +2581,26 @@ class DynamicPropertyAgent(Agent):
         speech_mode = "{speech_mode}"
         # For builtin transfer, force payload phone_number from dashboard config.
         # This prevents model-provided numbers from overriding configured transfer target.
-        if normalized_tool_name in ("call_transfer", "transfer_call"):
-            for _cfg in self.functions_config:
-                if _normalize_tool_name(_cfg.get("name", "")) == normalized_tool_name:
-                    _configured_phone = str(_cfg.get("phone_number", "")).strip()
-                    if _configured_phone:
-                        payload["phone_number"] = _configured_phone
-                    break
+        _is_pstn_transfer = False
+        _configured_phone = ""
+        for _cfg in self.functions_config:
+            if _normalize_tool_name(_cfg.get("name", "")) == normalized_tool_name:
+                _url = _cfg.get("url", "")
+                _sys_type = _normalize_tool_name(_cfg.get("system_type", ""))
+                if _sys_type == "transfer_call" or _url == "builtin://transfer_call":
+                    _is_pstn_transfer = True
+                    _sys_cfg_val = _cfg.get("system_config") or {{}}
+                    if isinstance(_sys_cfg_val, str):
+                        try:
+                            import json as _json
+                            _sys_cfg_val = _json.loads(_sys_cfg_val)
+                        except:
+                            _sys_cfg_val = {{}}
+                    _configured_phone = str(_cfg.get("phone_number", "") or _sys_cfg_val.get("phone_number", "")).strip()
+                break
+        
+        if _is_pstn_transfer and _configured_phone:
+            payload["phone_number"] = _configured_phone
         logger.info(f"Tool {func_name} called with args: {{payload}}")
         
         # Send tool call transcript
@@ -2596,49 +2641,60 @@ class DynamicPropertyAgent(Agent):
                     }}
                     break
 
-                if normalized_name in ("call_transfer", "transfer_call"):
-                    configured_phone = str(func_cfg.get("phone_number", "")).strip()
-                    requested_phone = str(payload.get("phone_number", "")).strip()
-                    target_phone = configured_phone or requested_phone
-                    logger.info(
-                        f"transfer_call target resolved: configured={{configured_phone or 'NONE'}} requested={{requested_phone or 'NONE'}} final={{target_phone or 'NONE'}}"
+                normalized_name = normalized_tool_name
+                if system_type == "transfer_call" or url == "builtin://transfer_call" or str(func_cfg.get("variables", {{}})).find("__transfer_phone__") != -1:
+                    # PSTN transfer function. 
+                    # If it's a SYSTEM tool, we use system_config.phone_number.
+                    # If it's a legacy imported tool, we check variables.__transfer_phone__.
+                    # If it's the generic builtin, we check phone_number.
+                    
+                    sys_cfg = func_cfg.get("system_config") or {{}}
+                    if isinstance(sys_cfg, str):
+                        try:
+                            sys_cfg = json.loads(sys_cfg)
+                        except:
+                            sys_cfg = {{}}
+                    
+                    vars_cfg = func_cfg.get("variables") or {{}}
+                    
+                    target_phone = (
+                        str(sys_cfg.get("phone_number") or "").strip() or 
+                        str(vars_cfg.get("__transfer_phone__") or "").strip() or
+                        str(func_cfg.get("phone_number") or "").strip() or
+                        str(payload.get("phone_number") or "").strip()
                     )
+                    
+                    logger.info(f"PSTN Transfer Triggered ({{normalized_name}}) → {{target_phone}}")
                     if not target_phone:
                         result = {{"success": False, "error": "Transfer phone number is not configured"}}
+                    elif not self.room:
+                        result = {{"success": False, "error": "Room not available for transfer"}}
+                    elif self._transfer_in_progress:
+                        result = {{"success": False, "error": "Transfer is already in progress"}}
                     else:
-                        is_valid_phone, transfer_phone_error = _validate_transfer_phone(target_phone)
-                        if not is_valid_phone:
-                            result = {{"success": False, "error": transfer_phone_error}}
-                        elif not self.room:
-                            result = {{"success": False, "error": "Room not available for transfer"}}
-                        elif self._transfer_in_progress:
-                            result = {{"success": False, "error": "Transfer is already in progress"}}
-                        else:
-                            if hasattr(self, "call_id") and self.call_id:
-                                await report_builtin_action(self.call_id, "transfer_call", {{"phone_number": target_phone}})
-                            self._transfer_in_progress = True
-
-                            async def _do_handoff():
-                                try:
-                                    handoff_result = await run_transfer_handoff(
-                                        self.room,
-                                        getattr(self, "call_id", None),
-                                        target_phone,
-                                    )
-                                    logger.info(f"transfer_call handoff result: {{handoff_result}}")
-                                except Exception as handoff_exc:
-                                    logger.error(f"transfer_call handoff failed: {{handoff_exc}}")
-                                finally:
-                                    self._transfer_in_progress = False
-
-                            asyncio.create_task(_do_handoff())
-                            result = {{
-                                "success": True,
-                                "action": "transfer_call",
-                                "phone_number": target_phone,
-                                "status": "handoff_queued",
-                                "message": "Handoff queued; announce transfer to caller now.",
-                            }}
+                        if hasattr(self, "call_id") and self.call_id:
+                            await report_builtin_action(self.call_id, "transfer_call", {{"phone_number": target_phone}})
+                        self._transfer_in_progress = True
+                        async def _do_pstn_handoff():
+                            try:
+                                handoff_result = await run_transfer_handoff(
+                                    self.room,
+                                    getattr(self, "call_id", None),
+                                    target_phone,
+                                )
+                                logger.info(f"PSTN handoff result: {{handoff_result}}")
+                            except Exception as handoff_exc:
+                                logger.error(f"PSTN handoff failed: {{handoff_exc}}")
+                            finally:
+                                self._transfer_in_progress = False
+                        asyncio.create_task(_do_pstn_handoff())
+                        result = {{
+                            "success": True,
+                            "action": "transfer_call",
+                            "phone_number": target_phone,
+                            "status": "handoff_queued",
+                            "message": "Handoff queued; announce transfer to caller now.",
+                        }}
                 elif system_type == "agent_transfer" or url == "builtin://agent_transfer":
                     result = await perform_agent_transfer_handoff(
                         self,
@@ -2684,7 +2740,7 @@ class DynamicPropertyAgent(Agent):
                             except:
                                 result = {{"response": response.text, "status": response.status_code}}
                     except Exception as e:
-                        logger.error(f"Error calling {func_name}: {{e}}")
+                        logger.error(f"Error calling {{normalized_tool_name}}: {{e}}")
                         result = {{"error": str(e)}}
                 else:
                     result = {{"success": False, "error": "Function URL is empty"}}
@@ -2694,7 +2750,7 @@ class DynamicPropertyAgent(Agent):
         if hasattr(self, 'call_id') and self.call_id:
             try:
                 import httpx
-                msg = f"[Tool response: {func_name}] {{json.dumps(result)}}"
+                msg = f"[Tool response: {{normalized_tool_name}}] {{json.dumps(result)}}"
                 asyncio.ensure_future(send_transcript_to_api(self.call_id, "tool_response", msg))
             except:
                 pass
@@ -2702,7 +2758,7 @@ class DynamicPropertyAgent(Agent):
         if self.room:
             try:
                 asyncio.ensure_future(self.room.local_participant.publish_data(
-                    json.dumps({{"type": "tool_response", "tool_name": "{func_name}", "response": result}}),
+                    json.dumps({{"type": "tool_response", "tool_name": normalized_tool_name, "response": result}}),
                     topic="room"
                 ))
             except:
