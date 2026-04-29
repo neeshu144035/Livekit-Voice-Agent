@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import asyncio
 import logging
@@ -51,7 +51,7 @@ MIN_AGENT_LLM_TEMPERATURE = 0.0
 MAX_AGENT_LLM_TEMPERATURE = 1.5
 MIN_AGENT_VOICE_SPEED = 0.8
 MAX_AGENT_VOICE_SPEED = 1.2
-TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "0.5"))
+TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "2.5"))
 END_CALL_DISCONNECT_DELAY_SEC = float(os.getenv("END_CALL_DISCONNECT_DELAY_SEC", "1.0"))
 DISCONNECT_GRACE_SEC = float(os.getenv("DISCONNECT_GRACE_SEC", "20"))
 CHAT_REPLY_TIMEOUT_SEC = float(os.getenv("CHAT_REPLY_TIMEOUT_SEC", "40"))
@@ -141,10 +141,10 @@ AUTO_GREETING_FALLBACKS = {
     "fr": "Bonjour, comment puis-je vous aider aujourd'hui ?",
     "de": "Hallo, wie kann ich Ihnen heute helfen?",
     "it": "Ciao, come posso aiutarla oggi?",
-    "hi": "नमस्ते, मैं आपकी कैसे मदद कर सकता हूँ?",
-    "hi-IN": "नमस्ते, मैं आपकी कैसे मदद कर सकता हूँ?",
-    "ml": "നമസ്കാരം, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
-    "ml-IN": "നമസ്കാരം, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+    "hi": "αñ¿αñ«αñ╕αÑìαññαÑç, αñ«αÑêαñé αñåαñ¬αñòαÑÇ αñòαÑêαñ╕αÑç αñ«αñªαñª αñòαñ░ αñ╕αñòαññαñ╛ αñ╣αÑéαñü?",
+    "hi-IN": "αñ¿αñ«αñ╕αÑìαññαÑç, αñ«αÑêαñé αñåαñ¬αñòαÑÇ αñòαÑêαñ╕αÑç αñ«αñªαñª αñòαñ░ αñ╕αñòαññαñ╛ αñ╣αÑéαñü?",
+    "ml": "α┤¿α┤«α┤╕α╡ìα┤òα┤╛α┤░α┤é, α┤₧α┤╛α╡╗ α┤¿α┤┐α┤Öα╡ìα┤Öα┤│α╡å α┤Äα┤Öα╡ìα┤Öα┤¿α╡å α┤╕α┤╣α┤╛α┤»α┤┐α┤òα╡ìα┤òα┤╛α┤é?",
+    "ml-IN": "α┤¿α┤«α┤╕α╡ìα┤òα┤╛α┤░α┤é, α┤₧α┤╛α╡╗ α┤¿α┤┐α┤Öα╡ìα┤Öα┤│α╡å α┤Äα┤Öα╡ìα┤Öα┤¿α╡å α┤╕α┤╣α┤╛α┤»α┤┐α┤òα╡ìα┤òα┤╛α┤é?",
 }
 AUTO_GREETING_META_PREFIXES = (
     "you are ",
@@ -492,29 +492,11 @@ def _normalize_tool_speech_flags(
 
 def _tool_speech_instruction_line(func_cfg: Dict[str, Any]) -> str:
     tool_name = str(func_cfg.get("name", "")).strip().replace(" ", "_").lower() or "tool"
-    url = str(func_cfg.get("url", "")).strip()
-    system_type = _normalize_tool_name(func_cfg.get("system_type", ""))
-    is_transfer = (
-        system_type in {"transfer_call", "agent_transfer"}
-        or url in {"builtin://transfer_call", "builtin://agent_transfer"}
-        or "_transfer" in tool_name
-    )
     during, after = _normalize_tool_speech_flags(
         func_cfg.get("speak_during_execution", False),
         func_cfg.get("speak_after_execution", True),
         fallback_after=True,
     )
-    if is_transfer:
-        # STRICT TRANSFER RULE: prevents extra speech before/after transfer
-        return (
-            f"- `{tool_name}` (TRANSFER TOOL — HIGHEST PRIORITY): "
-            "Say EXACTLY ONE sentence: 'I am transferring you now.' "
-            "Then call the tool immediately. "
-            "After the tool returns, say ABSOLUTELY NOTHING. "
-            "Do not confirm, do not summarize, do not add any commentary. "
-            "Remain completely silent. "
-            f"If you cannot call the tool, say '[FORCE_TRANSFER:{tool_name}]' on a new line and remain silent."
-        )
     if during:
         return (
             f"- `{tool_name}`: first tell the caller what you are checking/doing, "
@@ -646,7 +628,7 @@ def _clean_prompt_greeting_candidate(candidate: str) -> str:
         flags=re.IGNORECASE,
     ).strip()
     cleaned = re.sub(r"^(?:assistant|agent)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"\s*(?:->|→).*$", "", cleaned).strip()
+    cleaned = re.sub(r"\s*(?:->|ΓåÆ).*$", "", cleaned).strip()
     cleaned = strip_known_prompt_style_tags(cleaned)
     cleaned = _strip_wrapping_quotes(cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
@@ -1126,7 +1108,7 @@ async def send_usage_to_api(call_id, tracker):
                 # Otherwise assume it's already in proper units or USD cents
                 if total_model_cost > 1000:
                     # Likely GBP pence - convert to USD
-                    # e.g., 9360 pence = Â£93.60 -> $118.93 (which is wrong for 5406 chars)
+                    # e.g., 9360 pence = ├é┬ú93.60 -> $118.93 (which is wrong for 5406 chars)
                     # Use a more reasonable conversion - assume cost should be ~$1-2 for typical calls
                     total_model_cost = (total_model_cost / 100.0) * 1.27
                     # If still too high, cap it based on character count
@@ -1732,13 +1714,13 @@ async def wait_for_transfer_established(
     # instead of spinning for the full timeout_sec.
     ever_joined = False
     gone_since: Optional[float] = None
-    GONE_BAIL_SEC = 3.0  # if absent for this long after joining → treat as dropped
+    GONE_BAIL_SEC = 3.0  # if absent for this long after joining ΓåÆ treat as dropped
 
     while time.monotonic() < deadline:
         participant = _get_room_participant_by_identity(room, participant_identity)
         if participant:
             ever_joined = True
-            gone_since = None  # reset — it's back in the room
+            gone_since = None  # reset ΓÇö it's back in the room
             sip_state = _participant_sip_state(participant)
             if sip_state:
                 last_state = sip_state
@@ -1746,7 +1728,7 @@ async def wait_for_transfer_established(
                 return {"ready": True, "reason": f"sip_state:{sip_state}"}
         else:
             if ever_joined:
-                # Participant was in the room but has now left — could be a
+                # Participant was in the room but has now left ΓÇö could be a
                 # transient SIP re-INVITE or a permanent no-answer/busy drop.
                 now = time.monotonic()
                 if gone_since is None:
@@ -1936,11 +1918,11 @@ async def start_sip_transfer(
 
             if room:
                 joined = False
-                # Poll for up to 6 seconds (60 × 0.1s) for the transfer leg to
+                # Poll for up to 6 seconds (60 ├ù 0.1s) for the transfer leg to
                 # appear in the room. With wait_until_answered=False the SDK
                 # returns before the participant is visible, so we need a bit
                 # more patience here.
-                for _ in range(20):
+                for _ in range(60):
                     if _room_has_participant_identity(room, participant_identity):
                         joined = True
                         break
@@ -2035,43 +2017,22 @@ async def run_transfer_handoff(
     target_phone: str,
     delay_sec: float = TRANSFER_HANDOFF_DELAY_SEC,
 ) -> Dict[str, Any]:
-    """Disconnect assistant immediately, then perform the SIP transfer in the background."""
-    # Step 1: Remove the agent from the room IMMEDIATELY so it cannot speak any further.
-    # The transfer dial runs independently via LiveKit server; the agent worker does not
-    # need to stay in the room once the dial has been initiated.
-    agent_identity = ""
-    try:
-        agent_identity = (getattr(room.local_participant, "identity", "") or "").strip()
-    except Exception:
-        agent_identity = ""
-
-    if agent_identity:
-        await remove_room_participant(room.name, agent_identity)
-        logger.info(f"Agent {agent_identity} removed from room immediately for PSTN transfer")
-    else:
-        logger.warning("Could not resolve agent identity for immediate removal")
-
+    """Delay handoff slightly so assistant can announce transfer, then disconnect assistant."""
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
 
     sip_participant = detect_primary_sip_participant(room)
     if sip_participant:
-        try:
-            transfer_result = await asyncio.wait_for(
-                transfer_room_sip_participant(room, target_phone),
-                timeout=3.0,
-            )
-            if transfer_result.get("success"):
-                transfer_result["agent_removed"] = {
-                    "success": True,
-                    "skipped": True,
-                    "reason": "sip_refer_transfer",
-                }
-                return transfer_result
-            else:
-                logger.warning(f"SIP REFER transfer failed: {transfer_result.get('error')}. Falling back to bridged transfer.")
-        except asyncio.TimeoutError:
-            logger.warning("SIP REFER transfer timed out after 3s. Falling back to bridged transfer.")
+        transfer_result = await transfer_room_sip_participant(room, target_phone)
+        if transfer_result.get("success"):
+            transfer_result["agent_removed"] = {
+                "success": True,
+                "skipped": True,
+                "reason": "sip_refer_transfer",
+            }
+            return transfer_result
+        else:
+            logger.warning(f"SIP REFER transfer failed: {transfer_result.get('error')}. Falling back to bridged transfer.")
     
     # Fallback or primary: start a new SIP leg and bridge
     transfer_result = await start_sip_transfer(room.name, target_phone, call_id, room)
@@ -2085,7 +2046,17 @@ async def run_transfer_handoff(
         }
         return transfer_result
 
-    transfer_result["agent_removed"] = {"success": True, "reason": "agent_already_removed"}
+    agent_identity = ""
+    try:
+        agent_identity = (getattr(room.local_participant, "identity", "") or "").strip()
+    except Exception:
+        agent_identity = ""
+
+    if not agent_identity:
+        transfer_result["agent_removed"] = {"success": False, "error": "Unable to resolve local agent identity"}
+        return transfer_result
+
+    transfer_result["agent_removed"] = await remove_room_participant(room.name, agent_identity)
     return transfer_result
 
 
@@ -2506,7 +2477,7 @@ async def perform_agent_transfer_handoff(
             "target_agent_id": target_agent_id,
             "target_agent_name": target_payload.get("name"),
             "resolved_version": target_payload.get("resolved_version"),
-            "message": "Transfer completed. DO NOT say anything further. Remain completely silent."
+            "message": "Transfer completed successfully."
         }
     except Exception as handoff_exc:
         logger.error("agent_transfer handoff failed: %s", handoff_exc)
@@ -2693,7 +2664,7 @@ class DynamicPropertyAgent(Agent):
                         str(payload.get("phone_number") or "").strip()
                     )
                     
-                    logger.info(f"PSTN Transfer Triggered ({{normalized_name}}) → {{target_phone}}")
+                    logger.info(f"PSTN Transfer Triggered ({{normalized_name}}) ΓåÆ {{target_phone}}")
                     if not target_phone:
                         result = {{"success": False, "error": "Transfer phone number is not configured"}}
                     elif not self.room:
@@ -2710,7 +2681,6 @@ class DynamicPropertyAgent(Agent):
                                     self.room,
                                     getattr(self, "call_id", None),
                                     target_phone,
-                                    delay_sec=0.0,
                                 )
                                 logger.info(f"PSTN handoff result: {{handoff_result}}")
                             except Exception as handoff_exc:
@@ -2723,7 +2693,7 @@ class DynamicPropertyAgent(Agent):
                             "action": "transfer_call",
                             "phone_number": target_phone,
                             "status": "handoff_queued",
-                            "message": "Transfer initiated. DO NOT speak further. DO NOT confirm. Remain silent.",
+                            "message": "Handoff queued; announce transfer to caller now.",
                         }}
                 elif system_type == "agent_transfer" or url == "builtin://agent_transfer":
                     result = await perform_agent_transfer_handoff(
@@ -2801,7 +2771,7 @@ class DynamicPropertyAgent(Agent):
     local_vars = {}
     exec(class_def, globals(), local_vars)
     AgentClass = local_vars["DynamicPropertyAgent"]
-    agent_instance = AgentClass(
+    return AgentClass(
         instructions=base_instructions,
         functions_config=functions_config,
         room=current_room,
@@ -2817,9 +2787,6 @@ class DynamicPropertyAgent(Agent):
         stt_engine=stt_engine,
         chat_ctx=chat_ctx,
     )
-    tool_names = [t.info.name if hasattr(t, 'info') else str(t) for t in agent_instance.tools]
-    logger.info(f"Dynamic agent created with tools: {tool_names}")
-    return agent_instance
 
 
 # ==================== SIP Detection ====================
@@ -3538,65 +3505,6 @@ async def entrypoint(ctx: JobContext):
                     logger.debug(f"Failed to publish agent transcript event: {publish_err}")
                 logger.info(f"[transcript] Agent: {content[:60]}...")
 
-                # WORKAROUND: xAI realtime may not support function calling.
-                # Detect FORCE_TRANSFER marker or natural-language transfer intent in agent speech
-                # and trigger transfer programmatically.
-                forced_tool_name = None
-                force_transfer_match = re.search(r'\[FORCE_TRANSFER:([^\]]+)\]', content)
-                if force_transfer_match:
-                    forced_tool_name = force_transfer_match.group(1).strip()
-                    logger.warning(f"FORCE_TRANSFER marker detected for tool: {forced_tool_name}")
-                else:
-                    # Fallback: detect natural-language transfer intent
-                    content_lower = content.lower()
-                    transfer_keywords = [
-                        (r'lettings|renting|rent\b', 'renting_agent_transfer'),
-                        (r'buying|sales|purchase|buy\b', 'buying_agent_transfer'),
-                        (r'selling|valuation|sell\b', 'selling_agent_transfer'),
-                        (r'maintenance|repair|fix\b', 'maintenance_agent_transfer'),
-                    ]
-                    if re.search(r'transferr?(ing|ed|s)?\b', content_lower):
-                        for pattern, tool_name in transfer_keywords:
-                            if re.search(pattern, content_lower):
-                                forced_tool_name = tool_name
-                                logger.warning(f"Transfer intent detected via NLP: {forced_tool_name} from text: {content[:80]}")
-                                break
-
-                if forced_tool_name and not getattr(agent, '_agent_transfer_in_progress', False) and not getattr(agent, '_transfer_in_progress', False):
-                    for func_cfg in (getattr(agent, 'functions_config', []) or []):
-                        if _normalize_tool_name(func_cfg.get('name', '')) == forced_tool_name:
-                            sys_type = _normalize_tool_name(func_cfg.get('system_type', ''))
-                            url = str(func_cfg.get('url', ''))
-                            if sys_type == 'agent_transfer' or url == 'builtin://agent_transfer':
-                                logger.info(f"Triggering agent transfer for {forced_tool_name} programmatically")
-                                asyncio.create_task(perform_agent_transfer_handoff(
-                                    agent,
-                                    forced_tool_name,
-                                    func_cfg,
-                                    'after',
-                                ))
-                            elif sys_type == 'transfer_call' or url == 'builtin://transfer_call':
-                                logger.info(f"Triggering PSTN transfer for {forced_tool_name} programmatically")
-                                sys_cfg = func_cfg.get('system_config') or {}
-                                if isinstance(sys_cfg, str):
-                                    try:
-                                        import json as _json
-                                        sys_cfg = _json.loads(sys_cfg)
-                                    except:
-                                        sys_cfg = {}
-                                target_phone = (
-                                    str(sys_cfg.get('phone_number') or '').strip() or
-                                    str(func_cfg.get('phone_number') or '').strip()
-                                )
-                                if target_phone and agent.room:
-                                    asyncio.create_task(run_transfer_handoff(
-                                        agent.room,
-                                        getattr(agent, 'call_id', None),
-                                        target_phone,
-                                        delay_sec=0.0,
-                                    ))
-                            break
-
                 if getattr(agent, "_pending_end_call_after_speech", False) and not getattr(agent, "_end_call_handoff_started", False):
                     setattr(agent, "_pending_end_call_after_speech", False)
                     setattr(agent, "_end_call_handoff_started", True)
@@ -3952,9 +3860,6 @@ async def entrypoint(ctx: JobContext):
         disconnect_grace_task = asyncio.create_task(_delayed_shutdown_if_empty())
     
     try:
-        agent_tools = [t.info.name if hasattr(t, 'info') else str(t) for t in agent.tools]
-        session_tools = [t.info.name if hasattr(t, 'info') else str(t) for t in session.tools]
-        logger.info(f"Starting session with agent tools: {agent_tools}, session tools: {session_tools}")
         await session.start(
             agent=agent,
             room=ctx.room,

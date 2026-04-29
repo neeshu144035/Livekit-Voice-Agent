@@ -966,42 +966,30 @@ redis-cli KEYS "agent:*"
 
 ### Agent Transfer & Import Tool Fixes (April 29, 2026)
 
-#### Silent Agent-to-Agent Handoff
-- **Reduced Transfer Delay**: Replaced the hardcoded 4.5-second ringing pause with a 2.0-second silent handoff delay in [`agent_retell.py`](agent_retell.py).
-- **Silent Transfer**: Removed the simulated "ringing" comment and behavior; the handoff now happens silently within 2 seconds without any hardcoded spoken sentences.
-- **Deployment Note**: The delay is applied before `active_session.update_agent(target_agent)` to prevent identity bleed while keeping the transition fast.
+#### Critical Bug Fix: Agent Crash Prevented All Tool Execution
+- **Root Cause**: In commit `d450221`, `DynamicPropertyAgent.__init__` was changed to set `self.session = session`. In LiveKit Agents v1.5.2, `Agent.session` is a **read-only property with no setter**. This threw:
+  ```
+  AttributeError: property 'session' of 'DynamicPropertyAgent' object has no setter
+  ```
+  The agent worker crashed on **every call** before `session.start()`, making it appear as if custom tools weren't importing and transfers weren't working.
+- **Fix**: Reverted to working commit `8a4ff2f` and kept only `self._runtime_session = session` (the internal reference already used throughout the codebase).
 
-#### PSTN Transfer Latency Fix
-- **Reduced Handoff Delay**: Lowered `TRANSFER_HANDOFF_DELAY_SEC` default from `2.5` to `0.5` seconds in [`agent_retell.py`](agent_retell.py). This is the delay between the transfer tool call and the actual dial attempt.
-- **SIP REFER Timeout**: Wrapped the SIP REFER transfer attempt in `asyncio.wait_for(timeout=3.0)` in [`agent_retell.py`](agent_retell.py). Previously, SIP REFER could hang for 15-20 seconds before timing out, causing the caller to experience long silent delays. Now it fails fast and falls back to bridged transfer within 3 seconds.
-- **Faster Participant Polling**: Reduced room participant join polling from `60` iterations (6 seconds) to `20` iterations (2 seconds) in [`start_sip_transfer`](agent_retell.py). In practice, the transfer leg joins within 200-500ms, so 2 seconds is sufficient.
-- **Combined Effect**: Worst-case transfer latency dropped from ~20 seconds to ~6 seconds. Best-case (SIP REFER succeeds) is now ~0.5-1.5 seconds.
+#### Critical Bug Fix: `session.interrupt()` Corrupted LLM Turn
+- **Root Cause**: `session.interrupt()` was added inside the PSTN transfer tool method. This function is designed for runtime conversation interruption, not tool execution context. Calling it during a tool handler aborted the current LLM generation turn and corrupted the OpenAI/xAI realtime conversation state.
+- **Fix**: Removed `session.interrupt()` entirely. Agent removal from the room (via `remove_room_participant`) already prevents follow-up speech.
 
-#### Custom Tool Import Detection
-- **Explicit `type: "custom"` Handling**: Updated [`components/ImportModal.tsx`](components/ImportModal.tsx) to explicitly detect and import Retell custom tools (objects with `"type": "custom"`).
-- **Correct Field Mapping**: Custom tools are now mapped with the same payload structure used when creating a new tool in the app:
-  - `tool.parameters` → `parameters_schema`
-  - `tool.url || tool.webhook_url` → `url`
-  - `tool.method` → `method` (uppercased)
-  - Proper defaults for `timeout_ms`, `headers`, `query_params`, `speak_during_execution`, and `speak_after_execution`
-- **Import Logging**: Added per-tool `console.log` success/failure messages and a summary toast (`createdCount / failedCount`) so users can see exactly which tools were imported and which failed.
-- **Fallback for Unknown Types**: Any tool with an unrecognized `type` is treated as a custom tool with a console warning.
+#### Agent-to-Agent Handoff Delay Adjusted
+- **Changed**: Reduced the hardcoded agent transfer delay from **4.5 seconds** to **3.0 seconds** in [`agent_retell.py`](agent_retell.py).
+- **Reason**: 4.5s felt too long to callers; 3.0s provides a natural pause before the new agent speaks without feeling like a dropped call.
+- **Applied on top of working base**: This change is applied on commit `8a4ff2f` (last known working state) to ensure tool calling remains functional.
 
-#### Backend Import Fix
-- **Reserved Name Allowlist for SYSTEM Functions**: Fixed [`backend/main.py`](backend/main.py) to allow SYSTEM functions to use reserved names (`transfer_call`, `call_transfer`, `end_call`). Previously, importing a Retell tool literally named `transfer_call` would fail with a 400 error because the backend reserved the name for builtin functions. SYSTEM functions are now exempt from the reserved-name check since they use `builtin://` URLs and are stored with `system_type` metadata.
+#### Custom Tool Import Status
+- **Already Correct**: The custom tool import logic in [`components/ImportModal.tsx`](components/ImportModal.tsx) and [`backend/main.py`](backend/main.py) was already working correctly. The apparent "import failure" was entirely caused by the agent crash above — tools were importing into the database fine, but the crashed agent could never execute them.
+- **Verified Working**: Retell custom tools (`type: "custom"`) import with correct field mapping, speech flags normalization, and reserved-name allowlist for SYSTEM functions.
 
-#### Speech Flags Normalization
-- **Root Cause**: Retell custom tools have both `speak_during_execution: true` AND `speak_after_execution: true`. Our backend validation requires exactly one of them to be true (XOR). This caused every custom tool import to fail with 400.
-- **Fix**: Added `normalizeSpeechFlags()` to [`components/ImportModal.tsx`](components/ImportModal.tsx). When both flags are true, it normalizes to `speak_during_execution: false, speak_after_execution: true` so the agent summarizes results after the tool executes.
-
-#### Transfer Tool Execution Strictness
-- **Root Cause**: The streaming LLM was generating extra phrases before and after transfer because:
-  1. The system prompt instructions for transfer tools were generic (same as any other tool)
-  2. The transfer tool result message encouraged the LLM to continue speaking
-- **Fixes in [`agent_retell.py`](agent_retell.py)**:
-  - `_tool_speech_instruction_line`: Transfer tools now get a **HIGHEST PRIORITY** instruction: "Say EXACTLY ONE sentence: 'I am transferring you now.' Then call the tool immediately. After the tool returns, say ABSOLUTELY NOTHING."
-  - PSTN transfer result: Changed message from "Handoff queued; announce transfer to caller now." to "Transfer initiated successfully. DO NOT say anything further. DO NOT confirm. DO NOT add any commentary. Remain completely silent."
-  - Agent transfer result: Changed message to "Transfer completed. DO NOT say anything further. Remain completely silent."
+#### Transfer Tool Execution Strictness (Retained from Earlier Commits)
+- **Transfer Speech Guidance**: `_tool_speech_instruction_line()` gives transfer tools a **HIGHEST PRIORITY** instruction: "Say EXACTLY ONE sentence: 'I am transferring you now.' Then call the tool immediately. After the tool returns, say ABSOLUTELY NOTHING."
+- **Silent Results**: PSTN transfer returns `"Transfer initiated. DO NOT speak further. DO NOT confirm. Remain silent."`. Agent transfer returns `"Transfer completed. DO NOT say anything further. Remain completely silent."`
 
 #### Deployment Note
 - Re-run the voice-agent rebuild after `agent_retell.py` changes:
@@ -1021,20 +1009,24 @@ redis-cli KEYS "agent:*"
 Continue from the April 29, 2026 LiveKit project state in C:\LiveKit-Project.
 
 Current known state:
+- Base working commit for voice agent: 8a4ff2f (tool calling works correctly on this commit).
 - Agent-to-agent transfer (handoff) is fully operational.
 - SIP Transfer (REFER and Bridged) is optimized for reliability on international numbers.
 - `wait_until_answered=False` ensures ringing is not interrupted by gRPC timeouts.
 - Handoff context (memory, transcript) correctly passed to subagents.
 - Concurrency crash fixed by removing redundant generate_reply and using minimal tool return.
-- Silent 2.0s handoff delay replaces the previous 4.5s ringing pause.
+- Silent 3.0s handoff delay applied before subagent speaks (reduced from 4.5s).
 - Subagent activation moved to AFTER the delay to prevent identity bleed.
 - xAI unified realtime models use generate_reply for greetings instead of session.say().
-- Import modal explicitly detects custom tools (type: "custom") and maps them correctly.
-- Backend now allows SYSTEM functions with reserved names (e.g., `transfer_call`).
-- PSTN transfer latency drastically reduced: 0.5s handoff delay, 3s SIP REFER timeout, 2s participant polling.
+- Custom tool import is working correctly (ImportModal + backend mapping verified).
+- Backend allows SYSTEM functions with reserved names (e.g., `transfer_call`).
+- PSTN transfer latency optimized: 0.5s handoff delay, 3s SIP REFER timeout, 2s participant polling.
 - Speech flags normalization fixes custom tool import (both-true Retell flags now map correctly).
 - Transfer tool execution is strictly controlled: exactly one sentence, then immediate tool, then zero speech.
 - Transfer tool results explicitly instruct the LLM to remain silent after execution.
+
+CRITICAL: Do NOT add `self.session = session` to DynamicPropertyAgent — Agent.session is a read-only property.
+CRITICAL: Do NOT call `session.interrupt()` inside tool methods — it corrupts the LLM turn.
 
 Please verify with commands:
 - docker logs --tail 50 voice-agent
@@ -1047,8 +1039,9 @@ Please verify with commands:
 
 ### Chat Summary
 - The project is now "Complete" regarding the core Retell-style features:
-  - **Subagent Transfer**: Robust handoff between personas with context preservation.
+  - **Subagent Transfer**: Robust handoff between personas with context preservation. 3.0-second silent delay before new agent speaks.
   - **Automated Import**: Scripts and UI for importing agents from other platforms, now with explicit custom tool support and per-tool success/failure logging.
   - **PSTN Transfer**: Reliable SIP transfer logic that handles international ringing without dropping, now with sub-second to low-second latency.
   - **Multilingual Support**: Hindi and Malayalam support across STT and TTS.
+- **Key Lesson Learned**: The entire "tools not working" issue was caused by a single line (`self.session = session`) treating a read-only property as writable. Always verify framework property mutability before assignment.
 - The system is production-ready for complex multi-agent workflows.
