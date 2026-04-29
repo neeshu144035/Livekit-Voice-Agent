@@ -2478,7 +2478,7 @@ async def perform_agent_transfer_handoff(
             chat_ctx=new_chat_ctx,
         )
         # Silent handoff delay before the new agent speaks
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(3.0)
 
         active_session.update_agent(target_agent)
         if call_id:
@@ -2703,15 +2703,6 @@ class DynamicPropertyAgent(Agent):
                     else:
                         if hasattr(self, "call_id") and self.call_id:
                             await report_builtin_action(self.call_id, "transfer_call", {{"phone_number": target_phone}})
-                        # Immediately interrupt the agent to stop any ongoing speech or LLM generation.
-                        # This prevents the agent from saying follow-up sentences after the transfer tool fires.
-                        _sess = getattr(self, "session", None) or getattr(self, "_runtime_session", None)
-                        if _sess and hasattr(_sess, "interrupt"):
-                            try:
-                                _sess.interrupt()
-                                logger.info("PSTN transfer: session.interrupt() called to stop agent speech")
-                            except Exception as _intr_err:
-                                logger.warning(f"PSTN transfer: session.interrupt() failed: {{_intr_err}}")
                         self._transfer_in_progress = True
                         async def _do_pstn_handoff():
                             try:
