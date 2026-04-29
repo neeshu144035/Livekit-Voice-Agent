@@ -123,25 +123,53 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                     speak_during_execution: false,
                     speak_after_execution: true,
                 };
-            } else {
+            } else if (tool.type === 'custom' || !tool.type) {
+                // Explicit custom tool handling with correct field mapping from Retell format
                 const functionPayload = {
                     name: tool.name || 'custom_tool',
                     description: tool.description || '',
                     url: tool.url || tool.webhook_url || '',
-                    method: tool.method || 'POST',
+                    method: (tool.method || 'POST').toUpperCase(),
                     timeout_ms: tool.timeout_ms || 120000,
                     headers: tool.headers || {},
                     query_params: tool.query_params || {},
                     parameters_schema: tool.parameters || tool.parameters_schema || { type: 'object', properties: {} },
                     variables: tool.variables || {},
-                    speak_during_execution: tool.speak_during_execution || false,
+                    speak_during_execution: tool.speak_during_execution !== undefined ? tool.speak_during_execution : false,
                     speak_after_execution: tool.speak_after_execution !== undefined ? tool.speak_after_execution : true,
                 };
-                await fetch(`/api/agents/${agentId}/functions`, {
+                const fnResp = await fetch(`/api/agents/${agentId}/functions`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(functionPayload),
                 });
+                if (!fnResp.ok) {
+                    console.warn(`Failed to create custom function ${tool.name}:`, await fnResp.text());
+                }
+            } else {
+                // Fallback: treat any other tool type as custom with same mapping
+                console.warn(`Unknown tool type "${tool.type}" for ${tool.name}, treating as custom.`);
+                const functionPayload = {
+                    name: tool.name || 'custom_tool',
+                    description: tool.description || '',
+                    url: tool.url || tool.webhook_url || '',
+                    method: (tool.method || 'POST').toUpperCase(),
+                    timeout_ms: tool.timeout_ms || 120000,
+                    headers: tool.headers || {},
+                    query_params: tool.query_params || {},
+                    parameters_schema: tool.parameters || tool.parameters_schema || { type: 'object', properties: {} },
+                    variables: tool.variables || {},
+                    speak_during_execution: tool.speak_during_execution !== undefined ? tool.speak_during_execution : false,
+                    speak_after_execution: tool.speak_after_execution !== undefined ? tool.speak_after_execution : true,
+                };
+                const fnResp = await fetch(`/api/agents/${agentId}/functions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(functionPayload),
+                });
+                if (!fnResp.ok) {
+                    console.warn(`Failed to create function ${tool.name}:`, await fnResp.text());
+                }
             }
         }
 

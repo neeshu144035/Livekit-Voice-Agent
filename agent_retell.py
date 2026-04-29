@@ -2449,8 +2449,8 @@ async def perform_agent_transfer_handoff(
             stt_engine=runtime_bundle.get("stt_engine"),
             chat_ctx=new_chat_ctx,
         )
-        # Simulate a natural transfer/ringing delay before the new agent speaks
-        await asyncio.sleep(4.5)
+        # Silent handoff delay before the new agent speaks
+        await asyncio.sleep(2.0)
 
         active_session.update_agent(target_agent)
         if call_id:

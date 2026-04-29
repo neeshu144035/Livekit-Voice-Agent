@@ -964,9 +964,35 @@ redis-cli KEYS "agent:*"
 
 ---
 
+### Agent Transfer & Import Tool Fixes (April 29, 2026)
+
+#### Silent Agent-to-Agent Handoff
+- **Reduced Transfer Delay**: Replaced the hardcoded 4.5-second ringing pause with a 2.0-second silent handoff delay in [`agent_retell.py`](agent_retell.py).
+- **Silent Transfer**: Removed the simulated "ringing" comment and behavior; the handoff now happens silently within 2 seconds without any hardcoded spoken sentences.
+- **Deployment Note**: The delay is applied before `active_session.update_agent(target_agent)` to prevent identity bleed while keeping the transition fast.
+
+#### Custom Tool Import Detection
+- **Explicit `type: "custom"` Handling**: Updated [`components/ImportModal.tsx`](components/ImportModal.tsx) to explicitly detect and import Retell custom tools (objects with `"type": "custom"`).
+- **Correct Field Mapping**: Custom tools are now mapped with the same payload structure used when creating a new tool in the app:
+  - `tool.parameters` → `parameters_schema`
+  - `tool.url || tool.webhook_url` → `url`
+  - `tool.method` → `method` (uppercased)
+  - Proper defaults for `timeout_ms`, `headers`, `query_params`, `speak_during_execution`, and `speak_after_execution`
+- **Builtin Tools Preserved**: `agent_transfer`, `transfer_call`, and `end_call` continue to be imported as built-in system functions.
+- **Fallback for Unknown Types**: Any tool with an unrecognized `type` is treated as a custom tool with a console warning.
+
+#### Deployment Note
+- Re-run the voice-agent rebuild after `agent_retell.py` changes:
+  ```bash
+  ssh -i livekit-company-key.pem ubuntu@13.135.81.172 "cd ~/livekit-agent && docker compose up -d --build voice-agent"
+  ```
+- The frontend must be rebuilt and redeployed to the VPS after `ImportModal.tsx` changes.
+
+---
+
 ### Suggested Prompt For A New Chat
 ```text
-Continue from the April 27, 2026 LiveKit project state in C:\LiveKit-Project.
+Continue from the April 29, 2026 LiveKit project state in C:\LiveKit-Project.
 
 Current known state:
 - Agent-to-agent transfer (handoff) is fully operational.
@@ -974,9 +1000,11 @@ Current known state:
 - `wait_until_answered=False` ensures ringing is not interrupted by gRPC timeouts.
 - Handoff context (memory, transcript) correctly passed to subagents.
 - Concurrency crash fixed by removing redundant generate_reply and using minimal tool return.
-- Natural 4.5s ringing delay added to the handoff process.
+- Silent 2.0s handoff delay replaces the previous 4.5s ringing pause.
 - Subagent activation moved to AFTER the delay to prevent identity bleed.
 - xAI unified realtime models use generate_reply for greetings instead of session.say().
+- Import modal explicitly detects custom tools (type: "custom") and maps them correctly.
+- Builtin tools (agent_transfer, transfer_call, end_call) remain correctly imported as system functions.
 
 Please verify with commands:
 - docker logs --tail 50 voice-agent
@@ -985,12 +1013,12 @@ Please verify with commands:
 
 ---
 
-## Project State Summary (April 27, 2026)
+## Project State Summary (April 29, 2026)
 
 ### Chat Summary
 - The project is now "Complete" regarding the core Retell-style features:
   - **Subagent Transfer**: Robust handoff between personas with context preservation.
-  - **Automated Import**: Scripts and UI for importing agents from other platforms.
+  - **Automated Import**: Scripts and UI for importing agents from other platforms, now with explicit custom tool support.
   - **PSTN Transfer**: Reliable SIP transfer logic that handles international ringing without dropping.
   - **Multilingual Support**: Hindi and Malayalam support across STT and TTS.
 - The system is production-ready for complex multi-agent workflows.
