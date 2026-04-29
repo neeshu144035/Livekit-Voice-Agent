@@ -512,7 +512,8 @@ def _tool_speech_instruction_line(func_cfg: Dict[str, Any]) -> str:
             "Then call the tool immediately. "
             "After the tool returns, say ABSOLUTELY NOTHING. "
             "Do not confirm, do not summarize, do not add any commentary. "
-            "Remain completely silent."
+            "Remain completely silent. "
+            f"If you cannot call the tool, say '[FORCE_TRANSFER:{tool_name}]' on a new line and remain silent."
         )
     if during:
         return (
@@ -2546,7 +2547,6 @@ class DynamicPropertyAgent(Agent):
         self.functions_config = functions_config
         self.room = room
         self.call_id = call_id
-        self.session = session
         self._runtime_session = session
         self.agent_id = agent_id
         self.agent_label = agent_label
@@ -2801,7 +2801,7 @@ class DynamicPropertyAgent(Agent):
     local_vars = {}
     exec(class_def, globals(), local_vars)
     AgentClass = local_vars["DynamicPropertyAgent"]
-    return AgentClass(
+    agent_instance = AgentClass(
         instructions=base_instructions,
         functions_config=functions_config,
         room=current_room,
@@ -2817,6 +2817,9 @@ class DynamicPropertyAgent(Agent):
         stt_engine=stt_engine,
         chat_ctx=chat_ctx,
     )
+    tool_names = [t.info.name if hasattr(t, 'info') else str(t) for t in agent_instance.tools]
+    logger.info(f"Dynamic agent created with tools: {tool_names}")
+    return agent_instance
 
 
 # ==================== SIP Detection ====================
@@ -3535,6 +3538,65 @@ async def entrypoint(ctx: JobContext):
                     logger.debug(f"Failed to publish agent transcript event: {publish_err}")
                 logger.info(f"[transcript] Agent: {content[:60]}...")
 
+                # WORKAROUND: xAI realtime may not support function calling.
+                # Detect FORCE_TRANSFER marker or natural-language transfer intent in agent speech
+                # and trigger transfer programmatically.
+                forced_tool_name = None
+                force_transfer_match = re.search(r'\[FORCE_TRANSFER:([^\]]+)\]', content)
+                if force_transfer_match:
+                    forced_tool_name = force_transfer_match.group(1).strip()
+                    logger.warning(f"FORCE_TRANSFER marker detected for tool: {forced_tool_name}")
+                else:
+                    # Fallback: detect natural-language transfer intent
+                    content_lower = content.lower()
+                    transfer_keywords = [
+                        (r'lettings|renting|rent\b', 'renting_agent_transfer'),
+                        (r'buying|sales|purchase|buy\b', 'buying_agent_transfer'),
+                        (r'selling|valuation|sell\b', 'selling_agent_transfer'),
+                        (r'maintenance|repair|fix\b', 'maintenance_agent_transfer'),
+                    ]
+                    if re.search(r'transferr?(ing|ed|s)?\b', content_lower):
+                        for pattern, tool_name in transfer_keywords:
+                            if re.search(pattern, content_lower):
+                                forced_tool_name = tool_name
+                                logger.warning(f"Transfer intent detected via NLP: {forced_tool_name} from text: {content[:80]}")
+                                break
+
+                if forced_tool_name and not getattr(agent, '_agent_transfer_in_progress', False) and not getattr(agent, '_transfer_in_progress', False):
+                    for func_cfg in (getattr(agent, 'functions_config', []) or []):
+                        if _normalize_tool_name(func_cfg.get('name', '')) == forced_tool_name:
+                            sys_type = _normalize_tool_name(func_cfg.get('system_type', ''))
+                            url = str(func_cfg.get('url', ''))
+                            if sys_type == 'agent_transfer' or url == 'builtin://agent_transfer':
+                                logger.info(f"Triggering agent transfer for {forced_tool_name} programmatically")
+                                asyncio.create_task(perform_agent_transfer_handoff(
+                                    agent,
+                                    forced_tool_name,
+                                    func_cfg,
+                                    'after',
+                                ))
+                            elif sys_type == 'transfer_call' or url == 'builtin://transfer_call':
+                                logger.info(f"Triggering PSTN transfer for {forced_tool_name} programmatically")
+                                sys_cfg = func_cfg.get('system_config') or {}
+                                if isinstance(sys_cfg, str):
+                                    try:
+                                        import json as _json
+                                        sys_cfg = _json.loads(sys_cfg)
+                                    except:
+                                        sys_cfg = {}
+                                target_phone = (
+                                    str(sys_cfg.get('phone_number') or '').strip() or
+                                    str(func_cfg.get('phone_number') or '').strip()
+                                )
+                                if target_phone and agent.room:
+                                    asyncio.create_task(run_transfer_handoff(
+                                        agent.room,
+                                        getattr(agent, 'call_id', None),
+                                        target_phone,
+                                        delay_sec=0.0,
+                                    ))
+                            break
+
                 if getattr(agent, "_pending_end_call_after_speech", False) and not getattr(agent, "_end_call_handoff_started", False):
                     setattr(agent, "_pending_end_call_after_speech", False)
                     setattr(agent, "_end_call_handoff_started", True)
@@ -3890,6 +3952,9 @@ async def entrypoint(ctx: JobContext):
         disconnect_grace_task = asyncio.create_task(_delayed_shutdown_if_empty())
     
     try:
+        agent_tools = [t.info.name if hasattr(t, 'info') else str(t) for t in agent.tools]
+        session_tools = [t.info.name if hasattr(t, 'info') else str(t) for t in session.tools]
+        logger.info(f"Starting session with agent tools: {agent_tools}, session tools: {session_tools}")
         await session.start(
             agent=agent,
             room=ctx.room,
