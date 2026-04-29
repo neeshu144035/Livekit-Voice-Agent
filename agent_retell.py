@@ -2034,7 +2034,22 @@ async def run_transfer_handoff(
     target_phone: str,
     delay_sec: float = TRANSFER_HANDOFF_DELAY_SEC,
 ) -> Dict[str, Any]:
-    """Delay handoff slightly so assistant can announce transfer, then disconnect assistant."""
+    """Disconnect assistant immediately, then perform the SIP transfer in the background."""
+    # Step 1: Remove the agent from the room IMMEDIATELY so it cannot speak any further.
+    # The transfer dial runs independently via LiveKit server; the agent worker does not
+    # need to stay in the room once the dial has been initiated.
+    agent_identity = ""
+    try:
+        agent_identity = (getattr(room.local_participant, "identity", "") or "").strip()
+    except Exception:
+        agent_identity = ""
+
+    if agent_identity:
+        await remove_room_participant(room.name, agent_identity)
+        logger.info(f"Agent {agent_identity} removed from room immediately for PSTN transfer")
+    else:
+        logger.warning("Could not resolve agent identity for immediate removal")
+
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
 
@@ -2069,17 +2084,7 @@ async def run_transfer_handoff(
         }
         return transfer_result
 
-    agent_identity = ""
-    try:
-        agent_identity = (getattr(room.local_participant, "identity", "") or "").strip()
-    except Exception:
-        agent_identity = ""
-
-    if not agent_identity:
-        transfer_result["agent_removed"] = {"success": False, "error": "Unable to resolve local agent identity"}
-        return transfer_result
-
-    transfer_result["agent_removed"] = await remove_room_participant(room.name, agent_identity)
+    transfer_result["agent_removed"] = {"success": True, "reason": "agent_already_removed"}
     return transfer_result
 
 
@@ -2541,6 +2546,7 @@ class DynamicPropertyAgent(Agent):
         self.functions_config = functions_config
         self.room = room
         self.call_id = call_id
+        self.session = session
         self._runtime_session = session
         self.agent_id = agent_id
         self.agent_label = agent_label
@@ -2697,6 +2703,15 @@ class DynamicPropertyAgent(Agent):
                     else:
                         if hasattr(self, "call_id") and self.call_id:
                             await report_builtin_action(self.call_id, "transfer_call", {{"phone_number": target_phone}})
+                        # Immediately interrupt the agent to stop any ongoing speech or LLM generation.
+                        # This prevents the agent from saying follow-up sentences after the transfer tool fires.
+                        _sess = getattr(self, "session", None) or getattr(self, "_runtime_session", None)
+                        if _sess and hasattr(_sess, "interrupt"):
+                            try:
+                                _sess.interrupt()
+                                logger.info("PSTN transfer: session.interrupt() called to stop agent speech")
+                            except Exception as _intr_err:
+                                logger.warning(f"PSTN transfer: session.interrupt() failed: {{_intr_err}}")
                         self._transfer_in_progress = True
                         async def _do_pstn_handoff():
                             try:
@@ -2704,6 +2719,7 @@ class DynamicPropertyAgent(Agent):
                                     self.room,
                                     getattr(self, "call_id", None),
                                     target_phone,
+                                    delay_sec=0.0,
                                 )
                                 logger.info(f"PSTN handoff result: {{handoff_result}}")
                             except Exception as handoff_exc:
@@ -2716,7 +2732,7 @@ class DynamicPropertyAgent(Agent):
                             "action": "transfer_call",
                             "phone_number": target_phone,
                             "status": "handoff_queued",
-                            "message": "Transfer initiated successfully. DO NOT say anything further. DO NOT confirm. DO NOT add any commentary. Remain completely silent.",
+                            "message": "Transfer initiated. DO NOT speak further. DO NOT confirm. Remain silent.",
                         }}
                 elif system_type == "agent_transfer" or url == "builtin://agent_transfer":
                     result = await perform_agent_transfer_handoff(
