@@ -990,6 +990,19 @@ redis-cli KEYS "agent:*"
 #### Backend Import Fix
 - **Reserved Name Allowlist for SYSTEM Functions**: Fixed [`backend/main.py`](backend/main.py) to allow SYSTEM functions to use reserved names (`transfer_call`, `call_transfer`, `end_call`). Previously, importing a Retell tool literally named `transfer_call` would fail with a 400 error because the backend reserved the name for builtin functions. SYSTEM functions are now exempt from the reserved-name check since they use `builtin://` URLs and are stored with `system_type` metadata.
 
+#### Speech Flags Normalization
+- **Root Cause**: Retell custom tools have both `speak_during_execution: true` AND `speak_after_execution: true`. Our backend validation requires exactly one of them to be true (XOR). This caused every custom tool import to fail with 400.
+- **Fix**: Added `normalizeSpeechFlags()` to [`components/ImportModal.tsx`](components/ImportModal.tsx). When both flags are true, it normalizes to `speak_during_execution: false, speak_after_execution: true` so the agent summarizes results after the tool executes.
+
+#### Transfer Tool Execution Strictness
+- **Root Cause**: The streaming LLM was generating extra phrases before and after transfer because:
+  1. The system prompt instructions for transfer tools were generic (same as any other tool)
+  2. The transfer tool result message encouraged the LLM to continue speaking
+- **Fixes in [`agent_retell.py`](agent_retell.py)**:
+  - `_tool_speech_instruction_line`: Transfer tools now get a **HIGHEST PRIORITY** instruction: "Say EXACTLY ONE sentence: 'I am transferring you now.' Then call the tool immediately. After the tool returns, say ABSOLUTELY NOTHING."
+  - PSTN transfer result: Changed message from "Handoff queued; announce transfer to caller now." to "Transfer initiated successfully. DO NOT say anything further. DO NOT confirm. DO NOT add any commentary. Remain completely silent."
+  - Agent transfer result: Changed message to "Transfer completed. DO NOT say anything further. Remain completely silent."
+
 #### Deployment Note
 - Re-run the voice-agent rebuild after `agent_retell.py` changes:
   ```bash
@@ -1019,6 +1032,9 @@ Current known state:
 - Import modal explicitly detects custom tools (type: "custom") and maps them correctly.
 - Backend now allows SYSTEM functions with reserved names (e.g., `transfer_call`).
 - PSTN transfer latency drastically reduced: 0.5s handoff delay, 3s SIP REFER timeout, 2s participant polling.
+- Speech flags normalization fixes custom tool import (both-true Retell flags now map correctly).
+- Transfer tool execution is strictly controlled: exactly one sentence, then immediate tool, then zero speech.
+- Transfer tool results explicitly instruct the LLM to remain silent after execution.
 
 Please verify with commands:
 - docker logs --tail 50 voice-agent

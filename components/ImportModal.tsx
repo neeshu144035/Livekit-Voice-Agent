@@ -42,6 +42,20 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
         }
     };
 
+    const normalizeSpeechFlags = (tool: any) => {
+        const during = Boolean(tool.speak_during_execution);
+        const after = Boolean(tool.speak_after_execution);
+        if (during && after) {
+            // Retell allows both; our backend requires exactly one.
+            // Prefer speak_after_execution so the agent summarizes results.
+            return { speak_during_execution: false, speak_after_execution: true };
+        }
+        if (!during && !after) {
+            return { speak_during_execution: false, speak_after_execution: true };
+        }
+        return { speak_during_execution: during, speak_after_execution: after };
+    };
+
     const importRetellAgent = async (jsonData: any) => {
         if (!jsonData.agent_name && !jsonData.retellLlmData) {
             throw new Error('Invalid Retell agent JSON format');
@@ -135,6 +149,7 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                 console.log(`[Import] Registered builtin end_call`);
             } else if (tool.type === 'custom' || !tool.type) {
                 // Explicit custom tool handling with correct field mapping from Retell format
+                const speechFlags = normalizeSpeechFlags(tool);
                 const functionPayload = {
                     name: tool.name || 'custom_tool',
                     description: tool.description || '',
@@ -145,8 +160,7 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                     query_params: tool.query_params || {},
                     parameters_schema: tool.parameters || tool.parameters_schema || { type: 'object', properties: {} },
                     variables: tool.variables || {},
-                    speak_during_execution: tool.speak_during_execution !== undefined ? tool.speak_during_execution : false,
-                    speak_after_execution: tool.speak_after_execution !== undefined ? tool.speak_after_execution : true,
+                    ...speechFlags,
                 };
                 console.log(`[Import] Creating custom function: ${tool.name}`, functionPayload);
                 const fnResp = await fetch(`/api/agents/${agentId}/functions`, {
@@ -165,6 +179,7 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
             } else {
                 // Fallback: treat any other tool type as custom with same mapping
                 console.warn(`[Import] Unknown tool type "${tool.type}" for ${tool.name}, treating as custom.`);
+                const speechFlags = normalizeSpeechFlags(tool);
                 const functionPayload = {
                     name: tool.name || 'custom_tool',
                     description: tool.description || '',
@@ -175,8 +190,7 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                     query_params: tool.query_params || {},
                     parameters_schema: tool.parameters || tool.parameters_schema || { type: 'object', properties: {} },
                     variables: tool.variables || {},
-                    speak_during_execution: tool.speak_during_execution !== undefined ? tool.speak_during_execution : false,
-                    speak_after_execution: tool.speak_after_execution !== undefined ? tool.speak_after_execution : true,
+                    ...speechFlags,
                 };
                 console.log(`[Import] Creating fallback function: ${tool.name}`, functionPayload);
                 const fnResp = await fetch(`/api/agents/${agentId}/functions`, {

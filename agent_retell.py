@@ -492,11 +492,28 @@ def _normalize_tool_speech_flags(
 
 def _tool_speech_instruction_line(func_cfg: Dict[str, Any]) -> str:
     tool_name = str(func_cfg.get("name", "")).strip().replace(" ", "_").lower() or "tool"
+    url = str(func_cfg.get("url", "")).strip()
+    system_type = _normalize_tool_name(func_cfg.get("system_type", ""))
+    is_transfer = (
+        system_type in {"transfer_call", "agent_transfer"}
+        or url in {"builtin://transfer_call", "builtin://agent_transfer"}
+        or "_transfer" in tool_name
+    )
     during, after = _normalize_tool_speech_flags(
         func_cfg.get("speak_during_execution", False),
         func_cfg.get("speak_after_execution", True),
         fallback_after=True,
     )
+    if is_transfer:
+        # STRICT TRANSFER RULE: prevents extra speech before/after transfer
+        return (
+            f"- `{tool_name}` (TRANSFER TOOL — HIGHEST PRIORITY): "
+            "Say EXACTLY ONE sentence: 'I am transferring you now.' "
+            "Then call the tool immediately. "
+            "After the tool returns, say ABSOLUTELY NOTHING. "
+            "Do not confirm, do not summarize, do not add any commentary. "
+            "Remain completely silent."
+        )
     if during:
         return (
             f"- `{tool_name}`: first tell the caller what you are checking/doing, "
@@ -2483,7 +2500,7 @@ async def perform_agent_transfer_handoff(
             "target_agent_id": target_agent_id,
             "target_agent_name": target_payload.get("name"),
             "resolved_version": target_payload.get("resolved_version"),
-            "message": "Transfer completed successfully."
+            "message": "Transfer completed. DO NOT say anything further. Remain completely silent."
         }
     except Exception as handoff_exc:
         logger.error("agent_transfer handoff failed: %s", handoff_exc)
@@ -2699,7 +2716,7 @@ class DynamicPropertyAgent(Agent):
                             "action": "transfer_call",
                             "phone_number": target_phone,
                             "status": "handoff_queued",
-                            "message": "Handoff queued; announce transfer to caller now.",
+                            "message": "Transfer initiated successfully. DO NOT say anything further. DO NOT confirm. DO NOT add any commentary. Remain completely silent.",
                         }}
                 elif system_type == "agent_transfer" or url == "builtin://agent_transfer":
                     result = await perform_agent_transfer_handoff(
