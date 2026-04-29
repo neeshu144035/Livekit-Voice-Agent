@@ -85,6 +85,8 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
 
         const tools = jsonData.retellLlmData?.general_tools || jsonData.tools || [];
         const builtinFunctions: any = {};
+        let createdCount = 0;
+        let failedCount = 0;
 
         for (const tool of tools) {
             const dest = tool.transfer_destination;
@@ -108,13 +110,19 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                     speak_during_execution: true,
                     speak_after_execution: false,
                 };
+                console.log(`[Import] Creating transfer function: ${tool.name}`, functionPayload);
                 const fnResp = await fetch(`/api/agents/${agentId}/functions`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(functionPayload),
                 });
-                if (!fnResp.ok) {
-                    console.warn(`Failed to create transfer function ${tool.name}:`, await fnResp.text());
+                if (fnResp.ok) {
+                    createdCount++;
+                    console.log(`[Import] Created transfer function: ${tool.name}`);
+                } else {
+                    failedCount++;
+                    const errText = await fnResp.text();
+                    console.warn(`[Import] FAILED transfer function ${tool.name}: ${fnResp.status} ${errText}`);
                 }
             } else if (tool.type === 'end_call') {
                 builtinFunctions['builtin_end_call'] = {
@@ -123,6 +131,8 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                     speak_during_execution: false,
                     speak_after_execution: true,
                 };
+                createdCount++;
+                console.log(`[Import] Registered builtin end_call`);
             } else if (tool.type === 'custom' || !tool.type) {
                 // Explicit custom tool handling with correct field mapping from Retell format
                 const functionPayload = {
@@ -138,17 +148,23 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                     speak_during_execution: tool.speak_during_execution !== undefined ? tool.speak_during_execution : false,
                     speak_after_execution: tool.speak_after_execution !== undefined ? tool.speak_after_execution : true,
                 };
+                console.log(`[Import] Creating custom function: ${tool.name}`, functionPayload);
                 const fnResp = await fetch(`/api/agents/${agentId}/functions`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(functionPayload),
                 });
-                if (!fnResp.ok) {
-                    console.warn(`Failed to create custom function ${tool.name}:`, await fnResp.text());
+                if (fnResp.ok) {
+                    createdCount++;
+                    console.log(`[Import] Created custom function: ${tool.name}`);
+                } else {
+                    failedCount++;
+                    const errText = await fnResp.text();
+                    console.warn(`[Import] FAILED custom function ${tool.name}: ${fnResp.status} ${errText}`);
                 }
             } else {
                 // Fallback: treat any other tool type as custom with same mapping
-                console.warn(`Unknown tool type "${tool.type}" for ${tool.name}, treating as custom.`);
+                console.warn(`[Import] Unknown tool type "${tool.type}" for ${tool.name}, treating as custom.`);
                 const functionPayload = {
                     name: tool.name || 'custom_tool',
                     description: tool.description || '',
@@ -162,13 +178,19 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                     speak_during_execution: tool.speak_during_execution !== undefined ? tool.speak_during_execution : false,
                     speak_after_execution: tool.speak_after_execution !== undefined ? tool.speak_after_execution : true,
                 };
+                console.log(`[Import] Creating fallback function: ${tool.name}`, functionPayload);
                 const fnResp = await fetch(`/api/agents/${agentId}/functions`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(functionPayload),
                 });
-                if (!fnResp.ok) {
-                    console.warn(`Failed to create function ${tool.name}:`, await fnResp.text());
+                if (fnResp.ok) {
+                    createdCount++;
+                    console.log(`[Import] Created fallback function: ${tool.name}`);
+                } else {
+                    failedCount++;
+                    const errText = await fnResp.text();
+                    console.warn(`[Import] FAILED fallback function ${tool.name}: ${fnResp.status} ${errText}`);
                 }
             }
         }
@@ -181,7 +203,7 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
             });
         }
 
-        return newAgent;
+        return { agent: newAgent, createdCount, failedCount };
     };
 
     const handleImport = async () => {
@@ -197,9 +219,13 @@ export default function ImportModal({ isOpen, onClose }: ImportModalProps) {
                 
                 showToast(`Importing agent: ${jsonData.agent_name || selectedFile.name}...`, 'info');
                 
-                await importRetellAgent(jsonData);
+                const result = await importRetellAgent(jsonData);
                 
-                showToast('Agent imported successfully!', 'success');
+                if (result.failedCount > 0) {
+                    showToast(`Agent imported with ${result.createdCount} tools created, ${result.failedCount} failed. Check browser console for details.`, 'info');
+                } else {
+                    showToast(`Agent imported successfully with ${result.createdCount} tools!`, 'success');
+                }
                 onClose();
                 setSelectedFile(null);
                 // Force a page refresh to show the new agent

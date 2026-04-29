@@ -51,7 +51,7 @@ MIN_AGENT_LLM_TEMPERATURE = 0.0
 MAX_AGENT_LLM_TEMPERATURE = 1.5
 MIN_AGENT_VOICE_SPEED = 0.8
 MAX_AGENT_VOICE_SPEED = 1.2
-TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "2.5"))
+TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "0.5"))
 END_CALL_DISCONNECT_DELAY_SEC = float(os.getenv("END_CALL_DISCONNECT_DELAY_SEC", "1.0"))
 DISCONNECT_GRACE_SEC = float(os.getenv("DISCONNECT_GRACE_SEC", "20"))
 CHAT_REPLY_TIMEOUT_SEC = float(os.getenv("CHAT_REPLY_TIMEOUT_SEC", "40"))
@@ -1922,7 +1922,7 @@ async def start_sip_transfer(
                 # appear in the room. With wait_until_answered=False the SDK
                 # returns before the participant is visible, so we need a bit
                 # more patience here.
-                for _ in range(60):
+                for _ in range(20):
                     if _room_has_participant_identity(room, participant_identity):
                         joined = True
                         break
@@ -2023,16 +2023,22 @@ async def run_transfer_handoff(
 
     sip_participant = detect_primary_sip_participant(room)
     if sip_participant:
-        transfer_result = await transfer_room_sip_participant(room, target_phone)
-        if transfer_result.get("success"):
-            transfer_result["agent_removed"] = {
-                "success": True,
-                "skipped": True,
-                "reason": "sip_refer_transfer",
-            }
-            return transfer_result
-        else:
-            logger.warning(f"SIP REFER transfer failed: {transfer_result.get('error')}. Falling back to bridged transfer.")
+        try:
+            transfer_result = await asyncio.wait_for(
+                transfer_room_sip_participant(room, target_phone),
+                timeout=3.0,
+            )
+            if transfer_result.get("success"):
+                transfer_result["agent_removed"] = {
+                    "success": True,
+                    "skipped": True,
+                    "reason": "sip_refer_transfer",
+                }
+                return transfer_result
+            else:
+                logger.warning(f"SIP REFER transfer failed: {transfer_result.get('error')}. Falling back to bridged transfer.")
+        except asyncio.TimeoutError:
+            logger.warning("SIP REFER transfer timed out after 3s. Falling back to bridged transfer.")
     
     # Fallback or primary: start a new SIP leg and bridge
     transfer_result = await start_sip_transfer(room.name, target_phone, call_id, room)

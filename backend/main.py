@@ -624,7 +624,7 @@ def _validate_function_payload_or_400(
         raise HTTPException(status_code=400, detail="Function name must include at least one letter or number")
 
     builtin_tool_names = {"transfer_call", "call_transfer", "end_call"}
-    if normalized_name in builtin_tool_names:
+    if normalized_name in builtin_tool_names and normalized_method != "SYSTEM":
         raise HTTPException(status_code=400, detail=f"Function name '{normalized_name}' is reserved")
 
     duplicate_query = db.query(FunctionModel).filter(FunctionModel.agent_id == agent_id)
