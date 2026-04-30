@@ -56,7 +56,7 @@ MAX_AGENT_LLM_TEMPERATURE = 1.5
 MIN_AGENT_VOICE_SPEED = 0.8
 MAX_AGENT_VOICE_SPEED = 1.2
 TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "0.1"))
-SUBAGENT_GREETING_DELAY_SEC = float(os.getenv("SUBAGENT_GREETING_DELAY_SEC", "0.0"))
+SUBAGENT_GREETING_DELAY_SEC = float(os.getenv("SUBAGENT_GREETING_DELAY_SEC", "0.5"))
 END_CALL_DISCONNECT_DELAY_SEC = float(os.getenv("END_CALL_DISCONNECT_DELAY_SEC", "1.0"))
 DISCONNECT_GRACE_SEC = float(os.getenv("DISCONNECT_GRACE_SEC", "20"))
 CHAT_REPLY_TIMEOUT_SEC = float(os.getenv("CHAT_REPLY_TIMEOUT_SEC", "40"))
@@ -396,32 +396,32 @@ def _build_xai_realtime_model(
     xai_api_key: str,
 ) -> tuple[Any, str]:
     turn_detection = _build_openai_realtime_turn_detection()
-    if xai is not None and hasattr(xai, "realtime") and hasattr(xai.realtime, "RealtimeModel"):
-        realtime_kwargs: Dict[str, Any] = {
-            "voice": selected_voice,
-            "api_key": xai_api_key,
-        }
-        if turn_detection is not None:
-            realtime_kwargs["turn_detection"] = turn_detection
-        realtime_model = xai.realtime.RealtimeModel(**realtime_kwargs)
-        resolved_model = str(getattr(realtime_model, "model", "") or voice_realtime_model or DEFAULT_XAI_REALTIME_MODEL)
-        return realtime_model, resolved_model
-
+    
     if not hasattr(openai, "realtime") or not hasattr(openai.realtime, "RealtimeModel"):
         raise RuntimeError(
-            "xAI selected but neither livekit-plugins-xai nor livekit-plugins-openai RealtimeModel support is installed"
+            "xAI unified voice requires livekit-plugins-openai to be installed for RealtimeModel support."
         )
 
     realtime_kwargs: Dict[str, Any] = {
-        "model": voice_realtime_model,
+        "model": voice_realtime_model or DEFAULT_XAI_REALTIME_MODEL,
         "api_key": xai_api_key,
         "base_url": XAI_REALTIME_BASE_URL,
         "voice": selected_voice,
         "modalities": ["audio"],
     }
+    
+    # Enable STT (Speech-to-Text) on the unified model so we get user transcripts
+    try:
+        from livekit.plugins.openai.realtime.models import AudioTranscription
+        realtime_kwargs["input_audio_transcription"] = AudioTranscription(language=None, model=None, prompt=None)
+    except Exception:
+        realtime_kwargs["input_audio_transcription"] = {"model": "whisper-1"}
+        
     if turn_detection is not None:
         realtime_kwargs["turn_detection"] = turn_detection
-    return openai.realtime.RealtimeModel(**realtime_kwargs), voice_realtime_model
+        
+    logger.info("Instantiating xAI realtime model directly via livekit-plugins-openai with modalities: [audio, text]")
+    return openai.realtime.RealtimeModel(**realtime_kwargs), realtime_kwargs["model"]
 
 
 def resolve_llm_temperature(config: Dict[str, Any]) -> float:
@@ -2440,15 +2440,87 @@ def build_transfer_handoff_developer_note(
         f"{key}={value}" for key, value in caller_memory.items() if value not in (None, "")
     ) or "none"
     return (
-        "TRANSFER HANDOFF CONTEXT:\n"
-        f"- Summary: {handoff_summary or 'Continue the current call without repeating known details.'}\n"
-        f"- Caller memory: {memory_bits}\n"
-        "- You are taking over an active phone call.\n"
-        "- Greet the caller in your own tone and continue naturally.\n"
-        "- DO NOT ask the user if they are still there or if they can hear you unless they stay silent for a long time.\n"
-        "- Start speaking immediately to acknowledge the transfer.\n"
-        "- Do not re-ask already-known details such as name or issue unless they are missing, ambiguous, or contradicted."
+        "CALLER CONTEXT MEMORY:\n"
+        f"- Summary of what caller wants: {handoff_summary or 'Continue naturally without repeating details.'}\n"
+        f"- Collected details: {memory_bits}\n"
+        "- Do not re-ask already-known details such as name or issue unless they are missing.\n"
+        "- DO NOT say 'I understand' or 'Your call has been transferred'. Just start the conversation normally."
     )
+
+
+def _paralyze_old_session(agent_obj: Any):
+    """
+    Forcefully paralyze the old agent's audio output to ensure 100% silence during handoff.
+    """
+    try:
+        logger.info(f"!!! STARTING PARALYZATION of agent: {agent_obj}")
+        
+        # 1. Absolute silence: Monkey-patch the audio source to discard all future frames
+        if hasattr(agent_obj, "audio_source") and agent_obj.audio_source:
+            try:
+                # Clear existing queue
+                agent_obj.audio_source.clear_queue()
+                
+                # Replace push_frame with a no-op to stop all future audio
+                def _silent_push(*args, **kwargs):
+                    pass
+                agent_obj.audio_source.push_frame = _silent_push
+                logger.info("Monkey-patched audio_source.push_frame to NO-OP (Absolute Silence)")
+            except Exception as e:
+                logger.warning(f"Failed to monkey-patch audio source: {e}")
+
+        # 2. Trigger high-level interruption
+        if hasattr(agent_obj, "interrupt"):
+            try:
+                agent_obj.interrupt(all=True)
+                logger.info("Interrupted old agent high-level tasks")
+            except Exception:
+                pass
+
+        # 3. Deep paralyzation: Locate and kill the underlying realtime session (v1.5.2 compatible)
+        # We'll try a very wide search since the attribute names are unstable
+        session_candidates = [
+            getattr(agent_obj, "_session", None),
+            getattr(getattr(agent_obj, "_activity", object()), "_session", None),
+            getattr(getattr(agent_obj, "_activity", object()), "_rt_session", None),
+        ]
+        
+        # Check if it's nested in the activity's session (PipelineSession)
+        activity = getattr(agent_obj, "_activity", None)
+        if activity:
+            pipe_session = getattr(activity, "_session", None)
+            if pipe_session:
+                # For Realtime Unified, the session is often in the llm_stream
+                llm_stream = getattr(pipe_session, "_llm_stream", None)
+                if llm_stream:
+                    session_candidates.append(getattr(llm_stream, "_session", None))
+
+        for old_rt in session_candidates:
+            if old_rt is not None and hasattr(old_rt, "_recv_task"): # Signature of a RealtimeSession
+                logger.info(f"!!! CRITICAL: Found old realtime session to kill: {old_rt}")
+                
+                # Kill the plugin's internal source
+                if hasattr(old_rt, "_source") and old_rt._source:
+                    try:
+                        old_rt._source.clear_queue()
+                    except Exception:
+                        pass
+                
+                # Cancel all background tasks
+                for task_name in ["_recv_task", "_main_task", "_fwd_task", "_keepalive_task"]:
+                    task = getattr(old_rt, task_name, None)
+                    if task and hasattr(task, "cancel"):
+                        task.cancel()
+                        
+                # Force disconnect websocket
+                if hasattr(old_rt, "_session") and hasattr(old_rt._session, "connection"):
+                    try:
+                        old_rt._session.connection.close()
+                    except Exception:
+                        pass
+                break
+    except Exception as e:
+        logger.warning(f"Failed to paralyze old session: {e}")
 
 
 async def perform_agent_transfer_handoff(
@@ -2516,6 +2588,22 @@ async def perform_agent_transfer_handoff(
         is_phone_call=True,
         vad_instance=getattr(agent_obj, "vad_instance", None),
     )
+    
+    # Forcefully paralyze the old agent's realtime session to stop it from 
+    # hallucinating fallback responses or crashing.
+    _paralyze_old_session(agent_obj)
+
+    # Interrupt the primary agent immediately so its speech pipeline drains
+    # before we start building the subagent. This prevents bleed-through speech.
+    if hasattr(agent_obj, "interrupt"):
+        agent_obj.interrupt()
+
+    # Forcefully close the old realtime session
+    if hasattr(agent_obj, "_activity") and hasattr(agent_obj._activity, "_rt_session"):
+        old_rt = getattr(agent_obj._activity, "_rt_session", None)
+        if old_rt is not None:
+            # Create a background task to close it so we don't block
+            asyncio.create_task(old_rt.aclose())
 
     current_chat_ctx = None
     try:
@@ -2528,15 +2616,34 @@ async def perform_agent_transfer_handoff(
         except Exception:
             current_chat_ctx = None
 
+    # Detect if the target agent uses a realtime LLM (xAI / OpenAI Realtime).
+    # Realtime models push chat_ctx over a WebSocket and time out on large histories.
+    # For them, pass only the developer handoff note; the system prompt carries persona.
+    _target_tts = normalize_tts_provider(target_payload)
+    _target_runtime_mode = resolve_voice_runtime_mode(target_payload)
+    _is_realtime_target = _target_tts == "xai" or _target_runtime_mode == "realtime_text_tts"
+
     new_chat_ctx = llm_module.ChatContext.empty()
-    new_chat_ctx.add_message(
-        role="developer",
-        content=build_transfer_handoff_developer_note(
-            str(handoff_context.get("handoff_summary") or "").strip(),
-            handoff_context.get("caller_memory") or {},
-        ),
+    note_content = build_transfer_handoff_developer_note(
+        str(handoff_context.get("handoff_summary") or "").strip(),
+        handoff_context.get("caller_memory") or {},
     )
-    if current_chat_ctx is not None:
+    
+    if _is_realtime_target:
+        # For realtime models, we append the note directly to the system prompt
+        # instead of passing it as a developer message. This prevents the VAD
+        # from treating it as a conversational turn that requires an apology or
+        # an "I understand" acknowledgement.
+        target_prompt += f"\n\n--- HANDOFF CONTEXT ---\n{note_content}\n-----------------------\n"
+        target_prompt += "CRITICAL INSTRUCTION: You MUST begin your response using the EXACT greeting specified in your instructions. DO NOT acknowledge the handoff context or say 'I understand'."
+    else:
+        # For non-realtime models, we can safely use the developer message approach
+        new_chat_ctx.add_message(
+            role="developer",
+            content=note_content,
+        )
+    if not _is_realtime_target and current_chat_ctx is not None:
+        # For non-realtime (pipeline) models, include a short recent history window.
         try:
             copied_ctx = current_chat_ctx.copy(
                 exclude_instructions=True,
@@ -2544,15 +2651,36 @@ async def perform_agent_transfer_handoff(
                 exclude_handoff=True,
                 exclude_config_update=True,
             )
-            copied_ctx.truncate(max_items=30)
+            copied_ctx.truncate(max_items=8)
             new_chat_ctx.merge(copied_ctx, exclude_instructions=True, exclude_function_call=True, exclude_config_update=True)
         except Exception as chat_ctx_err:
             logger.warning("Failed to merge chat context for agent transfer: %s", chat_ctx_err)
 
-    if hasattr(agent_obj, "interrupt"):
-        agent_obj.interrupt()
     agent_obj._agent_transfer_in_progress = True
+    target_llm = runtime_bundle.get("llm")
     try:
+        if _target_tts == "xai":
+            # Recreate xAI model for a fresh websocket session
+            target_llm, _ = _build_xai_realtime_model(
+                selected_voice=target_payload.get("voice", "Rachel"),
+                voice_realtime_model=target_payload.get("llm_model", "grok-base"),
+                xai_api_key=os.environ.get("XAI_API_KEY"),
+            )
+        elif _target_runtime_mode == "realtime_text_tts":
+            # Recreate OpenAI realtime model for a fresh websocket session
+            import openai.realtime
+            target_llm = openai.realtime.RealtimeModel(
+                model=target_payload.get("llm_model", "gpt-4o-realtime-preview"),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                modalities=["text"]
+            )
+    except Exception as llm_err:
+        logger.warning("Could not instantiate fresh RealtimeModel for subagent; falling back to shared session: %s", llm_err)
+
+    try:
+        # Give the interruption a moment to settle before swapping agents.
+        await asyncio.sleep(max(0.05, TRANSFER_HANDOFF_DELAY_SEC))
+        
         target_agent = create_dynamic_agent_class(
             functions_config=target_functions,
             base_instructions=target_prompt,
@@ -2564,16 +2692,14 @@ async def perform_agent_transfer_handoff(
             is_phone_call=True,
             runtime_vars=merged_runtime_vars,
             vad_instance=runtime_bundle.get("vad"),
-            llm_engine=runtime_bundle.get("llm"),
+            llm_engine=target_llm,
             tts_engine=runtime_bundle.get("tts_engine"),
             stt_engine=runtime_bundle.get("stt_engine"),
             chat_ctx=new_chat_ctx,
+            is_subagent=True,
+            is_realtime_target=_is_realtime_target,
         )
-        # Silent handoff delay (minimized for hyper-latency)
-        # await asyncio.sleep(max(0.0, TRANSFER_HANDOFF_DELAY_SEC))
-        pass
 
-        active_session.update_agent(target_agent)
         if call_id:
             await report_builtin_action(
                 call_id,
@@ -2591,32 +2717,12 @@ async def perform_agent_transfer_handoff(
                 },
             )
 
-        # Trigger subagent greeting after handoff
-        # Trigger subagent greeting after handoff
-        async def _trigger_subagent_greeting():
-            # Wait for the new agent session to stabilize (minimal)
-            await asyncio.sleep(0.1)
-            try:
-                # For RealtimeModel/Multimodal agents, use generate_reply to trigger the first turn
-                # Truly Direct: No instructions, let the prompt drive the opening
-                active_session.generate_reply(
-                    allow_interruptions=True,
-                    input_modality="audio",
-                )
-            except Exception as greet_exc:
-                logger.error("Failed to trigger subagent greeting: %s", greet_exc)
-
-        asyncio.create_task(_trigger_subagent_greeting())
-
-        return {
-            "success": True,
-            "action": "agent_transfer",
-            "status": "agent_switched",
-            "target_agent_id": target_agent_id,
-            "target_agent_name": target_payload.get("name"),
-            "resolved_version": target_payload.get("resolved_version"),
-            "message": "Transfer completed successfully. Do not say anything further. Remain completely silent."
-        }
+        # For v1.5.2, the recommended way to perform a zero-latency handoff is to return 
+        # the target_agent object natively. We aggressively paralyze the old agent 
+        # just before returning to ensure no audio bleed-through occurs during the swap.
+        _paralyze_old_session(agent_obj)
+        
+        return target_agent
     except Exception as handoff_exc:
         logger.error("agent_transfer handoff failed: %s", handoff_exc)
         return {"success": False, "error": str(handoff_exc)}
@@ -2639,9 +2745,11 @@ def create_dynamic_agent_class(
     tts_engine=None,
     stt_engine=None,
     chat_ctx=None,
+    is_subagent=False,
+    is_realtime_target=False,
 ):
     if not functions_config:
-        return Agent(
+        agent = Agent(
             instructions=base_instructions,
             chat_ctx=chat_ctx,
             llm=llm_engine,
@@ -2649,6 +2757,20 @@ def create_dynamic_agent_class(
             stt=stt_engine,
             vad=vad_instance,
         )
+        return agent
+
+    on_enter_method = ""
+    if is_subagent:
+        on_enter_method = """
+    async def on_enter(self):
+        try:
+            self.session.generate_reply(
+                allow_interruptions=True,
+                input_modality="audio",
+            )
+        except Exception as _oe_err:
+            logger.warning("on_enter greeting skipped: %s", _oe_err)
+"""
 
     class_def = f"""
 class DynamicPropertyAgent(Agent):
@@ -2667,7 +2789,7 @@ class DynamicPropertyAgent(Agent):
         self._pending_end_call_after_speech = False
         self._end_call_handoff_started = False
         super().__init__(instructions=instructions, chat_ctx=chat_ctx, llm=llm_engine, tts=tts_engine, stt=stt_engine, vad=vad_instance)
-"""
+{on_enter_method}"""
 
     for func in functions_config:
         func_name = _normalize_tool_name(func.get("name", ""))
@@ -2721,6 +2843,7 @@ class DynamicPropertyAgent(Agent):
         method_def = f"""
     @function_tool(description="{desc}")
     async def {func_name}({args_str}) -> dict:
+        import json
         payload = {{ {payload_body_str} }}
         normalized_tool_name = "{func_name}"
         speech_mode = "{speech_mode}"
@@ -2817,6 +2940,7 @@ class DynamicPropertyAgent(Agent):
                     elif self._transfer_in_progress:
                         result = {{"success": False, "error": "Transfer is already in progress"}}
                     else:
+                        _paralyze_old_session(self)
                         if hasattr(self, "interrupt"):
                             self.interrupt()
                         if hasattr(self, "call_id") and self.call_id:
@@ -2842,7 +2966,7 @@ class DynamicPropertyAgent(Agent):
                             "status": "handoff_queued",
                             "message": "Handoff queued; announce transfer to caller now.",
                         }}
-                elif system_type == "agent_transfer" or url == "builtin://agent_transfer":
+                elif system_type in ("agent_transfer", "transfer_call") or url == "builtin://agent_transfer" or normalized_tool_name.endswith("_agent_transfer"):
                     if hasattr(self, "interrupt"):
                         self.interrupt()
                     result = await perform_agent_transfer_handoff(
@@ -3526,9 +3650,13 @@ async def entrypoint(ctx: JobContext):
         if _callable_supports_kwarg(deepgram.STT, "no_delay"):
             stt_kwargs["no_delay"] = True
         logger.info("STT config: model=%s language=%s endpointing_ms=%s", stt_model, stt_kwargs.get("language"), stt_kwargs.get("endpointing_ms"))
-        session_kwargs["vad"] = ctx.proc.userdata["vad"]
         session_kwargs["stt"] = deepgram.STT(**stt_kwargs)
-    else:
+
+    # ALWAYS provide VAD to the session, even for realtime unified audio, 
+    # as AgentSession requires it to monitor the room's audio input path.
+    session_kwargs["vad"] = ctx.proc.userdata["vad"]
+
+    if use_realtime_llm:
         if use_unified_realtime_audio:
             logger.info("Realtime voice path enabled: using xAI unified voice realtime for STT, generation, and speech output")
         else:
@@ -3545,7 +3673,7 @@ async def entrypoint(ctx: JobContext):
         agent_label=config.get("name"),
         is_phone_call=is_phone_call,
         runtime_vars=runtime_vars,
-        vad_instance=ctx.proc.userdata["vad"] if not use_unified_realtime_audio else None,
+        vad_instance=ctx.proc.userdata["vad"],
         llm_engine=llm,
         tts_engine=tts_engine,
         stt_engine=session_kwargs.get("stt"),
