@@ -1183,8 +1183,9 @@ The agent no longer uses forced regex-based greeting extraction. Instead, it use
 Call transfers between agents have been further optimized for zero-wait performance:
 - **Zero-Wait Handoff**: The internal handoff delay (`TRANSFER_HANDOFF_DELAY_SEC`) has been bypassed entirely for near-instant transitions.
 - **Immediate Interruption**: The primary agent is now forcibly interrupted (`self.interrupt()`) the exact millisecond a transfer tool is called. This prevents the agent from finishing any pending sentences or adding unrequested explanations.
-- **Truly Direct Subagent Trigger**: Subagents are triggered with a bare `generate_reply()` call. With no external instructions, the AI must rely 100% on its system prompt context to determine its opening persona and greeting.
-- **Strict Post-Tool Silence**: Handoff logic explicitly forbids the primary agent from generating any text after the tool call is emitted.
+- **Raw Direct Subagent Trigger**: Subagents are triggered with a bare `generate_reply(input_modality="audio")` call. By providing **no instructions**, the AI must rely 100% on its system prompt context to determine its opening persona and greeting.
+- **Modality Preservation**: Explicitly setting `input_modality="audio"` ensures the agent enters a listening state immediately after its proactive turn, resolving connectivity issues where the agent would stop listening.
+- **Low-Latency STT**: The STT endpointing latency has been reduced to **40ms** (configured via `STT_ENDPOINTING_PHONE_MS` in `docker-compose.yml`) for near-human response speed.
 
 ### Dynamic Label Sanitization
 To prevent technical labels (e.g., "General Inquiries:", "Opening Script:") from being spoken, the agent runtime now includes a dynamic sanitization layer that strips these prefixes from the system prompt before the LLM processes them, ensuring a clean, human-like voice experience.

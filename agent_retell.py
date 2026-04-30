@@ -2600,9 +2600,11 @@ async def perform_agent_transfer_handoff(
                 subagent_lang = normalize_agent_language(target_payload.get("language", "en-GB"))
                 logger.info("Triggering truly direct subagent greeting turn...")
                 # For RealtimeModel/Multimodal agents, use generate_reply to trigger the first turn
-                # No instructions = True Direct Access to system prompt
+                # No instructions = True Direct Access to system prompt. 
+                # modality="audio" = Ensures it listens after speaking.
                 active_session.generate_reply(
                     allow_interruptions=True,
+                    input_modality="audio",
                 )
             except Exception as greet_exc:
                 logger.error("Failed to trigger subagent greeting: %s", greet_exc)
