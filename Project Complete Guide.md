@@ -1150,3 +1150,23 @@ Added support for:
 - Transfer tool executes immediately.
 - Agent remains silent during transfer dial.
 - Subagent greets immediately upon participant join.
+
+### **xAI Unified Realtime & SIP Optimization (April 30, 2026 - Evening Update)**
+
+The following critical optimizations were implemented to achieve ultra-low latency (<1s) and robust initial listening for the xAI Grok-based voice agent:
+
+#### **1. Latency & Listening Optimizations**
+- **Server VAD Sensitivity**: Lowered the `threshold` to `0.35` and increased `prefix_padding_ms` to `300ms` to ensure immediate and sensitive voice detection.
+- **Silence Detection**: Set `silence_duration_ms` to `600ms` to prevent premature cut-offs while maintaining snappy response times.
+- **Greeting Logic**: Forced `generate_reply` with explicit text instructions for all greetings (Initial and Subagent). This ensures the model knows to "speak and then listen," preventing the "staying silent" issue after the first greeting.
+- **Context Management**: Disabled redundant manual history syncing for unified realtime paths to eliminate `failed to insert item` errors and reduce processing overhead.
+
+#### **2. SIP Transfer Snappiness**
+- **Ringing as Ready**: Updated `wait_for_transfer_established` to recognize the `ringing` SIP state as a successful handoff.
+- **Immediate Agent Disconnect**: The primary agent now disconnects as soon as the outbound leg starts ringing, rather than waiting for an answer.
+- **Auto-Interruption**: Added `self.interrupt()` calls when transfer tools are triggered. This forces the agent to stop speaking instantly when a handoff is initiated, preventing conversational "double-talk" (e.g., the agent continuing to speak while the transfer is starting).
+
+#### **3. Production Deployment**
+- **Target Container**: `voice-agent`
+- **Build Status**: Verified with `sudo docker compose up -d --build voice-agent`
+- **Branch**: `codex/agent-transfer-tools`

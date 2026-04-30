@@ -375,9 +375,9 @@ def _build_openai_realtime_turn_detection() -> Any:
     else:
         payload = {
             "type": "server_vad",
-            "threshold": _coerce_setting_float(OPENAI_REALTIME_VAD_THRESHOLD, default=0.45, min_value=0.1, max_value=0.9),
-            "prefix_padding_ms": _coerce_setting_int(OPENAI_REALTIME_PREFIX_PADDING_MS, default=150, min_value=50, max_value=500),
-            "silence_duration_ms": _coerce_setting_int(OPENAI_REALTIME_SILENCE_DURATION_MS, default=200, min_value=80, max_value=800),
+            "threshold": _coerce_setting_float(OPENAI_REALTIME_VAD_THRESHOLD, default=0.35, min_value=0.1, max_value=0.9),
+            "prefix_padding_ms": _coerce_setting_int(OPENAI_REALTIME_PREFIX_PADDING_MS, default=300, min_value=50, max_value=500),
+            "silence_duration_ms": _coerce_setting_int(OPENAI_REALTIME_SILENCE_DURATION_MS, default=600, min_value=80, max_value=800),
             "create_response": True,
             "interrupt_response": True,
         }
@@ -2517,6 +2517,8 @@ async def perform_agent_transfer_handoff(
         except Exception as chat_ctx_err:
             logger.warning("Failed to merge chat context for agent transfer: %s", chat_ctx_err)
 
+    if hasattr(agent_obj, "interrupt"):
+        agent_obj.interrupt()
     agent_obj._agent_transfer_in_progress = True
     try:
         target_agent = create_dynamic_agent_class(
@@ -2557,18 +2559,20 @@ async def perform_agent_transfer_handoff(
             )
 
         # Trigger subagent greeting after handoff
+        # Trigger subagent greeting after handoff
         async def _trigger_subagent_greeting():
-            await asyncio.sleep(max(0.0, SUBAGENT_GREETING_DELAY_SEC))
+            # Wait for the new agent session to stabilize
+            await asyncio.sleep(max(0.3, SUBAGENT_GREETING_DELAY_SEC + 0.2))
             try:
                 subagent_lang = normalize_agent_language(target_payload.get("language", "en-GB"))
                 subagent_greeting = build_safe_auto_greeting(subagent_lang, target_prompt)
                 if subagent_greeting:
-                    logger.info("Sending subagent greeting via generate_reply: %s", subagent_greeting)
-                    # Use generate_reply which works for both realtime and pipeline paths
+                    logger.info("Sending subagent greeting: %s", subagent_greeting)
+                    # For RealtimeModel/Multimodal agents, use generate_reply with instructions
                     active_session.generate_reply(
                         instructions=(
-                            f'Say this greeting to the caller now: "{subagent_greeting}"\n'
-                            'Say exactly this greeting. Do not add anything else.'
+                            f'Say exactly this greeting to the caller now: "{subagent_greeting}"\n'
+                            'Do not add anything else. Then listen for their response.'
                         ),
                         allow_interruptions=True,
                         input_modality="audio",
@@ -2789,6 +2793,8 @@ class DynamicPropertyAgent(Agent):
                     elif self._transfer_in_progress:
                         result = {{"success": False, "error": "Transfer is already in progress"}}
                     else:
+                        if hasattr(self, "interrupt"):
+                            self.interrupt()
                         if hasattr(self, "call_id") and self.call_id:
                             await report_builtin_action(self.call_id, "transfer_call", {{"phone_number": target_phone}})
                         self._transfer_in_progress = True
@@ -3836,7 +3842,15 @@ async def entrypoint(ctx: JobContext):
                 else:
                     if tts_engine is None:
                         logger.info("Triggering dynamic greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
-                        session.generate_reply(allow_interruptions=True, input_modality="audio")
+                        greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
+                        session.generate_reply(
+                            instructions=(
+                                f'Say exactly this greeting to the caller now: "{greeting_text}"\n'
+                                'Do not add anything else. Then listen for their response.'
+                            ),
+                            allow_interruptions=True,
+                            input_modality="audio",
+                        )
                     else:
                         greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
                         logger.info("Sending dynamic greeting via direct TTS (%s)", source)
