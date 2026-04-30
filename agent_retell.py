@@ -588,7 +588,8 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
         instructions.append(
             f"{len(instructions)+1}. {trigger} -> DO NOT ask for permission or confirmation. -> "
             f"First say exactly 'I am transferring you now.' -> "
-            f"immediately CALL `{tool_name}` TOOL -> STOP SPEAKING AND REMAIN SILENT"
+            f"immediately CALL `{tool_name}` TOOL -> STOP SPEAKING IMMEDIATELY. "
+            "Do not add any explanations, helpful tips, or goodbye messages after calling the tool."
         )
     if not instructions:
         return ""
@@ -2600,7 +2601,11 @@ async def perform_agent_transfer_handoff(
                 # For RealtimeModel/Multimodal agents, use generate_reply to trigger the first turn
                 # Neutral instruction ensures the model starts its turn without forcing a specific greeting
                 active_session.generate_reply(
-                    instructions="The call has been transferred to you. Start your turn now.",
+                    instructions=(
+                        "The call has been transferred to you. Introduce yourself as the new agent "
+                        "and follow your system instructions for the opening greeting script. "
+                        "Do not skip your introduction even though you see the previous conversation."
+                    ),
                     allow_interruptions=True,
                 )
             except Exception as greet_exc:

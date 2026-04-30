@@ -1183,7 +1183,8 @@ The agent no longer uses forced regex-based greeting extraction. Instead, it use
 Call transfers between agents have been optimized for near-instant execution:
 - **Reduced Delays**: The handoff wait time (`TRANSFER_HANDOFF_DELAY_SEC`) is now **0.1s**.
 - **Proactive Turns**: Subagents no longer wait for audio detection to start their turn. They are triggered immediately using a proactive `generate_reply` call.
-- **Handoff Instructions**: The primary agent is instructed to stop speaking immediately when the transfer tool is called, preventing double-talk and awkward transitions.
+- **Strict Silence**: The primary agent is instructed to say only "I am transferring you now" and then go **absolutely silent**. Post-tool explanations or goodbye messages are strictly forbidden to prevent "double-talk".
+- **Forced Subagent Intro**: Subagents are explicitly instructed to introduce themselves and use their opening script, even if they have access to the previous conversation history. This ensures the caller always knows they are speaking to a new agent.
 
 ### Dynamic Label Sanitization
 To prevent technical labels (e.g., "General Inquiries:", "Opening Script:") from being spoken, the agent runtime now includes a dynamic sanitization layer that strips these prefixes from the system prompt before the LLM processes them, ensuring a clean, human-like voice experience.
