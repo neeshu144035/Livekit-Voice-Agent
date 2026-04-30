@@ -402,26 +402,34 @@ def _build_xai_realtime_model(
             "xAI unified voice requires livekit-plugins-openai to be installed for RealtimeModel support."
         )
 
+    # Use the specific model name xAI expects for realtime
+    model_name = voice_realtime_model or "grok-voice-think-fast-1.0"
+    
     realtime_kwargs: Dict[str, Any] = {
-        "model": voice_realtime_model or DEFAULT_XAI_REALTIME_MODEL,
+        "model": model_name,
         "api_key": xai_api_key,
         "base_url": XAI_REALTIME_BASE_URL,
         "voice": selected_voice,
-        "modalities": ["audio"],
+        "modalities": ["audio", "text"],
     }
     
-    # Enable STT (Speech-to-Text) on the unified model so we get user transcripts
+    # xAI Realtime Beta often requires explicit transcription for 'audio' only mode
     try:
         from livekit.plugins.openai.realtime.models import AudioTranscription
-        realtime_kwargs["input_audio_transcription"] = AudioTranscription(language=None, model=None, prompt=None)
+        realtime_kwargs["input_audio_transcription"] = AudioTranscription(model="whisper-1")
     except Exception:
-        realtime_kwargs["input_audio_transcription"] = {"model": "whisper-1"}
+        pass
         
     if turn_detection is not None:
+        # Increase silence duration slightly to prevent "choppiness" leading to 429s
+        if isinstance(turn_detection, dict):
+            turn_detection["silence_duration_ms"] = 800
         realtime_kwargs["turn_detection"] = turn_detection
         
-    logger.info("Instantiating xAI realtime model directly via livekit-plugins-openai with modalities: [audio, text]")
-    return openai.realtime.RealtimeModel(**realtime_kwargs), realtime_kwargs["model"]
+    logger.info("Instantiating xAI realtime model (Bypass Mode) | Model: %s | Modalities: [audio, text]", model_name)
+    rt_model = openai.realtime.RealtimeModel(**realtime_kwargs)
+    
+    return rt_model, model_name
 
 
 def resolve_llm_temperature(config: Dict[str, Any]) -> float:
@@ -597,7 +605,8 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
         "TRANSFER RULES — FOLLOW STRICTLY:\n"
         + "\n".join(instructions)
         + "\nDO NOT ask the user if they want to be transferred if they have already requested it or agreed to it. "
-        + "\nAFTER CALLING ANY TRANSFER TOOL YOU MUST STOP SPEAKING. DO NOT SAY ANYTHING ELSE."
+        + "\nCRITICAL SYSTEM INSTRUCTION: You MUST execute the ACTUAL JSON function call for the transfer tool. DO NOT simply say 'I am transferring you' and stop. You MUST trigger the tool itself. "
+        + "\nAFTER EXECUTING THE TOOL FUNCTION CALL, YOU MUST STOP SPEAKING."
     )
 
 
@@ -2354,6 +2363,8 @@ def build_runtime_engines_for_config(
         )
         use_realtime_llm = True
         use_unified_realtime_audio = True
+        # Disable chat_ctx sync for this path to prevent history-matching errors/latency
+        chat_ctx = None
     elif (
         voice_runtime_mode == "realtime_text_tts"
         and voice_realtime_model
@@ -2660,19 +2671,17 @@ async def perform_agent_transfer_handoff(
     target_llm = runtime_bundle.get("llm")
     try:
         if _target_tts == "xai":
-            # Recreate xAI model for a fresh websocket session
+            # Recreate xAI realtime model for a fresh WebSocket session.
+            # IMPORTANT: use resolve_voice_realtime_model() — NOT llm_model —
+            # because llm_model holds the text-generation model name (e.g. gpt-5.1)
+            # which is invalid for the xAI realtime/audio API.
+            _target_realtime_model = resolve_voice_realtime_model(target_payload) or DEFAULT_XAI_REALTIME_MODEL
+            _target_voice = target_payload.get("voice") or "ara"
+            logger.info("Building xAI realtime model for subagent | model=%s | voice=%s", _target_realtime_model, _target_voice)
             target_llm, _ = _build_xai_realtime_model(
-                selected_voice=target_payload.get("voice", "Rachel"),
-                voice_realtime_model=target_payload.get("llm_model", "grok-base"),
+                selected_voice=_target_voice,
+                voice_realtime_model=_target_realtime_model,
                 xai_api_key=os.environ.get("XAI_API_KEY"),
-            )
-        elif _target_runtime_mode == "realtime_text_tts":
-            # Recreate OpenAI realtime model for a fresh websocket session
-            import openai.realtime
-            target_llm = openai.realtime.RealtimeModel(
-                model=target_payload.get("llm_model", "gpt-4o-realtime-preview"),
-                api_key=os.environ.get("OPENAI_API_KEY"),
-                modalities=["text"]
             )
     except Exception as llm_err:
         logger.warning("Could not instantiate fresh RealtimeModel for subagent; falling back to shared session: %s", llm_err)
@@ -2717,11 +2726,12 @@ async def perform_agent_transfer_handoff(
                 },
             )
 
-        # For v1.5.2, the recommended way to perform a zero-latency handoff is to return 
-        # the target_agent object natively. We aggressively paralyze the old agent 
-        # just before returning to ensure no audio bleed-through occurs during the swap.
-        _paralyze_old_session(agent_obj)
+        # For v1.5.2, returning the target_agent natively handles the handoff
+        # gracefully. The framework will update the chat context and then cleanly swap.
         
+        # The subagent's on_enter() method will fire generate_reply once
+        # the session swaps to it. No separate background task needed.
+        logger.info("Agent swap complete — subagent on_enter will trigger greeting for: %s", target_payload.get("name"))
         return target_agent
     except Exception as handoff_exc:
         logger.error("agent_transfer handoff failed: %s", handoff_exc)
@@ -2764,7 +2774,7 @@ def create_dynamic_agent_class(
         on_enter_method = """
     async def on_enter(self):
         try:
-            self.session.generate_reply(
+            await self.session.generate_reply(
                 allow_interruptions=True,
                 input_modality="audio",
             )
@@ -3522,6 +3532,8 @@ async def entrypoint(ctx: JobContext):
             base_url = XAI_REALTIME_BASE_URL
             use_realtime_llm = True
             use_unified_realtime_audio = True
+            # Disable chat_ctx sync for this path to prevent history-matching errors/latency
+            chat_ctx = None
         except Exception as realtime_err:
             raise RuntimeError(f"xAI unified realtime voice path unavailable: {realtime_err}") from realtime_err
     elif (
@@ -3773,6 +3785,65 @@ async def entrypoint(ctx: JobContext):
                     logger.debug(f"Failed to publish agent transcript event: {publish_err}")
                 logger.info(f"[transcript] Agent: {content[:60]}...")
 
+                # FALLBACK: If xAI model roleplays a transfer but fails to call the tool natively
+                if not getattr(agent, "_transfer_in_progress", False):
+                    content_lower = content.lower()
+                    if "transferring you" in content_lower or "transfer you" in content_lower or "get you straight to" in content_lower:
+                        target_tool = None
+                        if "sale" in content_lower or "buy" in content_lower:
+                            target_tool = "selling_agent_transfer" if "sale" in content_lower else "buying_agent_transfer"
+                        elif "mainten" in content_lower or "repair" in content_lower:
+                            target_tool = "maintenance_agent_transfer"
+                        elif "letting" in content_lower or "rent" in content_lower:
+                            target_tool = "renting_agent_transfer"
+                            
+                        if target_tool:
+                            logger.warning(f"FALLBACK: Agent roleplayed transfer to {target_tool}. Forcing manual swap.")
+                            setattr(agent, "_transfer_in_progress", True)
+                            
+                            async def _force_swap():
+                                try:
+                                    target_payload = next((f for f in getattr(agent, "functions_config", []) if _normalize_tool_name(f.get("name", "")) == target_tool), None)
+                                    if not target_payload:
+                                        logger.warning("FALLBACK failed: Could not find target tool payload.")
+                                        return
+                                        
+                                    new_agent = await perform_agent_transfer_handoff(
+                                        agent,
+                                        target_tool,
+                                        target_payload,
+                                        "realtime" if getattr(agent, "tts", None) is None else "turn"
+                                    )
+                                    
+                                    participant = detect_primary_sip_participant(ctx.room)
+                                    if not participant and ctx.room.remote_participants:
+                                        participant = list(ctx.room.remote_participants.values())[0]
+                                        
+                                    if participant:
+                                        # Force the session to recognize the new agent.
+                                        # In v1.5.2, updating the session's agent reference is the primary way to swap.
+                                        if hasattr(session, "update_agent"):
+                                            await session.update_agent(new_agent)
+                                        elif hasattr(agent, "_runtime_session") and hasattr(agent._runtime_session, "update_agent"):
+                                            await agent._runtime_session.update_agent(new_agent)
+                                        else:
+                                            # Last resort: try to replace the internal reference
+                                            logger.warning("AgentSession.update_agent not found; attempting direct reference swap.")
+                                            if hasattr(agent, "_runtime_session"):
+                                                agent._runtime_session.agent = new_agent
+                                        
+                                        logger.info("FALLBACK: Manual agent swap complete.")
+                                        
+                                        # Manually disconnect the old agent to free the mic
+                                        await asyncio.sleep(0.5)
+                                        if hasattr(agent, "_activity") and agent._activity:
+                                            agent._activity.cancel()
+                                            
+                                except Exception as e:
+                                    logger.error(f"FALLBACK swap failed: {e}")
+                                    
+                            asyncio.create_task(_force_swap())
+
                 if getattr(agent, "_pending_end_call_after_speech", False) and not getattr(agent, "_end_call_handoff_started", False):
                     setattr(agent, "_pending_end_call_after_speech", False)
                     setattr(agent, "_end_call_handoff_started", True)
@@ -3978,25 +4049,29 @@ async def entrypoint(ctx: JobContext):
                     return
                 initial_greeting_sent = True
                 initial_greeting_in_progress = True
+
+                if tts_engine is None:  # realtime path (xAI / OpenAI realtime)
+                    pass
+
                 if welcome_message_mode == "custom" and welcome_msg.strip():
                     greeting_text = welcome_msg.strip()
                     if tts_engine is None:
                         logger.info("Sending custom greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
-                        session.generate_reply(
+                        asyncio.ensure_future(session.generate_reply(
                             allow_interruptions=True,
-                            input_modality="audio",
-                        )
+                        ))
                     else:
                         logger.info("Sending custom greeting via direct TTS (%s)", source)
                         session.say(greeting_text, add_to_chat_ctx=True, allow_interruptions=True)
                 else:
                     if tts_engine is None:
-                        logger.info("Triggering dynamic greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
-                        greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
-                        session.generate_reply(
+                        logger.info("Triggering initial greeting via generate_reply (audio-listening mode) (%s)", source)
+                        # Short sleep to ensure WebSocket session is fully established
+                        await asyncio.sleep(0.5)
+                        asyncio.ensure_future(session.generate_reply(
                             allow_interruptions=True,
                             input_modality="audio",
-                        )
+                        ))
                     else:
                         greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
                         logger.info("Sending dynamic greeting via direct TTS (%s)", source)

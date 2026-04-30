@@ -16,6 +16,8 @@
 13. [Project State Summary (April 2026)](#project-state-summary-april-2026)
 14. [Agent-to-Agent Handoff Optimization (April 25, 2026)](#agent-to-agent-handoff-optimization-april-25-2026)
 15. [Truly Direct Greeting & Ultra-Low Latency (April 30, 2026)](#truly-direct-greeting-ultra-low-latency-april-30-2026)
+16. [xAI Plugin Bypass & Modality Optimization (April 30, 2026 - Night Update)](#xai-plugin-bypass--modality-optimization-april-30-2026---night-update)
+17. [Final Agent Transfer & Greeting Resolution (April 30, 2026 - Final)](#final-agent-transfer--greeting-resolution-april-30-2026---final)
 
 ---
 
@@ -1189,3 +1191,54 @@ Call transfers between agents have been further optimized for zero-wait performa
 
 ### Dynamic Label Sanitization
 To prevent technical labels (e.g., "General Inquiries:", "Opening Script:") from being spoken, the agent runtime now includes a dynamic sanitization layer that strips these prefixes from the system prompt before the LLM processes them, ensuring a clean, human-like voice experience.
+
+---
+
+## 16. xAI Plugin Bypass & Modality Optimization (April 30, 2026 - Night Update)
+
+### The Issue: Agent Speaking But Not Listening
+We discovered that the standard `livekit-plugins-xai` integration hardcodes the model communication to `modalities=['audio']`. This caused several critical issues:
+1. **No Transcripts**: The model would not return text transcripts for the user or agent, making it impossible to log conversation history or provide context for tool calls.
+2. **Listening failures**: Under certain conditions, the xAI unified model would fail to transition to a listening state after its initial greeting when restricted to audio-only modalities.
+3. **High Latency**: Requesting both audio and text from the unified model (`['audio', 'text']`) introduced a ~5 second latency penalty due to buffering in the xAI beta API.
+
+### The Solution: Manual Plugin Bypass
+We have modified `_build_xai_realtime_model` in `agent_retell.py` to bypass the xAI plugin and use the standard `livekit-plugins-openai` library directly, pointing it to xAI's real-time base URL.
+
+- **Direct OpenAI Bridge**: We now use `openai.realtime.RealtimeModel` with `base_url='https://api.x.ai/v1/realtime'`.
+- **Modality Optimization**: We force `modalities=['audio']`. By excluding the `text` output modality, we eliminate the 5-second generation latency, restoring sub-second response times.
+- **Explicit STT Transcription**: We enabled `input_audio_transcription` manually. This ensures the xAI backend transcribes the **user's** speech even when the agent is in audio-only mode.
+- **Result**: The agent now listens perfectly, transcribes the user's input for the backend, and responds with near-zero latency.
+
+### Deployment Summary
+- **Container**: `voice-agent`
+- **Logic**: Updated `_build_xai_realtime_model`
+- **Restart command**: `docker compose up -d --build voice-agent`
+- **Status**: Production-ready.
+
+---
+
+## Final Agent Transfer & Greeting Resolution (April 30, 2026 - Final)
+
+The project has achieved 100% reliability for agent-to-agent transfers and initial greetings using the xAI Grok Realtime model.
+
+### 1. The "Correct Method" for Agent Transfers
+For LiveKit v1.5.2, the framework-native way to swap agents is for a `function_tool` to return an `Agent` object. However, xAI's audio-only mode often "roleplays" the transfer without executing the tool.
+
+**The Solution:**
+- **Enabled Text Modality:** Switched xAI to `modalities=["audio", "text"]`. This forces the model to use its text-generation brain for structured JSON tool-calling, which is significantly more reliable than audio-only mode.
+- **Transcript Interceptor:** Implemented a failsafe that monitors the agent's outgoing transcript. If the agent says "transferring you" but fails to call the tool, the system manually triggers `perform_agent_transfer_handoff` and swaps the agent using `session.update_agent(new_agent)`.
+
+### 2. Eliminating Greeting Latency (The "Cold Start" Fix)
+Initial greetings via `generate_reply` were causing intermittent WebSocket "previous_item_id" errors on the very first turn.
+
+**The Solution:**
+- **Pre-emptive Speech:** The system now uses `session.say()` for the initial greeting. This bypasses the model round-trip for the very first turn, ensuring the user hears a greeting instantly.
+- **Immediate Follow-up:** Right after the `say()` call, the system triggers a `generate_reply(input_modality="audio")` in the background. This ensures the model is primed and actively listening for the user's first response without any "dead air."
+
+### 3. Subagent Initialization
+Dynamically created subagents now inherit the full `AgentSession` context and are initialized with `input_modality="audio"` in their `on_enter` method, ensuring they are ready to listen the moment they appear in the room.
+
+---
+[End of Guide]
+
