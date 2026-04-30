@@ -2597,11 +2597,8 @@ async def perform_agent_transfer_handoff(
             # Wait for the new agent session to stabilize (minimal)
             await asyncio.sleep(0.1)
             try:
-                subagent_lang = normalize_agent_language(target_payload.get("language", "en-GB"))
-                logger.info("Triggering truly direct subagent greeting turn...")
                 # For RealtimeModel/Multimodal agents, use generate_reply to trigger the first turn
-                # No instructions = True Direct Access to system prompt. 
-                # modality="audio" = Ensures it listens after speaking.
+                # Truly Direct: No instructions, let the prompt drive the opening
                 active_session.generate_reply(
                     allow_interruptions=True,
                     input_modality="audio",

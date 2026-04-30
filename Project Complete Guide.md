@@ -1182,10 +1182,10 @@ The agent no longer uses forced regex-based greeting extraction. Instead, it use
 ### Hyper-Optimized Transfers (Ultra-Low Latency)
 Call transfers between agents have been further optimized for zero-wait performance:
 - **Zero-Wait Handoff**: The internal handoff delay (`TRANSFER_HANDOFF_DELAY_SEC`) has been bypassed entirely for near-instant transitions.
-- **Immediate Interruption**: The primary agent is now forcibly interrupted (`self.interrupt()`) the exact millisecond a transfer tool is called. This prevents the agent from finishing any pending sentences or adding unrequested explanations.
-- **Raw Direct Subagent Trigger**: Subagents are triggered with a bare `generate_reply(input_modality="audio")` call. By providing **no instructions**, the AI must rely 100% on its system prompt context to determine its opening persona and greeting.
-- **Modality Preservation**: Explicitly setting `input_modality="audio"` ensures the agent enters a listening state immediately after its proactive turn, resolving connectivity issues where the agent would stop listening.
-- **Low-Latency STT**: The STT endpointing latency has been reduced to **40ms** (configured via `STT_ENDPOINTING_PHONE_MS` in `docker-compose.yml`) for near-human response speed.
+- **Immediate Interruption**: The primary agent is now forcibly interrupted (`self.interrupt()`) the exact millisecond a transfer tool is called. This prevents post-transfer chatter.
+- **Truly Direct Subagent Trigger**: Subagents are triggered with a bare `generate_reply(input_modality="audio")` call with **NO instructions**. The AI relies 100% on its system prompt to determine its persona and greeting.
+- **Modality Preservation**: Explicitly setting `input_modality="audio"` ensures the agent enters a listening state immediately after its proactive turn, resolving connectivity issues.
+- **Tuned VAD & STT**: The STT endpointing is set to **80ms** for stability, and the VAD is tuned with a **0.1s** minimum speech duration to filter out line noise while remaining responsive.
 
 ### Dynamic Label Sanitization
 To prevent technical labels (e.g., "General Inquiries:", "Opening Script:") from being spoken, the agent runtime now includes a dynamic sanitization layer that strips these prefixes from the system prompt before the LLM processes them, ensuring a clean, human-like voice experience.
