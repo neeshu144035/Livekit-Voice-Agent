@@ -1127,3 +1127,26 @@ Please verify with commands:
 
 #### Deployment
 - Voice agent rebuilt and deployed at ~08:35 UTC
+
+### xAI Unified Realtime & SIP Optimization (April 30, 2026 - Evening Update)
+
+#### 1. xAI Unified Realtime Model Integration
+- **Unified Path**: Centralized xAI realtime model building into `_build_xai_realtime_model`.
+- **Server-Side Turn Detection**: Disabled local VAD (`vad_instance=None`) when using xAI unified realtime. This allows the model's native `server_vad` (configured via `TurnDetection`) to handle user speech more reliably, fixing the issue where the agent appeared "silent" or failed to recognize input.
+- **Responsiveness**: Enabled `create_response` and `interrupt_response` in turn detection settings to ensure the agent can be interrupted and responds immediately.
+
+#### 2. SIP Transfer Handoff Optimization
+- **Ringing State Handoff**: Updated `wait_for_transfer_established` to include `ringing` as a "ready" state. Previously, the agent would wait up to 45 seconds for a call to be "answered" before disconnecting. Now, the agent disconnects (handoff completes) as soon as the outbound leg starts ringing, reducing the period where the caller hears both the agent and the ringback tone.
+- **Minimized Handoff Latency**: Tuned `TRANSFER_HANDOFF_DELAY_SEC` (0.8s) and `SUBAGENT_GREETING_DELAY_SEC` (0.3s) via environment variables to ensure a smooth transition without overlapping speech.
+- **Imperative Prompting**: Enforced a strict "Say X -> Call Tool -> STOP" pattern in the system prompt. This bypasses conversational loops where the model asks for permission to transfer.
+
+#### 3. Environment Variable Controls
+Added support for:
+- `TRANSFER_HANDOFF_DELAY_SEC`: Delay between agent saying "transferring" and the SIP dial start.
+- `SUBAGENT_GREETING_DELAY_SEC`: Delay before the new agent speaks after handoff.
+- `OPENAI_REALTIME_SILENCE_DURATION_MS`: Control for server-side turn detection sensitivity.
+
+#### Final Verification
+- Transfer tool executes immediately.
+- Agent remains silent during transfer dial.
+- Subagent greets immediately upon participant join.

@@ -3202,6 +3202,9 @@ def _safe_chat_completion_create(client, **kwargs):
 
 async def _execute_agent_runtime_tool(func_cfg: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
     tool_name = str(func_cfg.get("name", "")).strip().replace(" ", "_").lower()
+    url = str(func_cfg.get("url", "")).strip()
+    system_type = _normalize_system_function_type(func_cfg.get("system_type"))
+    system_config = ensure_custom_params(func_cfg.get("system_config"))
     normalized_args, validation_errors = _validate_and_normalize_runtime_args(func_cfg, args or {})
     if validation_errors:
         return {
@@ -3211,8 +3214,12 @@ async def _execute_agent_runtime_tool(func_cfg: Dict[str, Any], args: Dict[str, 
         }
     args = normalized_args
 
-    if tool_name in ("transfer_call", "call_transfer"):
-        configured_phone = str(func_cfg.get("phone_number", "")).strip()
+    if (
+        tool_name in ("transfer_call", "call_transfer")
+        or system_type == SYSTEM_FUNCTION_TRANSFER_CALL
+        or url == f"builtin://{SYSTEM_FUNCTION_TRANSFER_CALL}"
+    ):
+        configured_phone = str(system_config.get("phone_number") or func_cfg.get("phone_number", "")).strip()
         requested_phone = str((args or {}).get("phone_number", "")).strip()
         target_phone = configured_phone or requested_phone
         if not target_phone:
@@ -3224,8 +3231,7 @@ async def _execute_agent_runtime_tool(func_cfg: Dict[str, Any], args: Dict[str, 
             "status": "test_chat_simulated",
         }
 
-    if tool_name == SYSTEM_FUNCTION_AGENT_TRANSFER:
-        system_config = ensure_custom_params(func_cfg.get("system_config"))
+    if system_type == SYSTEM_FUNCTION_AGENT_TRANSFER or url == f"builtin://{SYSTEM_FUNCTION_AGENT_TRANSFER}":
         target_agent_id = system_config.get("target_agent_id")
         return {
             "success": False,
@@ -3238,7 +3244,6 @@ async def _execute_agent_runtime_tool(func_cfg: Dict[str, Any], args: Dict[str, 
     if tool_name == "end_call":
         return {"success": True, "action": "end_call", "status": "test_chat_simulated"}
 
-    url = str(func_cfg.get("url", "")).strip()
     if not url:
         return {"success": False, "error": "Function URL is empty"}
 

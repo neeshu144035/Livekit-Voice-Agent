@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import asyncio
 import logging
@@ -26,6 +26,10 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, openai, silero, elevenlabs
 try:
+    from livekit.plugins import xai
+except Exception:
+    xai = None  # type: ignore[assignment]
+try:
     from livekit.plugins.elevenlabs import VoiceSettings as ElevenVoiceSettings
 except Exception:
     ElevenVoiceSettings = None  # type: ignore[assignment]
@@ -51,7 +55,8 @@ MIN_AGENT_LLM_TEMPERATURE = 0.0
 MAX_AGENT_LLM_TEMPERATURE = 1.5
 MIN_AGENT_VOICE_SPEED = 0.8
 MAX_AGENT_VOICE_SPEED = 1.2
-TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "2.5"))
+TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "0.8"))
+SUBAGENT_GREETING_DELAY_SEC = float(os.getenv("SUBAGENT_GREETING_DELAY_SEC", "0.3"))
 END_CALL_DISCONNECT_DELAY_SEC = float(os.getenv("END_CALL_DISCONNECT_DELAY_SEC", "1.0"))
 DISCONNECT_GRACE_SEC = float(os.getenv("DISCONNECT_GRACE_SEC", "20"))
 CHAT_REPLY_TIMEOUT_SEC = float(os.getenv("CHAT_REPLY_TIMEOUT_SEC", "40"))
@@ -364,6 +369,8 @@ def _build_openai_realtime_turn_detection() -> Any:
         payload: Dict[str, Any] = {
             "type": "semantic_vad",
             "eagerness": OPENAI_REALTIME_SEMANTIC_EAGERNESS,
+            "create_response": True,
+            "interrupt_response": True,
         }
     else:
         payload = {
@@ -371,6 +378,8 @@ def _build_openai_realtime_turn_detection() -> Any:
             "threshold": _coerce_setting_float(OPENAI_REALTIME_VAD_THRESHOLD, default=0.45, min_value=0.1, max_value=0.9),
             "prefix_padding_ms": _coerce_setting_int(OPENAI_REALTIME_PREFIX_PADDING_MS, default=150, min_value=50, max_value=500),
             "silence_duration_ms": _coerce_setting_int(OPENAI_REALTIME_SILENCE_DURATION_MS, default=200, min_value=80, max_value=800),
+            "create_response": True,
+            "interrupt_response": True,
         }
     try:
         from openai.types.beta.realtime.session import TurnDetection
@@ -378,6 +387,41 @@ def _build_openai_realtime_turn_detection() -> Any:
         return TurnDetection(**payload)
     except Exception:
         return payload
+
+
+def _build_xai_realtime_model(
+    *,
+    selected_voice: str,
+    voice_realtime_model: str,
+    xai_api_key: str,
+) -> tuple[Any, str]:
+    turn_detection = _build_openai_realtime_turn_detection()
+    if xai is not None and hasattr(xai, "realtime") and hasattr(xai.realtime, "RealtimeModel"):
+        realtime_kwargs: Dict[str, Any] = {
+            "voice": selected_voice,
+            "api_key": xai_api_key,
+        }
+        if turn_detection is not None:
+            realtime_kwargs["turn_detection"] = turn_detection
+        realtime_model = xai.realtime.RealtimeModel(**realtime_kwargs)
+        resolved_model = str(getattr(realtime_model, "model", "") or voice_realtime_model or DEFAULT_XAI_REALTIME_MODEL)
+        return realtime_model, resolved_model
+
+    if not hasattr(openai, "realtime") or not hasattr(openai.realtime, "RealtimeModel"):
+        raise RuntimeError(
+            "xAI selected but neither livekit-plugins-xai nor livekit-plugins-openai RealtimeModel support is installed"
+        )
+
+    realtime_kwargs: Dict[str, Any] = {
+        "model": voice_realtime_model,
+        "api_key": xai_api_key,
+        "base_url": XAI_REALTIME_BASE_URL,
+        "voice": selected_voice,
+        "modalities": ["audio"],
+    }
+    if turn_detection is not None:
+        realtime_kwargs["turn_detection"] = turn_detection
+    return openai.realtime.RealtimeModel(**realtime_kwargs), voice_realtime_model
 
 
 def resolve_llm_temperature(config: Dict[str, Any]) -> float:
@@ -530,10 +574,20 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
         if not _is_transfer_tool(fn):
             continue
         tool_name = str(fn.get("name", "")).strip().replace(" ", "_").lower() or ""
-        topic = tool_name.replace("_agent_transfer", "").replace("_", " ")
+        system_type = _normalize_tool_name(fn.get("system_type", ""))
+        raw_description = re.sub(r"\s+", " ", str(fn.get("description", "")).strip())
+        if tool_name.endswith("_agent_transfer"):
+            topic = tool_name.replace("_agent_transfer", "").replace("_", " ").strip()
+            trigger = f"If the caller asks for the {topic} team or agrees to that transfer"
+        elif raw_description and normalize_text(raw_description) not in {"transfer", "transfer call", "agent transfer"}:
+            trigger = f"If the caller's request matches this transfer ({raw_description})"
+        elif system_type == "transfer_call":
+            trigger = "If the caller asks to transfer, escalate, or speak to a human"
+        else:
+            trigger = "If the caller asks for another team/person or agrees to be transferred"
         instructions.append(
-            f"{len(instructions)+1}. Caller wants {topic} → Say 'I am transferring you to the {topic} team now' → "
-            f"CALL `{tool_name}` TOOL → STOP SPEAKING IMMEDIATELY"
+            f"{len(instructions)+1}. {trigger} -> first say exactly 'I am transferring you now.' -> "
+            f"immediately CALL `{tool_name}` TOOL -> STOP SPEAKING"
         )
     if not instructions:
         return ""
@@ -1765,7 +1819,7 @@ async def wait_for_transfer_established(
             sip_state = _participant_sip_state(participant)
             if sip_state:
                 last_state = sip_state
-            if sip_state in {"active", "automation", "answered", "bridged", "connected", "confirmed", "complete", "completed", "in-progress", "in_progress"}:
+            if sip_state in {"active", "automation", "answered", "bridged", "connected", "confirmed", "complete", "completed", "in-progress", "in_progress", "ringing"}:
                 return {"ready": True, "reason": f"sip_state:{sip_state}"}
         else:
             if ever_joined:
@@ -2263,20 +2317,11 @@ def build_runtime_engines_for_config(
             raise RuntimeError("xAI selected but no realtime model was saved in the app")
         if not xai_api_key:
             raise RuntimeError("xAI selected but XAI_API_KEY is not set")
-        if not hasattr(openai, "realtime") or not hasattr(openai.realtime, "RealtimeModel"):
-            raise RuntimeError("xAI unified voice path requires livekit-plugins-openai RealtimeModel support")
-        realtime_kwargs: Dict[str, Any] = {
-            "model": voice_realtime_model,
-            "api_key": xai_api_key,
-            "base_url": XAI_REALTIME_BASE_URL,
-            "voice": selected_voice,
-            "modalities": ["audio"],
-        }
-        turn_detection = _build_openai_realtime_turn_detection()
-        if turn_detection is not None:
-            realtime_kwargs["turn_detection"] = turn_detection
-        llm = openai.realtime.RealtimeModel(**realtime_kwargs)
-        runtime_llm_model = voice_realtime_model
+        llm, runtime_llm_model = _build_xai_realtime_model(
+            selected_voice=selected_voice,
+            voice_realtime_model=voice_realtime_model,
+            xai_api_key=xai_api_key,
+        )
         use_realtime_llm = True
         use_unified_realtime_audio = True
     elif (
@@ -2491,7 +2536,7 @@ async def perform_agent_transfer_handoff(
             chat_ctx=new_chat_ctx,
         )
         # Silent handoff delay before the new agent speaks
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(max(0.0, TRANSFER_HANDOFF_DELAY_SEC))
 
         active_session.update_agent(target_agent)
         if call_id:
@@ -2513,7 +2558,7 @@ async def perform_agent_transfer_handoff(
 
         # Trigger subagent greeting after handoff
         async def _trigger_subagent_greeting():
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(max(0.0, SUBAGENT_GREETING_DELAY_SEC))
             try:
                 subagent_lang = normalize_agent_language(target_payload.get("language", "en-GB"))
                 subagent_greeting = build_safe_auto_greeting(subagent_lang, target_prompt)
@@ -3312,21 +3357,12 @@ async def entrypoint(ctx: JobContext):
             raise RuntimeError("xAI selected but no realtime model was saved in the app")
         if not xai_api_key:
             raise RuntimeError("xAI selected but XAI_API_KEY is not set")
-        if not hasattr(openai, "realtime") or not hasattr(openai.realtime, "RealtimeModel"):
-            raise RuntimeError("xAI unified voice path requires livekit-plugins-openai RealtimeModel support")
-        realtime_kwargs: Dict[str, Any] = {
-            "model": voice_realtime_model,
-            "api_key": xai_api_key,
-            "base_url": XAI_REALTIME_BASE_URL,
-            "voice": selected_voice,
-            "modalities": ["audio"],
-        }
-        turn_detection = _build_openai_realtime_turn_detection()
-        if turn_detection is not None:
-            realtime_kwargs["turn_detection"] = turn_detection
         try:
-            llm = openai.realtime.RealtimeModel(**realtime_kwargs)
-            runtime_llm_model = voice_realtime_model
+            llm, runtime_llm_model = _build_xai_realtime_model(
+                selected_voice=selected_voice,
+                voice_realtime_model=voice_realtime_model,
+                xai_api_key=xai_api_key,
+            )
             base_url = XAI_REALTIME_BASE_URL
             use_realtime_llm = True
             use_unified_realtime_audio = True
@@ -3477,7 +3513,7 @@ async def entrypoint(ctx: JobContext):
         agent_label=config.get("name"),
         is_phone_call=is_phone_call,
         runtime_vars=runtime_vars,
-        vad_instance=ctx.proc.userdata["vad"],
+        vad_instance=ctx.proc.userdata["vad"] if not use_unified_realtime_audio else None,
         llm_engine=llm,
         tts_engine=tts_engine,
         stt_engine=session_kwargs.get("stt"),

@@ -2,6 +2,7 @@ livekit-agents==1.5.2
 livekit-plugins-deepgram==1.5.2
 livekit-plugins-elevenlabs==1.5.2
 livekit-plugins-openai==1.5.2
+livekit-plugins-xai==1.5.2
 livekit-plugins-silero==1.5.2
 livekit-plugins-turn-detector==1.5.2
 elevenlabs>=2.0.0
