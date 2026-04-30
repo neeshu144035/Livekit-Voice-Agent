@@ -55,8 +55,8 @@ MIN_AGENT_LLM_TEMPERATURE = 0.0
 MAX_AGENT_LLM_TEMPERATURE = 1.5
 MIN_AGENT_VOICE_SPEED = 0.8
 MAX_AGENT_VOICE_SPEED = 1.2
-TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "0.8"))
-SUBAGENT_GREETING_DELAY_SEC = float(os.getenv("SUBAGENT_GREETING_DELAY_SEC", "0.3"))
+TRANSFER_HANDOFF_DELAY_SEC = float(os.getenv("TRANSFER_HANDOFF_DELAY_SEC", "0.1"))
+SUBAGENT_GREETING_DELAY_SEC = float(os.getenv("SUBAGENT_GREETING_DELAY_SEC", "0.0"))
 END_CALL_DISCONNECT_DELAY_SEC = float(os.getenv("END_CALL_DISCONNECT_DELAY_SEC", "1.0"))
 DISCONNECT_GRACE_SEC = float(os.getenv("DISCONNECT_GRACE_SEC", "20"))
 CHAT_REPLY_TIMEOUT_SEC = float(os.getenv("CHAT_REPLY_TIMEOUT_SEC", "40"))
@@ -586,14 +586,16 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
         else:
             trigger = "If the caller asks for another team/person or agrees to be transferred"
         instructions.append(
-            f"{len(instructions)+1}. {trigger} -> first say exactly 'I am transferring you now.' -> "
-            f"immediately CALL `{tool_name}` TOOL -> STOP SPEAKING"
+            f"{len(instructions)+1}. {trigger} -> DO NOT ask for permission or confirmation. -> "
+            f"First say exactly 'I am transferring you now.' -> "
+            f"immediately CALL `{tool_name}` TOOL -> STOP SPEAKING AND REMAIN SILENT"
         )
     if not instructions:
         return ""
     return (
-        "TRANSFER RULES — FOLLOW EXACTLY IN THIS ORDER:\n"
+        "TRANSFER RULES — FOLLOW STRICTLY:\n"
         + "\n".join(instructions)
+        + "\nDO NOT ask the user if they want to be transferred if they have already requested it or agreed to it. "
         + "\nAFTER CALLING ANY TRANSFER TOOL YOU MUST STOP SPEAKING. DO NOT SAY ANYTHING ELSE."
     )
 
@@ -712,16 +714,30 @@ def _clean_prompt_greeting_candidate(candidate: str) -> str:
         return ""
     cleaned = re.sub(r"^[\-\*]\s*", "", cleaned).strip()
     cleaned = re.sub(
-        r"^(?:greeting|first message|opening line|opening greeting|say|script)\s*[:\-]\s*",
+        r"^(?:greeting|first message|opening line|opening greeting|say|script|general inquiry|general inquiries|general query|opening)\s*[:\-]\s*",
         "",
         cleaned,
         flags=re.IGNORECASE,
     ).strip()
-    cleaned = re.sub(r"^(?:assistant|agent)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
-    cleaned = re.sub(r"\s*(?:->|ΓåÆ).*$", "", cleaned).strip()
+    cleaned = re.sub(r"^(?:assistant|agent)\s*[:\-]\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s*(?:->|→).*$", "", cleaned).strip()
     cleaned = strip_known_prompt_style_tags(cleaned)
     cleaned = _strip_wrapping_quotes(cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    
+    # Root Cause Fix: Dynamic label stripping. 
+    # Strips leading labels like "General Inquiries: Hello" -> "Hello"
+    # or "Opening Script - Welcome" -> "Welcome".
+    # Only strips if the prefix is short (label-like) and doesn't start with a greeting word.
+    prefix_match = re.match(r"^([^:\-]{2,35})[:\-]\s+(.+)$", cleaned)
+    if prefix_match:
+        prefix, content = prefix_match.groups()
+        prefix_lower = prefix.lower().strip()
+        greeting_starters = ("hi", "hello", "hey", "welcome", "good morning", "good afternoon", "good evening", "namaste")
+        if not any(prefix_lower.startswith(w) for w in greeting_starters):
+            # It's a label, return the content
+            cleaned = content.strip()
+
     if normalize_text(cleaned).startswith("bridge:"):
         return ""
     return cleaned
@@ -765,9 +781,21 @@ def extract_prompt_greeting(system_prompt: str) -> str:
     time_of_day = _resolve_time_of_day_label()
     fallback_candidate = ""
     for line in lines[start_idx + 1 : start_idx + 15]:
+        raw_line = line.strip()
+        if not raw_line:
+            continue
+        # Skip pure label lines like "General Inquiries:" or "Main Greeting:"
+        if raw_line.endswith(":") and len(raw_line) < 40:
+            continue
+            
         candidate = _clean_prompt_greeting_candidate(line)
         if not candidate:
             continue
+            
+        # Skip technical candidates that only contain the labels we want to avoid
+        if normalize_text(candidate) in ("general inquiries", "general inquiry", "general query", "opening script", "opening message"):
+            continue
+            
         candidate = re.sub(
             r"\[\s*morning\s*/\s*afternoon\s*/\s*evening\s*\]",
             time_of_day,
@@ -1513,6 +1541,7 @@ def build_effective_runtime_prompt(
         config.get("system_prompt", "You are a helpful voice assistant."),
         runtime_vars,
     )
+
     language_instruction = build_language_enforcement_instruction(agent_lang)
     if language_instruction:
         sys_prompt += f"\n\n{language_instruction}"
@@ -2415,6 +2444,8 @@ def build_transfer_handoff_developer_note(
         f"- Caller memory: {memory_bits}\n"
         "- You are taking over an active phone call.\n"
         "- Greet the caller in your own tone and continue naturally.\n"
+        "- DO NOT ask the user if they are still there or if they can hear you unless they stay silent for a long time.\n"
+        "- Start speaking immediately to acknowledge the transfer.\n"
         "- Do not re-ask already-known details such as name or issue unless they are missing, ambiguous, or contradicted."
     )
 
@@ -2561,24 +2592,17 @@ async def perform_agent_transfer_handoff(
         # Trigger subagent greeting after handoff
         # Trigger subagent greeting after handoff
         async def _trigger_subagent_greeting():
-            # Wait for the new agent session to stabilize
-            await asyncio.sleep(max(0.3, SUBAGENT_GREETING_DELAY_SEC + 0.2))
+            # Wait for the new agent session to stabilize (minimal)
+            await asyncio.sleep(0.1)
             try:
                 subagent_lang = normalize_agent_language(target_payload.get("language", "en-GB"))
-                subagent_greeting = build_safe_auto_greeting(subagent_lang, target_prompt)
-                if subagent_greeting:
-                    logger.info("Sending subagent greeting: %s", subagent_greeting)
-                    # For RealtimeModel/Multimodal agents, use generate_reply with instructions
-                    active_session.generate_reply(
-                        instructions=(
-                            f'Say exactly this greeting to the caller now: "{subagent_greeting}"\n'
-                            'Do not add anything else. Then listen for their response.'
-                        ),
-                        allow_interruptions=True,
-                        input_modality="audio",
-                    )
-                else:
-                    logger.warning("No greeting found for subagent; skipping proactive greeting")
+                logger.info("Triggering proactive subagent greeting turn...")
+                # For RealtimeModel/Multimodal agents, use generate_reply to trigger the first turn
+                # Neutral instruction ensures the model starts its turn without forcing a specific greeting
+                active_session.generate_reply(
+                    instructions="The call has been transferred to you. Start your turn now.",
+                    allow_interruptions=True,
+                )
             except Exception as greet_exc:
                 logger.error("Failed to trigger subagent greeting: %s", greet_exc)
 
@@ -3829,10 +3853,6 @@ async def entrypoint(ctx: JobContext):
                     if tts_engine is None:
                         logger.info("Sending custom greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
                         session.generate_reply(
-                            instructions=(
-                                f'Say this greeting to the caller now: "{greeting_text}"\\n'
-                                'Say exactly this greeting. Do not add anything else.'
-                            ),
                             allow_interruptions=True,
                             input_modality="audio",
                         )
@@ -3844,10 +3864,6 @@ async def entrypoint(ctx: JobContext):
                         logger.info("Triggering dynamic greeting via generate_reply (no TTS engine, realtime path) (%s)", source)
                         greeting_text = build_safe_auto_greeting(agent_lang, sys_prompt)
                         session.generate_reply(
-                            instructions=(
-                                f'Say exactly this greeting to the caller now: "{greeting_text}"\n'
-                                'Do not add anything else. Then listen for their response.'
-                            ),
                             allow_interruptions=True,
                             input_modality="audio",
                         )

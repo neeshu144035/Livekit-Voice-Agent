@@ -15,6 +15,7 @@
 12. [Explicit Runtime Control (April 2026)](#explicit-runtime-control-april-2026)
 13. [Project State Summary (April 2026)](#project-state-summary-april-2026)
 14. [Agent-to-Agent Handoff Optimization (April 25, 2026)](#agent-to-agent-handoff-optimization-april-25-2026)
+15. [Truly Direct Greeting & Ultra-Low Latency (April 30, 2026)](#truly-direct-greeting-ultra-low-latency-april-30-2026)
 
 ---
 
@@ -1170,3 +1171,19 @@ The following critical optimizations were implemented to achieve ultra-low laten
 - **Target Container**: `voice-agent`
 - **Build Status**: Verified with `sudo docker compose up -d --build voice-agent`
 - **Branch**: `codex/agent-transfer-tools`
+## Truly Direct Greeting & Ultra-Low Latency (April 30, 2026)
+
+### Truly Direct Greeting Model
+The agent no longer uses forced regex-based greeting extraction. Instead, it uses the **Pure System Prompt** model:
+- The agent is triggered to speak with a neutral instruction: `"The call has started. Start your turn now."`
+- The AI uses its entire system prompt and persona to decide the opening line naturally.
+- This eliminates "robotic" extraction errors and allows the agent to handle complex, categorized prompts without speaking technical metadata.
+
+### Ultra-Low Latency Transfers
+Call transfers between agents have been optimized for near-instant execution:
+- **Reduced Delays**: The handoff wait time (`TRANSFER_HANDOFF_DELAY_SEC`) is now **0.1s**.
+- **Proactive Turns**: Subagents no longer wait for audio detection to start their turn. They are triggered immediately using a proactive `generate_reply` call.
+- **Handoff Instructions**: The primary agent is instructed to stop speaking immediately when the transfer tool is called, preventing double-talk and awkward transitions.
+
+### Dynamic Label Sanitization
+To prevent technical labels (e.g., "General Inquiries:", "Opening Script:") from being spoken, the agent runtime now includes a dynamic sanitization layer that strips these prefixes from the system prompt before the LLM processes them, ensuring a clean, human-like voice experience.
