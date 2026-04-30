@@ -2569,8 +2569,9 @@ async def perform_agent_transfer_handoff(
             stt_engine=runtime_bundle.get("stt_engine"),
             chat_ctx=new_chat_ctx,
         )
-        # Silent handoff delay before the new agent speaks
-        await asyncio.sleep(max(0.0, TRANSFER_HANDOFF_DELAY_SEC))
+        # Silent handoff delay (minimized for hyper-latency)
+        # await asyncio.sleep(max(0.0, TRANSFER_HANDOFF_DELAY_SEC))
+        pass
 
         active_session.update_agent(target_agent)
         if call_id:
@@ -2597,15 +2598,10 @@ async def perform_agent_transfer_handoff(
             await asyncio.sleep(0.1)
             try:
                 subagent_lang = normalize_agent_language(target_payload.get("language", "en-GB"))
-                logger.info("Triggering proactive subagent greeting turn...")
+                logger.info("Triggering truly direct subagent greeting turn...")
                 # For RealtimeModel/Multimodal agents, use generate_reply to trigger the first turn
-                # Neutral instruction ensures the model starts its turn without forcing a specific greeting
+                # No instructions = True Direct Access to system prompt
                 active_session.generate_reply(
-                    instructions=(
-                        "The call has been transferred to you. Introduce yourself as the new agent "
-                        "and follow your system instructions for the opening greeting script. "
-                        "Do not skip your introduction even though you see the previous conversation."
-                    ),
                     allow_interruptions=True,
                 )
             except Exception as greet_exc:
@@ -2848,6 +2844,8 @@ class DynamicPropertyAgent(Agent):
                             "message": "Handoff queued; announce transfer to caller now.",
                         }}
                 elif system_type == "agent_transfer" or url == "builtin://agent_transfer":
+                    if hasattr(self, "interrupt"):
+                        self.interrupt()
                     result = await perform_agent_transfer_handoff(
                         self,
                         normalized_tool_name,

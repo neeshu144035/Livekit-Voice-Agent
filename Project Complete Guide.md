@@ -1179,12 +1179,12 @@ The agent no longer uses forced regex-based greeting extraction. Instead, it use
 - The AI uses its entire system prompt and persona to decide the opening line naturally.
 - This eliminates "robotic" extraction errors and allows the agent to handle complex, categorized prompts without speaking technical metadata.
 
-### Ultra-Low Latency Transfers
-Call transfers between agents have been optimized for near-instant execution:
-- **Reduced Delays**: The handoff wait time (`TRANSFER_HANDOFF_DELAY_SEC`) is now **0.1s**.
-- **Proactive Turns**: Subagents no longer wait for audio detection to start their turn. They are triggered immediately using a proactive `generate_reply` call.
-- **Strict Silence**: The primary agent is instructed to say only "I am transferring you now" and then go **absolutely silent**. Post-tool explanations or goodbye messages are strictly forbidden to prevent "double-talk".
-- **Forced Subagent Intro**: Subagents are explicitly instructed to introduce themselves and use their opening script, even if they have access to the previous conversation history. This ensures the caller always knows they are speaking to a new agent.
+### Hyper-Optimized Transfers (Ultra-Low Latency)
+Call transfers between agents have been further optimized for zero-wait performance:
+- **Zero-Wait Handoff**: The internal handoff delay (`TRANSFER_HANDOFF_DELAY_SEC`) has been bypassed entirely for near-instant transitions.
+- **Immediate Interruption**: The primary agent is now forcibly interrupted (`self.interrupt()`) the exact millisecond a transfer tool is called. This prevents the agent from finishing any pending sentences or adding unrequested explanations.
+- **Truly Direct Subagent Trigger**: Subagents are triggered with a bare `generate_reply()` call. With no external instructions, the AI must rely 100% on its system prompt context to determine its opening persona and greeting.
+- **Strict Post-Tool Silence**: Handoff logic explicitly forbids the primary agent from generating any text after the tool call is emitted.
 
 ### Dynamic Label Sanitization
 To prevent technical labels (e.g., "General Inquiries:", "Opening Script:") from being spoken, the agent runtime now includes a dynamic sanitization layer that strips these prefixes from the system prompt before the LLM processes them, ensuring a clean, human-like voice experience.
