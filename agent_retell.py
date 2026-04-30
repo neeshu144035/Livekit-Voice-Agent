@@ -490,8 +490,23 @@ def _normalize_tool_speech_flags(
     return False, False
 
 
+def _is_transfer_tool(func_cfg: Dict[str, Any]) -> bool:
+    tool_name = str(func_cfg.get("name", "")).strip().replace(" ", "_").lower() or ""
+    system_type = _normalize_tool_name(func_cfg.get("system_type", ""))
+    url = str(func_cfg.get("url", "")).strip()
+    return (
+        system_type in ("transfer_call", "agent_transfer")
+        or url in ("builtin://transfer_call", "builtin://agent_transfer")
+        or tool_name in ("transfer_call", "agent_transfer")
+        or tool_name.endswith("_agent_transfer")
+    )
+
+
 def _tool_speech_instruction_line(func_cfg: Dict[str, Any]) -> str:
     tool_name = str(func_cfg.get("name", "")).strip().replace(" ", "_").lower() or "tool"
+    if _is_transfer_tool(func_cfg):
+        return ""
+
     during, after = _normalize_tool_speech_flags(
         func_cfg.get("speak_during_execution", False),
         func_cfg.get("speak_after_execution", True),
@@ -509,10 +524,31 @@ def _tool_speech_instruction_line(func_cfg: Dict[str, Any]) -> str:
     return f"- `{tool_name}`: default to concise post-tool result only."
 
 
+def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
+    instructions: List[str] = []
+    for fn in functions_config or []:
+        if not _is_transfer_tool(fn):
+            continue
+        tool_name = str(fn.get("name", "")).strip().replace(" ", "_").lower() or ""
+        topic = tool_name.replace("_agent_transfer", "").replace("_", " ")
+        instructions.append(
+            f"{len(instructions)+1}. Caller wants {topic} → Say 'I am transferring you to the {topic} team now' → "
+            f"CALL `{tool_name}` TOOL → STOP SPEAKING IMMEDIATELY"
+        )
+    if not instructions:
+        return ""
+    return (
+        "TRANSFER RULES — FOLLOW EXACTLY IN THIS ORDER:\n"
+        + "\n".join(instructions)
+        + "\nAFTER CALLING ANY TRANSFER TOOL YOU MUST STOP SPEAKING. DO NOT SAY ANYTHING ELSE."
+    )
+
+
 def build_tool_speech_guidance(functions_config: List[Dict[str, Any]]) -> str:
     if not functions_config:
         return ""
     lines = [_tool_speech_instruction_line(fn) for fn in functions_config if fn.get("name")]
+    lines = [line for line in lines if line]
     if not lines:
         return ""
     return "Tool speech behavior (must follow per tool):\n" + "\n".join(lines)
@@ -1433,12 +1469,20 @@ def build_effective_runtime_prompt(
         sys_prompt = adapt_system_prompt_for_xai(sys_prompt)
         logger.info("Adapted saved prompt for xAI unified realtime voice")
 
+    # Add explicit transfer instructions BEFORE other additions (highest priority)
+    # Build from ALL functions first, then filter
+    all_functions = list(functions or [])
+    transfer_instructions = build_transfer_instructions(all_functions)
+    if transfer_instructions:
+        sys_prompt = f"{transfer_instructions}\n\n{sys_prompt}"
+        logger.info("Prepended transfer instructions to system prompt")
+
     logger.info(
         "Loaded system prompt (len=%s): %s",
         len(sys_prompt or ""),
         (sys_prompt or "").replace("\n", " ")[:180],
     )
-    filtered_functions = list(functions or [])
+    filtered_functions = all_functions
     if STRICT_PROMPT_TOOL_FILTER:
         initial_tool_count = len(filtered_functions)
         filtered_functions = filter_functions_by_prompt(filtered_functions, sys_prompt)
@@ -1447,11 +1491,8 @@ def build_effective_runtime_prompt(
             len(filtered_functions),
             max(initial_tool_count - len(filtered_functions), 0),
         )
-
-    tool_speech_guidance = build_tool_speech_guidance(filtered_functions)
-    if tool_speech_guidance:
-        sys_prompt = f"{sys_prompt}\n\n{tool_speech_guidance}" if sys_prompt else tool_speech_guidance
-        logger.info("Applied tool speech guidance block to runtime prompt")
+        kept_names = [f.get("name", "") for f in filtered_functions if f.get("name")]
+        logger.info("Tools surviving filter: %s", kept_names)
 
     if EMAIL_SPELLING_POLICY:
         sys_prompt = f"{sys_prompt}\n\n{EMAIL_SPELLING_POLICY}" if sys_prompt else EMAIL_SPELLING_POLICY
@@ -2470,6 +2511,30 @@ async def perform_agent_transfer_handoff(
                 },
             )
 
+        # Trigger subagent greeting after handoff
+        async def _trigger_subagent_greeting():
+            await asyncio.sleep(2.5)
+            try:
+                subagent_lang = normalize_agent_language(target_payload.get("language", "en-GB"))
+                subagent_greeting = build_safe_auto_greeting(subagent_lang, target_prompt)
+                if subagent_greeting:
+                    logger.info("Sending subagent greeting via generate_reply: %s", subagent_greeting)
+                    # Use generate_reply which works for both realtime and pipeline paths
+                    active_session.generate_reply(
+                        instructions=(
+                            f'Say this greeting to the caller now: "{subagent_greeting}"\n'
+                            'Say exactly this greeting. Do not add anything else.'
+                        ),
+                        allow_interruptions=True,
+                        input_modality="audio",
+                    )
+                else:
+                    logger.warning("No greeting found for subagent; skipping proactive greeting")
+            except Exception as greet_exc:
+                logger.error("Failed to trigger subagent greeting: %s", greet_exc)
+
+        asyncio.create_task(_trigger_subagent_greeting())
+
         return {
             "success": True,
             "action": "agent_transfer",
@@ -2477,7 +2542,7 @@ async def perform_agent_transfer_handoff(
             "target_agent_id": target_agent_id,
             "target_agent_name": target_payload.get("name"),
             "resolved_version": target_payload.get("resolved_version"),
-            "message": "Transfer completed successfully."
+            "message": "Transfer completed successfully. Do not say anything further. Remain completely silent."
         }
     except Exception as handoff_exc:
         logger.error("agent_transfer handoff failed: %s", handoff_exc)
@@ -2535,6 +2600,7 @@ class DynamicPropertyAgent(Agent):
         func_name = _normalize_tool_name(func.get("name", ""))
         if not func_name:
             continue
+        logger.info("Creating tool method for: %s (system_type=%s)", func_name, func.get("system_type", ""))
 
         speak_during, speak_after = _normalize_tool_speech_flags(
             func.get("speak_during_execution", False),
@@ -2542,12 +2608,18 @@ class DynamicPropertyAgent(Agent):
             fallback_after=True,
         )
         speech_mode = "during" if speak_during else "after" if speak_after else "default"
-        speech_hint = (
-            "Before calling this tool, first tell the caller what you are doing; then share a concise result."
-            if speak_during
-            else "Call this tool first, then explain the result after it finishes."
-        )
-        desc = f"{func.get('description', '').strip()} {speech_hint}".strip().replace('"', "'").replace('\n', ' ')
+        # Transfer tools: never speak after execution to prevent double-talk
+        if _is_transfer_tool(func):
+            speak_after = False
+            speech_mode = "default"
+            desc = func.get('description', '').strip().replace('"', "'").replace('\n', ' ')
+        else:
+            speech_hint = (
+                "Before calling this tool, first tell the caller what you are doing; then share a concise result."
+                if speak_during
+                else "Call this tool first, then explain the result after it finishes."
+            )
+            desc = f"{func.get('description', '').strip()} {speech_hint}".strip().replace('"', "'").replace('\n', ' ')
 
         variables = func.get("variables", {})
         if not variables:

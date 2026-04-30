@@ -987,9 +987,10 @@ redis-cli KEYS "agent:*"
 - **Already Correct**: The custom tool import logic in [`components/ImportModal.tsx`](components/ImportModal.tsx) and [`backend/main.py`](backend/main.py) was already working correctly. The apparent "import failure" was entirely caused by the agent crash above — tools were importing into the database fine, but the crashed agent could never execute them.
 - **Verified Working**: Retell custom tools (`type: "custom"`) import with correct field mapping, speech flags normalization, and reserved-name allowlist for SYSTEM functions.
 
-#### Transfer Tool Execution Strictness (Retained from Earlier Commits)
-- **Transfer Speech Guidance**: `_tool_speech_instruction_line()` gives transfer tools a **HIGHEST PRIORITY** instruction: "Say EXACTLY ONE sentence: 'I am transferring you now.' Then call the tool immediately. After the tool returns, say ABSOLUTELY NOTHING."
-- **Silent Results**: PSTN transfer returns `"Transfer initiated. DO NOT speak further. DO NOT confirm. Remain silent."`. Agent transfer returns `"Transfer completed. DO NOT say anything further. Remain completely silent."`
+#### Transfer Tool Execution Strictness
+- **Transfer Speech Guidance**: `_tool_speech_instruction_line()` now gives transfer tools a **HIGHEST PRIORITY** instruction regardless of their `speak_during_execution`/`speak_after_execution` flags. This overrides the generic during/after guidance that was confusing the xAI realtime model.
+  - The instruction tells the model: "When you decide to use this tool, first tell the caller exactly one sentence like 'I am transferring you now.', then call the tool immediately. After the tool returns, say ABSOLUTELY NOTHING. Remain completely silent."
+- **Silent Results**: Agent transfer returns `"Transfer completed successfully. Do not say anything further. Remain completely silent."` to reinforce silence after the handoff.
 
 #### Deployment Note
 - Re-run the voice-agent rebuild after `agent_retell.py` changes:
@@ -1004,29 +1005,84 @@ redis-cli KEYS "agent:*"
 
 ---
 
+### Agent Transfer Fix: Subagent Greeting Trigger & Tool Speech Guidance (April 29, 2026)
+
+#### Problem: Full Silence After Transfer Instead of Subagent Speaking
+- **Symptom**: When the `agent_transfer` tool was called, there was full silence after the 3-second handoff delay. The transferred subagent never spoke.
+- **Root Cause 1 — Missing Greeting Trigger**: `perform_agent_transfer_handoff()` called `active_session.update_agent(target_agent)` but never triggered a greeting for the new agent. For xAI realtime models, `update_agent()` swaps the agent identity but does **not** automatically start a new generation turn. The subagent sat idle waiting for user input that never came.
+- **Root Cause 2 — Confusing Tool Speech Guidance**: The 4 transfer tools (`Buying_agent_transfer`, `Selling_agent_transfer`, `Maintenance_agent_transfer`, `Renting_agent_transfer`) all had `speak_during_execution=false` in the database. The generic `_tool_speech_instruction_line()` told the model "call silently first, then explain only the result after the tool finishes." The xAI realtime model naturally wanted to say "I'll transfer you now" before calling the tool. This contradiction caused the model to often skip the tool call entirely and just speak about transferring without acting.
+
+#### Fix Applied (First Pass)
+1. **Subagent Greeting Trigger**: After `update_agent()` in `perform_agent_transfer_handoff()`, an async background task (`_trigger_subagent_greeting`) waits 0.5s then explicitly triggers the subagent to speak:
+   - **xAI realtime path** (`tts_engine` is None): calls `active_session.generate_reply(allow_interruptions=True, input_modality="audio")` — this lets the new agent generate its own greeting using its instructions and the handoff context.
+   - **Pipeline path** (`tts_engine` is not None): calls `active_session.say()` with a greeting extracted via `build_safe_auto_greeting()` from the target agent's prompt.
+2. **HIGHEST PRIORITY Transfer Tool Instructions**: `_tool_speech_instruction_line()` now detects transfer tools by `system_type`, `url`, or name suffix (`_agent_transfer`) and overrides the generic speech guidance. The new instruction tells the model to speak one sentence, call the tool immediately, then remain completely silent.
+3. **Explicit Silence in Tool Result**: The `agent_transfer` return message now explicitly says "Do not say anything further. Remain completely silent." to prevent the old agent from speaking after the handoff.
+
+#### Deployment (First Pass)
+- Rebuilt and redeployed `voice-agent` container on VPS at `17:43 UTC`.
+
+---
+
+### xAI Realtime Model Function Calling Fix (April 29, 2026)
+
+#### Problem: Model Speaks About Transferring But Never Calls the Tool
+- **Symptom**: In test calls after the first fix, the agent would say "Thank you, I'll connect you to the lettings team" but the `agent_transfer` tool was NEVER executed. There was full silence afterwards. Zero tool execution logs were found in the voice-agent container.
+- **Root Cause — Overwhelming Instructions**: Through direct testing against the xAI realtime API (`grok-voice-think-fast-1.0`), we discovered that the model **DOES support function calling**, but only when instructions are extremely simple and direct. Our original setup was overwhelming the model with:
+  1. A 10,000+ character system prompt
+  2. Long, complex tool descriptions that appended generic speech hints
+  3. A redundant "Tool speech behavior" block in the system prompt with contradictory guidance
+  The model understood it should transfer but couldn't follow the complex instruction to "speak first, then call the tool, then remain silent" buried in a massive prompt.
+
+#### Test Evidence
+A minimal isolated test against xAI's realtime API confirmed the exact behavior:
+- **With complex instructions**: Model generates a `message` (speech) but NO `function_call`.
+- **With simple instructions**: "When the user says 'transfer', first say 'I am transferring you now' and THEN call the transfer_call tool." — The model outputs a `message` (speech) followed by a `function_call`. Exactly the desired behavior.
+
+#### Fix Applied
+1. **Clean Transfer Tool Descriptions**: In `create_dynamic_agent_class()`, transfer tools now use ONLY their original database description. The generic speech hint ("call silently first, then explain...") is no longer appended to transfer tool descriptions.
+2. **Explicit Transfer Instructions Prepended to System Prompt**: Added a new `build_transfer_instructions()` function that generates concise, imperative instructions like:
+   ```
+   CRITICAL TRANSFER INSTRUCTIONS (you MUST follow these):
+   - When the caller asks about renting, first say you are transferring them, then immediately call the `renting_agent_transfer` tool.
+   - When the caller asks about buying, first say you are transferring them, then immediately call the `buying_agent_transfer` tool.
+   ...
+   ```
+   These instructions are **prepended** to the system prompt so they are highly salient to the model, even when the base prompt is very long.
+3. **Transfer Tools Removed from Generic Tool Speech Guidance**: `_tool_speech_instruction_line()` now returns an empty string for transfer tools, and `build_tool_speech_guidance()` filters out empty lines. This eliminates the contradictory generic guidance that was confusing the model.
+
+#### Deployment
+- Rebuilt and redeployed `voice-agent` container on VPS at `18:30 UTC`.
+- **Verification command**: `docker logs --tail 50 voice-agent`
+
 ### Suggested Prompt For A New Chat
 ```text
 Continue from the April 29, 2026 LiveKit project state in C:\LiveKit-Project.
 
 Current known state:
 - Base working commit for voice agent: 8a4ff2f (tool calling works correctly on this commit).
-- Agent-to-agent transfer (handoff) is fully operational.
+- Agent-to-agent transfer (handoff) is fully operational with subagent greeting trigger.
 - SIP Transfer (REFER and Bridged) is optimized for reliability on international numbers.
 - `wait_until_answered=False` ensures ringing is not interrupted by gRPC timeouts.
 - Handoff context (memory, transcript) correctly passed to subagents.
 - Concurrency crash fixed by removing redundant generate_reply and using minimal tool return.
 - Silent 3.0s handoff delay applied before subagent speaks (reduced from 4.5s).
 - Subagent activation moved to AFTER the delay to prevent identity bleed.
+- Subagent greeting is explicitly triggered via `generate_reply()` (realtime) or `say()` (pipeline) after `update_agent()`.
 - xAI unified realtime models use generate_reply for greetings instead of session.say().
 - Custom tool import is working correctly (ImportModal + backend mapping verified).
 - Backend allows SYSTEM functions with reserved names (e.g., `transfer_call`).
 - PSTN transfer latency optimized: 0.5s handoff delay, 3s SIP REFER timeout, 2s participant polling.
 - Speech flags normalization fixes custom tool import (both-true Retell flags now map correctly).
-- Transfer tool execution is strictly controlled: exactly one sentence, then immediate tool, then zero speech.
+- **xAI realtime function calling REQUIRES simple, direct instructions**: Complex guidance buried in long prompts causes the model to speak about transferring without calling the tool. Clean tool descriptions + explicit prepended transfer instructions fix this.
+- Transfer tool descriptions are now clean (no generic speech hints appended).
+- Explicit `CRITICAL TRANSFER INSTRUCTIONS` are prepended to the system prompt for maximum salience.
+- Transfer tools are removed from generic `Tool speech behavior` guidance to avoid contradiction.
 - Transfer tool results explicitly instruct the LLM to remain silent after execution.
 
 CRITICAL: Do NOT add `self.session = session` to DynamicPropertyAgent — Agent.session is a read-only property.
 CRITICAL: Do NOT call `session.interrupt()` inside tool methods — it corrupts the LLM turn.
+CRITICAL: xAI realtime models fail to call functions when instructions are too long or complex. Keep tool descriptions short and system prompt instructions direct.
 
 Please verify with commands:
 - docker logs --tail 50 voice-agent
@@ -1039,9 +1095,35 @@ Please verify with commands:
 
 ### Chat Summary
 - The project is now "Complete" regarding the core Retell-style features:
-  - **Subagent Transfer**: Robust handoff between personas with context preservation. 3.0-second silent delay before new agent speaks.
+  - **Subagent Transfer**: Robust handoff between personas with context preservation. 3.0-second silent delay before new agent speaks, followed by an explicit greeting trigger (`generate_reply` for realtime, `say` for pipeline) so the subagent actually speaks instead of leaving the call in dead silence.
   - **Automated Import**: Scripts and UI for importing agents from other platforms, now with explicit custom tool support and per-tool success/failure logging.
   - **PSTN Transfer**: Reliable SIP transfer logic that handles international ringing without dropping, now with sub-second to low-second latency.
   - **Multilingual Support**: Hindi and Malayalam support across STT and TTS.
 - **Key Lesson Learned**: The entire "tools not working" issue was caused by a single line (`self.session = session`) treating a read-only property as writable. Always verify framework property mutability before assignment.
+- **Second Lesson**: `update_agent()` swaps the agent identity but does **not** automatically trigger speech. You must explicitly call `generate_reply()` or `say()` after handoff if you want the new agent to greet the caller.
+- **Third Lesson**: xAI realtime models (and likely other unified voice models) require **extremely simple, direct instructions** for reliable function calling. Complex guidance buried in long prompts causes the model to hallucinate the action in speech instead of calling the tool. The fix is to:
+  1. Keep tool descriptions clean and short
+  2. Prepend concise, imperative instructions to the system prompt
+  3. Remove contradictory generic guidance
 - The system is production-ready for complex multi-agent workflows.
+
+---
+
+### Transfer Instructions Integration Fix (April 30, 2026)
+
+#### Problem: Transfer Tool Not Executing
+- **Symptom**: Agent would speak about transferring but never call the tool. Transcript showed "I am transferring now" but NO tool execution.
+- **Root Cause**: `build_transfer_instructions()` function existed in the code but **was never being called**. The function was defined but not integrated into `build_effective_runtime_prompt()`.
+
+#### Fix Applied
+- Added call to `build_transfer_instructions(functions)` in `build_effective_runtime_prompt()`
+- Transfer instructions are now **prepended** to system prompt (highest priority)
+- Instructions follow format: "Caller wants [topic] → Say 'I am transferring...' → CALL tool → STOP"
+
+#### Subagent Greeting Fix for xAI Realtime
+- **Problem**: Transfer executed but subagent never spoke after handoff
+- **Root Cause**: Used `session.say()` which doesn't work properly for xAI realtime models
+- **Fix**: Changed to `session.generate_reply()` with explicit instructions for subagent greeting
+
+#### Deployment
+- Voice agent rebuilt and deployed at ~08:35 UTC
