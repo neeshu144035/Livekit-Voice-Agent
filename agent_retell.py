@@ -3815,10 +3815,7 @@ async def entrypoint(ctx: JobContext):
     functions = merge_builtin_functions_into_runtime(functions, config)
     logger.info(f"Agent: {config.get('name')}, Functions: {len(functions)}")
 
-    transfer_guidance = build_transfer_instructions(functions)
-    if transfer_guidance:
-        sys_prompt = f"{sys_prompt}\n\n{transfer_guidance}"
-        logger.info("Appended transfer instructions to system prompt (length now %d)", len(sys_prompt))
+    # transfer guidance is already appended to sys_prompt inside build_effective_runtime_prompt
 
     is_phone_call = bool(
         from_number
