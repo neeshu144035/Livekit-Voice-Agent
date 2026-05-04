@@ -2149,13 +2149,16 @@ async def transfer_room_sip_participant(
             api_secret=os.getenv("LIVEKIT_API_SECRET", "secret12345678"),
         )
         try:
-            await lk_api.sip.transfer_sip_participant(
-                TransferSIPParticipantRequest(
-                    participant_identity=participant_identity,
-                    room_name=room.name,
-                    transfer_to=f"tel:{phone_number}",
-                    play_dialtone=False,
-                )
+            await asyncio.wait_for(
+                lk_api.sip.transfer_sip_participant(
+                    TransferSIPParticipantRequest(
+                        participant_identity=participant_identity,
+                        room_name=room.name,
+                        transfer_to=f"tel:{phone_number}",
+                        play_dialtone=False,
+                    )
+                ),
+                timeout=3.0
             )
             return {
                 "success": True,

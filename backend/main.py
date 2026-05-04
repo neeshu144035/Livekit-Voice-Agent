@@ -305,7 +305,9 @@ VALID_CALL_DIRECTIONS = {"inbound", "outbound"}
 DEFAULT_CALL_DIRECTION = "outbound"
 ACTIVE_CALL_STATUSES = ("pending", "in-progress", "initiating", "dialing")
 STALE_ACTIVE_CALL_SECONDS = int(os.getenv("STALE_ACTIVE_CALL_SECONDS", "7200"))
-DEFAULT_LIVEKIT_WORKER_AGENT_NAME = (os.getenv("LIVEKIT_WORKER_AGENT_NAME", "sarah") or "sarah").strip() or "sarah"
+DEFAULT_LIVEKIT_WORKER_AGENT_NAME = (
+    os.getenv("LIVEKIT_WORKER_AGENT_NAME", "voice-agent") or "voice-agent"
+).strip() or "voice-agent"
 PREFER_AGENT_SPECIFIC_DISPATCH = os.getenv("PREFER_AGENT_SPECIFIC_DISPATCH", "0").strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_AGENT_LLM_TEMPERATURE = 0.2
 DEFAULT_AGENT_VOICE_SPEED = 1.0
@@ -856,6 +858,56 @@ def find_phone_record_by_number(db: Session, phone_number: Optional[str]) -> tup
     return None, normalized_phone
 
 
+def collect_livekit_inbound_trunk_numbers(db: Session, trunk_id: Optional[str]) -> List[str]:
+    normalized_trunk_id = str(trunk_id or "").strip()
+    if not normalized_trunk_id:
+        return []
+
+    rows = (
+        db.query(PhoneNumberModel)
+        .filter(PhoneNumberModel.livekit_inbound_trunk_id == normalized_trunk_id)
+        .order_by(PhoneNumberModel.created_at.asc(), PhoneNumberModel.id.asc())
+        .all()
+    )
+
+    numbers: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not row.enable_inbound:
+            continue
+        normalized_number = normalize_phone_lookup(row.phone_number)
+        if normalized_number and normalized_number not in seen:
+            numbers.append(normalized_number)
+            seen.add(normalized_number)
+
+    return numbers
+
+
+async def sync_livekit_inbound_trunk_numbers(db: Session, trunk_id: Optional[str]) -> List[str]:
+    normalized_trunk_id = str(trunk_id or "").strip()
+    if not normalized_trunk_id:
+        return []
+
+    numbers = collect_livekit_inbound_trunk_numbers(db, normalized_trunk_id)
+
+    from livekit import api as livekit_api
+
+    lk_api = livekit_api.LiveKitAPI(
+        url="http://127.0.0.1:7880",
+        api_key=os.getenv("LIVEKIT_API_KEY", "devkey"),
+        api_secret=os.getenv("LIVEKIT_API_SECRET", "secret12345678"),
+    )
+    try:
+        await lk_api.sip.update_inbound_trunk_fields(normalized_trunk_id, numbers=numbers)
+        if numbers:
+            logger.info("Synced LiveKit inbound trunk %s with numbers: %s", normalized_trunk_id, numbers)
+        else:
+            logger.info("Cleared LiveKit inbound trunk %s because no enabled numbers remain", normalized_trunk_id)
+        return numbers
+    finally:
+        await lk_api.aclose()
+
+
 def resolve_inbound_agent_id(
     db: Session,
     *,
@@ -1044,12 +1096,60 @@ def _is_stale_active_call(call: Optional["CallModel"]) -> bool:
     return False
 
 
+def _is_non_error_call_message(message: Optional[str]) -> bool:
+    normalized = str(message or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized.startswith("transfer requested to:") or normalized == "ended by system"
+
+
+def _normalize_call_transfer_events(raw_value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for item in raw_value:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+    return normalized
+
+
+def _record_call_transfer_event(call: "CallModel", params: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = ensure_custom_params(call.call_metadata)
+    transfer_events = _normalize_call_transfer_events(metadata.get("call_transfers"))
+    phone_number = normalize_phone_lookup(params.get("phone_number")) or str(params.get("phone_number") or "").strip() or None
+    tool_name = _normalize_tool_name(params.get("tool_name") or "call_transfer") or "call_transfer"
+    if tool_name in {"transfer_call", "call_transfer"}:
+        tool_name = "call_transfer"
+    event = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "tool_name": tool_name,
+        "phone_number": phone_number,
+        "status": str(params.get("status") or "").strip() or "requested",
+        "transfer_established": bool(params.get("transfer_established", False)),
+        "transfer_mode": str(params.get("transfer_mode") or "").strip() or None,
+        "participant_identity": str(params.get("participant_identity") or "").strip() or None,
+        "trunk_id": str(params.get("trunk_id") or "").strip() or None,
+        "trunk_source": str(params.get("trunk_source") or "").strip() or None,
+        "establishment_reason": str(params.get("establishment_reason") or "").strip() or None,
+        "error": str(params.get("error") or "").strip() or None,
+    }
+    transfer_events.append(event)
+    metadata["call_transfers"] = transfer_events[-20:]
+    metadata["last_transfer_phone"] = phone_number
+    metadata["last_transfer_status"] = event["status"]
+    if event.get("error"):
+        metadata["last_transfer_error"] = event["error"]
+    call.call_metadata = metadata
+    flag_modified(call, "call_metadata")
+    return event
+
+
 def _infer_terminal_status_for_call(call: "CallModel", db: Session) -> tuple[str, Optional[str]]:
     current_status = str(call.status or "").strip().lower()
     if current_status in {"failed", "error"}:
         return ("failed" if current_status == "error" else current_status), call.error_message
 
-    if (call.error_message or "").strip():
+    if (call.error_message or "").strip() and not _is_non_error_call_message(call.error_message):
         return "failed", call.error_message
 
     direction = normalize_call_direction_for_row(call)
@@ -1107,12 +1207,11 @@ def resolve_dispatch_agent_name(
     agent: Optional["AgentModel"] = None,
     requested_name: Optional[str] = None,
 ) -> str:
-    if PREFER_AGENT_SPECIFIC_DISPATCH:
-        explicit = (requested_name or "").strip()
-        if explicit:
-            return explicit
-        if agent and (agent.agent_name or "").strip():
-            return str(agent.agent_name).strip()
+    explicit = (requested_name or "").strip()
+    if explicit:
+        return explicit
+    if PREFER_AGENT_SPECIFIC_DISPATCH and agent and (agent.agent_name or "").strip():
+        return str(agent.agent_name).strip()
     return DEFAULT_LIVEKIT_WORKER_AGENT_NAME
 
 
@@ -1639,6 +1738,9 @@ class PhoneNumberCreate(BaseModel):
     twilio_account_sid: Optional[str] = None
     twilio_auth_token: Optional[str] = None
     twilio_sip_trunk_sid: Optional[str] = None
+    livekit_inbound_trunk_id: Optional[str] = None
+    livekit_outbound_trunk_id: Optional[str] = None
+    livekit_dispatch_rule_id: Optional[str] = None
     
     inbound_agent_id: Optional[int] = None
     outbound_agent_id: Optional[int] = None
@@ -1648,6 +1750,7 @@ class PhoneNumberCreate(BaseModel):
 
 
 class PhoneNumberUpdate(BaseModel):
+    phone_number: Optional[str] = None
     description: Optional[str] = None
     
     # Twilio SIP Trunk Configuration (Retell-style)
@@ -1658,6 +1761,8 @@ class PhoneNumberUpdate(BaseModel):
     twilio_account_sid: Optional[str] = None
     twilio_auth_token: Optional[str] = None
     twilio_sip_trunk_sid: Optional[str] = None
+    livekit_inbound_trunk_id: Optional[str] = None
+    livekit_outbound_trunk_id: Optional[str] = None
     inbound_agent_id: Optional[int] = None
     outbound_agent_id: Optional[int] = None
     enable_inbound: Optional[bool] = None
@@ -2727,26 +2832,30 @@ def _load_agent_runtime_functions(agent: AgentModel, db: Session) -> List[Dict[s
             transfer_speak_during, transfer_speak_after = True, False
         runtime_functions.append(
             {
-                "name": "transfer_call",
+                "name": "call_transfer",
                 "description": (
                     "Use ONLY when the user explicitly asks to transfer/escalate/connect to a human agent. "
                     "Do not call this for regular Q&A."
                 ),
-                "url": "",
-                "method": "POST",
-                "timeout_ms": 120000,
+                "url": "builtin://transfer_call",
+                "method": "SYSTEM",
+                "timeout_ms": 10000,
                 "headers": {},
+                "query_params": {},
                 "parameters_schema": {
                     "type": "object",
                     "properties": {
                         "phone_number": {
                             "type": "string",
-                            "description": "Target phone number in E.164 format, e.g. +447123456789",
+                            "description": "Optional override. The configured transfer target will be used automatically.",
                         }
                     },
-                    "required": ["phone_number"],
+                    "required": [],
                 },
                 "phone_number": transfer_phone,
+                "is_system": True,
+                "system_type": SYSTEM_FUNCTION_TRANSFER_CALL,
+                "system_config": {"phone_number": transfer_phone},
                 "speak_during_execution": transfer_speak_during,
                 "speak_after_execution": transfer_speak_after,
             }
@@ -3583,6 +3692,10 @@ async def end_call(call_id: str, db: Session = Depends(get_database)):
         if _backfill_usage_from_transcript_and_cost(call, db):
             db.commit()
             logger.info("Backfilled usage on end_call for call_id=%s", call_id)
+    if not _has_cost_metrics(call):
+        if _recompute_call_costs_from_usage(call, db):
+            db.commit()
+            logger.info("Recomputed call costs on end_call for call_id=%s", call_id)
     
     return {"message": "Call ended", "call_id": call_id}
 
@@ -3828,6 +3941,12 @@ async def get_analytics(agent_id: Optional[int] = None, days: int = 7, db: Sessi
     if agent_id:
         query = query.filter(CallModel.agent_id == agent_id)
     all_calls = query.all()
+    hydrated_calls = False
+    for call in all_calls:
+        if _hydrate_call_record_metrics(call, db):
+            hydrated_calls = True
+    if hydrated_calls:
+        db.commit()
     
     # Separate phone calls and web calls
     phone_calls = [c for c in all_calls if c.call_type == "phone"]
@@ -3933,20 +4052,20 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
             "message": "Call ended successfully"
         }
     
-    elif action_type == "transfer_call":
-        phone_number = params.get("phone_number")
+    elif action_type in ("transfer_call", "call_transfer"):
+        phone_number = normalize_phone_lookup(params.get("phone_number")) or params.get("phone_number")
         if not phone_number:
             raise HTTPException(status_code=400, detail="phone_number is required for transfer")
-        
-        # Store transfer info
-        call.error_message = f"Transfer requested to: {phone_number}"
+
+        transfer_event = _record_call_transfer_event(call, params)
         db.commit()
-        
+
         return {
             "success": True,
-            "action": "transfer_call",
+            "action": "call_transfer",
             "call_id": call_id,
             "transfer_to": phone_number,
+            "transfer_event": transfer_event,
             "message": f"Call transfer initiated to {phone_number}"
         }
 
@@ -4157,7 +4276,7 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
         {
             "id": "builtin_transfer_call",
             "agent_id": agent_id,
-            "name": "transfer_call",
+            "name": "call_transfer",
             "description": "Transfer the current call to another phone number. Use this when the user needs to speak to a different department or person.",
             "method": "SYSTEM",
             "url": "builtin://transfer_call",
@@ -4176,7 +4295,7 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
                         "description": "Optional message to speak before transferring (e.g., 'Please hold while I transfer you')"
                     }
                 },
-                "required": ["phone_number"]
+                "required": []
             },
             "variables": {},
             "speak_during_execution": True,
@@ -4386,6 +4505,191 @@ def get_livekit_sip_endpoint() -> str:
     return f"{url_host}:5060"
 
 
+def get_livekit_http_url() -> str:
+    lk_http_url = LIVEKIT_URL.replace("ws://", "http://").replace("wss://", "https://")
+    if "livekit-server" in lk_http_url:
+        lk_http_url = lk_http_url.replace("livekit-server", "localhost")
+    return lk_http_url
+
+
+async def ensure_livekit_dispatch_rule_for_phone(
+    lk_api: Any,
+    *,
+    phone: "PhoneNumberModel",
+    dispatch_agent_name: str,
+) -> str:
+    from livekit import api as livekit_api
+
+    inbound_trunk_id = str(phone.livekit_inbound_trunk_id or "").strip()
+    if not inbound_trunk_id:
+        raise RuntimeError("Inbound trunk ID is required before creating a dispatch rule")
+
+    existing_dispatch_rule_id = str(phone.livekit_dispatch_rule_id or "").strip()
+    dispatch_rules = await lk_api.sip.list_sip_dispatch_rule(livekit_api.ListSIPDispatchRuleRequest())
+    for rule in dispatch_rules.items:
+        rule_id = str(getattr(rule, "sip_dispatch_rule_id", "") or "").strip()
+        rule_trunk_ids = {str(trunk_id or "").strip() for trunk_id in getattr(rule, "trunk_ids", [])}
+        if not rule_id:
+            continue
+        if rule_id == existing_dispatch_rule_id or inbound_trunk_id in rule_trunk_ids:
+            logger.info("Deleting existing dispatch rule %s for inbound trunk %s", rule_id, inbound_trunk_id)
+            await lk_api.sip.delete_sip_dispatch_rule(
+                livekit_api.DeleteSIPDispatchRuleRequest(sip_dispatch_rule_id=rule_id)
+            )
+
+    dispatch_req = livekit_api.CreateSIPDispatchRuleRequest(
+        name=f"{dispatch_agent_name}-inbound",
+        trunk_ids=[inbound_trunk_id],
+        room_config=livekit_api.RoomConfiguration(
+            agents=[livekit_api.RoomAgentDispatch(agent_name=dispatch_agent_name)]
+        ),
+        rule=livekit_api.SIPDispatchRule(
+            dispatch_rule_individual=livekit_api.SIPDispatchRuleIndividual(
+                room_prefix="call"
+            )
+        ),
+    )
+    result = await lk_api.sip.create_sip_dispatch_rule(dispatch_req)
+    dispatch_rule_id = str(getattr(result, "sip_dispatch_rule_id", "") or "").strip()
+    if not dispatch_rule_id:
+        raise RuntimeError(f"Unable to read created dispatch rule id from LiveKit response: {result}")
+    return dispatch_rule_id
+
+
+async def ensure_livekit_pure_sip_resources(
+    db: Session,
+    phone: "PhoneNumberModel",
+) -> Dict[str, Any]:
+    from livekit import api as livekit_api
+    from livekit.protocol import sip as sip_proto
+
+    normalized_phone_number = normalize_phone_lookup(phone.phone_number)
+    if not normalized_phone_number:
+        raise RuntimeError("Phone number must be a valid E.164 number before LiveKit SIP configuration")
+
+    termination_uri = str(phone.termination_uri or "").strip()
+    if not termination_uri:
+        raise RuntimeError("Termination URI is required for SIP trunk configuration")
+
+    auth_username = str(phone.sip_trunk_username or "").strip() or None
+    auth_password = str(phone.sip_trunk_password or "").strip() or None
+    lk_api = livekit_api.LiveKitAPI(
+        url=get_livekit_http_url(),
+        api_key=os.getenv("LIVEKIT_API_KEY", "devkey"),
+        api_secret=os.getenv("LIVEKIT_API_SECRET", "secret12345678"),
+    )
+
+    try:
+        outbound_trunk_id = str(phone.livekit_outbound_trunk_id or "").strip()
+        outbound_created = False
+        if outbound_trunk_id:
+            await lk_api.sip.update_sip_outbound_trunk_fields(
+                outbound_trunk_id,
+                address=termination_uri,
+                numbers=[normalized_phone_number],
+                auth_username=auth_username,
+                auth_password=auth_password,
+                name=normalized_phone_number,
+            )
+        else:
+            outbound_req = livekit_api.CreateSIPOutboundTrunkRequest(
+                trunk=sip_proto.SIPOutboundTrunkInfo(
+                    name=normalized_phone_number,
+                    address=termination_uri,
+                    numbers=[normalized_phone_number],
+                    auth_username=auth_username or "",
+                    auth_password=auth_password or "",
+                )
+            )
+            outbound_res = await lk_api.sip.create_sip_outbound_trunk(outbound_req)
+            outbound_trunk_id = str(getattr(outbound_res, "sip_trunk_id", "") or "").strip()
+            if not outbound_trunk_id:
+                raise RuntimeError(f"Unable to read created outbound trunk id from LiveKit response: {outbound_res}")
+            phone.livekit_outbound_trunk_id = outbound_trunk_id
+            outbound_created = True
+
+        inbound_result: Dict[str, Any] = {
+            "livekit_inbound_trunk_id": str(phone.livekit_inbound_trunk_id or "").strip() or None,
+            "livekit_dispatch_rule_id": str(phone.livekit_dispatch_rule_id or "").strip() or None,
+            "synced_inbound_numbers": [],
+            "dispatch_agent_name": None,
+            "dispatch_warning": None,
+            "inbound_trunk_created": False,
+        }
+
+        if phone.enable_inbound:
+            inbound_trunk_id = str(phone.livekit_inbound_trunk_id or "").strip()
+            inbound_created = False
+            if inbound_trunk_id:
+                await lk_api.sip.update_sip_inbound_trunk_fields(
+                    inbound_trunk_id,
+                    numbers=[normalized_phone_number],
+                    auth_username="",
+                    auth_password="",
+                    name=normalized_phone_number,
+                )
+            else:
+                inbound_req = livekit_api.CreateSIPInboundTrunkRequest(
+                    trunk=sip_proto.SIPInboundTrunkInfo(
+                        name=normalized_phone_number,
+                        numbers=[normalized_phone_number],
+                        # Twilio origination typically authenticates via IP ACL, not SIP digest.
+                        auth_username="",
+                        auth_password="",
+                        krisp_enabled=bool(phone.enable_krisp_noise_cancellation),
+                    )
+                )
+                inbound_res = await lk_api.sip.create_sip_inbound_trunk(inbound_req)
+                inbound_trunk_id = str(getattr(inbound_res, "sip_trunk_id", "") or "").strip()
+                if not inbound_trunk_id:
+                    raise RuntimeError(f"Unable to read created inbound trunk id from LiveKit response: {inbound_res}")
+                phone.livekit_inbound_trunk_id = inbound_trunk_id
+                inbound_created = True
+
+            db.flush()
+            synced_numbers = await sync_livekit_inbound_trunk_numbers(db, inbound_trunk_id)
+
+            dispatch_agent_name: Optional[str] = None
+            dispatch_warning: Optional[str] = None
+            dispatch_rule_id = str(phone.livekit_dispatch_rule_id or "").strip() or None
+            if phone.inbound_agent_id:
+                inbound_agent = db.query(AgentModel).filter(AgentModel.id == phone.inbound_agent_id).first()
+                if not inbound_agent:
+                    raise RuntimeError(f"Inbound agent {phone.inbound_agent_id} no longer exists")
+                dispatch_agent_name = resolve_dispatch_agent_name(inbound_agent)
+                dispatch_rule_id = await ensure_livekit_dispatch_rule_for_phone(
+                    lk_api,
+                    phone=phone,
+                    dispatch_agent_name=dispatch_agent_name,
+                )
+                phone.livekit_dispatch_rule_id = dispatch_rule_id
+            else:
+                dispatch_warning = "Inbound agent is not assigned, so no LiveKit dispatch rule was created."
+
+            inbound_result = {
+                "livekit_inbound_trunk_id": inbound_trunk_id,
+                "livekit_dispatch_rule_id": dispatch_rule_id,
+                "synced_inbound_numbers": synced_numbers,
+                "dispatch_agent_name": dispatch_agent_name,
+                "dispatch_warning": dispatch_warning,
+                "inbound_trunk_created": inbound_created,
+            }
+        elif phone.livekit_inbound_trunk_id:
+            db.flush()
+            inbound_result["synced_inbound_numbers"] = await sync_livekit_inbound_trunk_numbers(
+                db,
+                phone.livekit_inbound_trunk_id,
+            )
+
+        return {
+            "livekit_outbound_trunk_id": outbound_trunk_id,
+            "outbound_trunk_created": outbound_created,
+            **inbound_result,
+        }
+    finally:
+        await lk_api.aclose()
+
+
 @app.post("/api/phone-numbers/", response_model=PhoneNumberResponse, status_code=201)
 async def create_phone_number(phone_data: PhoneNumberCreate, db: Session = Depends(get_database)):
     """Create a new phone number with Twilio SIP configuration"""
@@ -4423,6 +4727,9 @@ async def create_phone_number(phone_data: PhoneNumberCreate, db: Session = Depen
         twilio_account_sid=phone_data.twilio_account_sid,
         twilio_auth_token=phone_data.twilio_auth_token,
         twilio_sip_trunk_sid=phone_data.twilio_sip_trunk_sid,
+        livekit_inbound_trunk_id=phone_data.livekit_inbound_trunk_id,
+        livekit_outbound_trunk_id=phone_data.livekit_outbound_trunk_id,
+        livekit_dispatch_rule_id=phone_data.livekit_dispatch_rule_id,
         
         inbound_agent_id=phone_data.inbound_agent_id,
         outbound_agent_id=phone_data.outbound_agent_id,
@@ -4436,6 +4743,16 @@ async def create_phone_number(phone_data: PhoneNumberCreate, db: Session = Depen
     db.add(phone_number)
     db.commit()
     db.refresh(phone_number)
+
+    if phone_number.livekit_inbound_trunk_id:
+        try:
+            await sync_livekit_inbound_trunk_numbers(db, phone_number.livekit_inbound_trunk_id)
+        except Exception as sync_err:
+            logger.warning(
+                "LiveKit inbound trunk sync failed after phone create for %s: %s",
+                phone_number.phone_number,
+                sync_err,
+            )
     
     return phone_number
 
@@ -4496,6 +4813,7 @@ async def update_phone_number(phone_id: int, phone_update: PhoneNumberUpdate, db
     phone = db.query(PhoneNumberModel).filter(PhoneNumberModel.id == phone_id).first()
     if not phone:
         raise HTTPException(status_code=404, detail="Phone number not found")
+    previous_inbound_trunk_id = str(phone.livekit_inbound_trunk_id or "").strip()
     
     # Validate agent IDs if provided
     if phone_update.inbound_agent_id is not None:
@@ -4512,12 +4830,44 @@ async def update_phone_number(phone_id: int, phone_update: PhoneNumberUpdate, db
     
     # Update fields
     update_data = phone_update.dict(exclude_unset=True)
+    if "phone_number" in update_data:
+        normalized_phone = normalize_phone_lookup(update_data.get("phone_number"))
+        if not normalized_phone:
+            raise HTTPException(status_code=400, detail="Phone number must be in E.164 format (e.g., +1234567890)")
+
+        duplicate = (
+            db.query(PhoneNumberModel)
+            .filter(PhoneNumberModel.phone_number == normalized_phone, PhoneNumberModel.id != phone_id)
+            .first()
+        )
+        if duplicate:
+            raise HTTPException(status_code=400, detail="Phone number already registered")
+
+        update_data["phone_number"] = normalized_phone
     for field, value in update_data.items():
         setattr(phone, field, value)
     
     phone.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(phone)
+
+    trunk_ids_to_sync = {
+        trunk_id
+        for trunk_id in (
+            previous_inbound_trunk_id,
+            str(phone.livekit_inbound_trunk_id or "").strip(),
+        )
+        if trunk_id
+    }
+    for trunk_id in trunk_ids_to_sync:
+        try:
+            await sync_livekit_inbound_trunk_numbers(db, trunk_id)
+        except Exception as sync_err:
+            logger.warning(
+                "LiveKit inbound trunk sync failed after phone update for trunk %s: %s",
+                trunk_id,
+                sync_err,
+            )
     
     response = PhoneNumberResponse.from_orm(phone)
     if phone.inbound_agent_id:
@@ -4538,9 +4888,20 @@ async def delete_phone_number(phone_id: int, db: Session = Depends(get_database)
     phone = db.query(PhoneNumberModel).filter(PhoneNumberModel.id == phone_id).first()
     if not phone:
         raise HTTPException(status_code=404, detail="Phone number not found")
+    trunk_id_to_sync = str(phone.livekit_inbound_trunk_id or "").strip()
     
     db.delete(phone)
     db.commit()
+
+    if trunk_id_to_sync:
+        try:
+            await sync_livekit_inbound_trunk_numbers(db, trunk_id_to_sync)
+        except Exception as sync_err:
+            logger.warning(
+                "LiveKit inbound trunk sync failed after phone delete for trunk %s: %s",
+                trunk_id_to_sync,
+                sync_err,
+            )
     return {"message": "Phone number deleted successfully"}
 
 
@@ -4551,12 +4912,9 @@ async def configure_phone_number(phone_id: int, db: Session = Depends(get_databa
     if not phone:
         raise HTTPException(status_code=404, detail="Phone number not found")
     
-    # Needs EITHER Twilio credentials OR Pure SIP Trunking settings
-    has_twilio = bool(phone.twilio_account_sid and phone.twilio_auth_token)
-    has_pure_sip = bool(phone.termination_uri)
-    
-    if not has_twilio and not has_pure_sip:
-        raise HTTPException(status_code=400, detail="Neither Twilio credentials nor SIP Trunk Details (Termination URI) are configured")
+    has_pure_sip = bool(str(phone.termination_uri or "").strip())
+    if not has_pure_sip:
+        raise HTTPException(status_code=400, detail="Termination URI is required for SIP trunk configuration")
     
     # Get LiveKit API credentials
     lk_api_key = os.getenv("LIVEKIT_API_KEY")
@@ -4571,71 +4929,45 @@ async def configure_phone_number(phone_id: int, db: Session = Depends(get_databa
     
     try:
         if has_pure_sip:
-            # CREATE PURE SIP OUTBOUND TRUNK
-            from livekit import api as livekit_api
-            from livekit.protocol import sip as sip_proto
-            
-            lk_http_url = LIVEKIT_URL.replace("ws://", "http://").replace("wss://", "https://")
-            if "livekit-server" in lk_http_url:
-                lk_http_url = lk_http_url.replace("livekit-server", "localhost")
-            
-            lk_api = livekit_api.LiveKitAPI(url=lk_http_url, api_key=lk_api_key, api_secret=lk_api_secret)
-            try:
-                username = phone.sip_trunk_username or ""
-                password = phone.sip_trunk_password or ""
-                trunk_name = phone.phone_number
-                
-                req = livekit_api.CreateSIPOutboundTrunkRequest(
-                    trunk=sip_proto.SIPOutboundTrunkInfo(
-                        name=trunk_name,
-                        address=phone.termination_uri,
-                        numbers=[phone.phone_number],
-                        auth_username=username,
-                        auth_password=password
-                    )
-                )
-                
-                logger.info(f"Creating SIP Outbound Trunk for {phone.phone_number} at {phone.termination_uri}")
-                res = await lk_api.sip.create_sip_outbound_trunk(req)
-                
-                # Update phone record with the new trunk ID
-                phone.livekit_outbound_trunk_id = res.sip_trunk_id
-                logger.info(f"Created SIP Outbound Trunk: {res.sip_trunk_id}")
-                
-                phone.status = "configured"
-                phone.error_message = None
-                db.commit()
-                
-                return {
-                    "message": f"Successfully created Pure SIP Outbound Trunk ({res.sip_trunk_id}).",
-                    "phone_number": phone.phone_number,
-                    "livekit_outbound_trunk_id": res.sip_trunk_id
-                }
-            except Exception as e:
-                logger.error(f"Error creating SIP Outbound Trunk: {e}")
-                raise
-            finally:
-                await lk_api.aclose()
-        
-        else:
-            # STANDARD TWILIO HTTP SETUP (Fallback)
+            logger.info("Configuring LiveKit SIP resources for %s", phone.phone_number)
+            pure_sip_result = await ensure_livekit_pure_sip_resources(db, phone)
+
             phone.status = "configured"
             phone.error_message = None
             db.commit()
-            
+
+            message_parts = [
+                (
+                    f"Pure SIP outbound trunk {'created' if pure_sip_result.get('outbound_trunk_created') else 'updated'} "
+                    f"({pure_sip_result.get('livekit_outbound_trunk_id')})."
+                )
+            ]
+            inbound_trunk_id = pure_sip_result.get("livekit_inbound_trunk_id")
+            if phone.enable_inbound and inbound_trunk_id:
+                dispatch_rule_id = pure_sip_result.get("livekit_dispatch_rule_id")
+                if dispatch_rule_id:
+                    message_parts.append(
+                        f"Inbound trunk {'created' if pure_sip_result.get('inbound_trunk_created') else 'updated'} "
+                        f"({inbound_trunk_id}) and dispatch rule configured ({dispatch_rule_id})."
+                    )
+                else:
+                    message_parts.append(
+                        f"Inbound trunk {'created' if pure_sip_result.get('inbound_trunk_created') else 'updated'} "
+                        f"({inbound_trunk_id}), but no dispatch rule was created yet."
+                    )
+            elif phone.enable_inbound:
+                message_parts.append("Inbound is enabled, but no LiveKit inbound trunk was configured.")
+
+            dispatch_warning = pure_sip_result.get("dispatch_warning")
+            if dispatch_warning:
+                message_parts.append(dispatch_warning)
+
             return {
-                "message": "Phone number configured. Please create SIP trunks in LiveKit Cloud dashboard.",
+                "message": " ".join(message_parts),
                 "phone_number": phone.phone_number,
-                "livekit_sip_endpoint": phone.livekit_sip_endpoint,
-                "instructions": {
-                    "step1": "Go to LiveKit Cloud Dashboard â†’ Telephony â†’ SIP Trunks",
-                    "step2": f"Create Inbound Trunk with number: {phone.phone_number}",
-                    "step3": f"Set Origination URI to: sip:{phone.livekit_sip_endpoint}",
-                    "step4": "Create Dispatch Rule to route calls to your agent",
-                    "step5": "Update this record with the trunk IDs from LiveKit"
-                }
+                **pure_sip_result,
             }
-            
+        
     except Exception as e:
         phone.status = "error"
         phone.error_message = str(e)
@@ -4644,7 +4976,11 @@ async def configure_phone_number(phone_id: int, db: Session = Depends(get_databa
 
 
 @app.post("/api/phone-numbers/{phone_id}/create-dispatch-rule")
-async def create_dispatch_rule(phone_id: int, agent_name: str = "sarah", db: Session = Depends(get_database)):
+async def create_dispatch_rule(
+    phone_id: int,
+    agent_name: str = DEFAULT_LIVEKIT_WORKER_AGENT_NAME,
+    db: Session = Depends(get_database),
+):
     """Create a LiveKit SIP dispatch rule with agent configuration"""
     phone = db.query(PhoneNumberModel).filter(PhoneNumberModel.id == phone_id).first()
     if not phone:
@@ -4655,46 +4991,24 @@ async def create_dispatch_rule(phone_id: int, agent_name: str = "sarah", db: Ses
     dispatch_agent_name = resolve_dispatch_agent_name(None, agent_name)
 
     try:
-        import httpx
         from livekit import api as livekit_api
         
         # Use LiveKit SDK to get proper URL
         lk_api = livekit_api.LiveKitAPI(
-            url="http://127.0.0.1:7880",
+            url=get_livekit_http_url(),
             api_key=os.getenv("LIVEKIT_API_KEY", "devkey"),
             api_secret=os.getenv("LIVEKIT_API_SECRET", "secret12345678")
         )
-        
-        # Delete existing dispatch rules for this trunk
-        dispatch_rules = await lk_api.sip.list_sip_dispatch_rule(livekit_api.ListSIPDispatchRuleRequest())
-        for rule in dispatch_rules.items:
-            if phone.livekit_inbound_trunk_id in rule.trunk_ids:
-                logger.info(f"Deleting existing dispatch rule: {rule.sip_dispatch_rule_id}")
-                await lk_api.sip.delete_sip_dispatch_rule(
-                    livekit_api.DeleteSIPDispatchRuleRequest(
-                        sip_dispatch_rule_id=rule.sip_dispatch_rule_id
-                    )
-                )
-        
-        dispatch_req = livekit_api.CreateSIPDispatchRuleRequest(
-            name=f"{dispatch_agent_name}-inbound",
-            trunk_ids=[phone.livekit_inbound_trunk_id],
-            room_config=livekit_api.RoomConfiguration(
-                agents=[livekit_api.RoomAgentDispatch(agent_name=dispatch_agent_name)]
-            ),
-            rule=livekit_api.SIPDispatchRule(
-                dispatch_rule_individual=livekit_api.SIPDispatchRuleIndividual(
-                    room_prefix="call"
-                )
-            )
-        )
 
-        result = await lk_api.sip.create_sip_dispatch_rule(dispatch_req)
-        dispatch_rule_id = str(getattr(result, "sip_dispatch_rule_id", "") or "").strip()
-        if not dispatch_rule_id:
-            raise RuntimeError(f"Unable to read created dispatch rule id from LiveKit response: {result}")
-        
-        await lk_api.aclose()
+        try:
+            await sync_livekit_inbound_trunk_numbers(db, phone.livekit_inbound_trunk_id)
+            dispatch_rule_id = await ensure_livekit_dispatch_rule_for_phone(
+                lk_api,
+                phone=phone,
+                dispatch_agent_name=dispatch_agent_name,
+            )
+        finally:
+            await lk_api.aclose()
         
         # Update database
         phone.livekit_dispatch_rule_id = dispatch_rule_id
@@ -4830,6 +5144,7 @@ async def make_outbound_call(phone_id: int, call_request: OutboundCallRequest, d
                         room_name=room_name,
                         participant_identity=f"call_{to_number}",
                         play_ringtone=True,
+                        wait_until_answered=False,
                     )
                 )
                 logger.info(f"Initiated SIP call to {to_number} via LiveKit trunk")
@@ -4993,6 +5308,10 @@ async def livekit_webhook(request_body: dict = None, db: Session = Depends(get_d
                  "sip" in identity.lower()
         
         if is_sip:
+            identity_l = str(identity or "").strip().lower()
+            if identity_l.startswith("transfer_") or identity_l.startswith("call_"):
+                logger.info("Ignoring SIP participant_joined for non-inbound leg: %s", identity)
+                return {"status": "ok"}
             # This is an inbound phone call
             caller_number = normalize_phone_lookup(
                 attributes.get("sip.callerNumber", "")
@@ -5001,6 +5320,8 @@ async def livekit_webhook(request_body: dict = None, db: Session = Depends(get_d
             )
             called_number = normalize_phone_lookup(
                 attributes.get("sip.calledNumber", "")
+                or attributes.get("sip.phoneNumber", "")
+                or attributes.get("sip.trunkPhoneNumber", "")
                 or attributes.get("sip.to", "")
             )
             sip_call_id = attributes.get("sip.callID", "")
@@ -5099,6 +5420,9 @@ async def livekit_webhook(request_body: dict = None, db: Session = Depends(get_d
             if _looks_like_missing_usage(call):
                 if _backfill_usage_from_transcript_and_cost(call, db):
                     logger.info("Backfilled usage on room_finished for call_id=%s", call.call_id)
+            if not _has_cost_metrics(call):
+                if _recompute_call_costs_from_usage(call, db):
+                    logger.info("Recomputed call costs on room_finished for call_id=%s", call.call_id)
         db.commit()
     
     return {"status": "ok"}
@@ -5125,19 +5449,27 @@ def _serialize_voice_runtime_agent(agent: AgentModel) -> Dict[str, Any]:
     }
 
 
-@app.get("/api/agents/by-dispatch-name/{dispatch_name:path}")
-async def get_agent_by_dispatch_name(dispatch_name: str, db: Session = Depends(get_database)):
-    """Resolve agent config by worker dispatch name (used when SIP metadata lacks phone numbers)."""
+def _find_agent_by_dispatch_name_value(db: Session, dispatch_name: Optional[str]) -> Optional["AgentModel"]:
     dispatch = (dispatch_name or "").strip()
     if not dispatch:
-        raise HTTPException(status_code=400, detail="dispatch_name is required")
-
-    agent = (
+        return None
+    if dispatch.lower() == str(DEFAULT_LIVEKIT_WORKER_AGENT_NAME or "").strip().lower():
+        return None
+    return (
         db.query(AgentModel)
         .filter(AgentModel.agent_name.ilike(dispatch))
         .order_by(AgentModel.updated_at.desc())
         .first()
     )
+
+
+@app.get("/api/agents/by-dispatch-name/{dispatch_name:path}")
+async def get_agent_by_dispatch_name(dispatch_name: str, db: Session = Depends(get_database)):
+    """Resolve agent config by worker dispatch name (used when SIP metadata lacks phone numbers)."""
+    if not (dispatch_name or "").strip():
+        raise HTTPException(status_code=400, detail="dispatch_name is required")
+
+    agent = _find_agent_by_dispatch_name_value(db, dispatch_name)
     if not agent:
         raise HTTPException(status_code=404, detail="No agent configured with this dispatch name")
     return _serialize_voice_runtime_agent(agent)
@@ -5205,6 +5537,32 @@ def _looks_like_missing_usage(call: CallModel) -> bool:
     )
 
 
+def _has_usage_metrics(call: Optional["CallModel"]) -> bool:
+    if not call:
+        return False
+    return any(
+        [
+            (call.llm_tokens_in or 0) > 0,
+            (call.llm_tokens_out or 0) > 0,
+            (call.stt_duration_ms or 0) > 0,
+            (call.tts_characters or 0) > 0,
+        ]
+    )
+
+
+def _has_cost_metrics(call: Optional["CallModel"]) -> bool:
+    if not call:
+        return False
+    return any(
+        [
+            (call.cost_usd or 0) > 0,
+            (call.llm_cost or 0) > 0,
+            (call.stt_cost or 0) > 0,
+            (call.tts_cost or 0) > 0,
+        ]
+    )
+
+
 def _compute_llm_cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
     m = (model or "").lower()
     ti = max(tokens_in or 0, 0)
@@ -5226,6 +5584,58 @@ def _compute_llm_cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
     if ti > 0 or to > 0:
         cost = max(cost, 0.001)
     return cost
+
+
+def _recompute_call_costs_from_usage(call: "CallModel", db: Session) -> bool:
+    if not call:
+        return False
+
+    if not _has_usage_metrics(call) and (call.duration_seconds or 0) <= 0:
+        return False
+
+    model = call.llm_model_used or ""
+    if not model:
+        agent = db.query(AgentModel).filter(AgentModel.id == call.agent_id).first()
+        model = (agent.llm_model if agent else "") or ""
+        if model:
+            call.llm_model_used = model
+
+    metadata = ensure_custom_params(call.call_metadata)
+    tts_provider = normalize_tts_provider(metadata.get("tts_provider"), None)
+    if tts_provider == "xai":
+        voice_minutes = max((call.duration_seconds or 0) / 60.0, 0.0)
+        call.llm_cost = 0.0
+        call.stt_cost = 0.0
+        call.tts_cost = max(voice_minutes * XAI_VOICE_SESSION_RATE_PER_MINUTE, 0.001) if voice_minutes > 0 else 0.0
+        call.cost_usd = call.tts_cost or 0.0
+        return voice_minutes > 0
+
+    call.llm_cost = _compute_llm_cost_usd(model, call.llm_tokens_in or 0, call.llm_tokens_out or 0)
+
+    stt_minutes = (call.stt_duration_ms or 0) / 60000.0
+    if stt_minutes > 0:
+        stt_model = metadata.get("stt_model") or "nova-3"
+        stt_rate = 0.006 if ("nova-3" in str(stt_model).lower() or "conversationalai" in str(stt_model).lower()) else 0.004
+        call.stt_cost = max(stt_minutes * stt_rate, 0.001)
+    else:
+        call.stt_cost = 0.0
+
+    tts_model_used = metadata.get("tts_model")
+    tts_chars = call.tts_characters or 0
+    if tts_chars > 0:
+        if tts_provider == "elevenlabs":
+            tts_rate = FALLBACK_ELEVENLABS_TTS_RATE_PER_1K_CHARS.get(
+                tts_model_used or DEFAULT_ELEVENLABS_MODEL,
+                FALLBACK_ELEVENLABS_TTS_RATE_PER_1K_CHARS[DEFAULT_ELEVENLABS_MODEL],
+            )
+        else:
+            tts_rate = 0.015
+        call.tts_cost = max((tts_chars / 1000.0) * tts_rate, 0.001)
+    else:
+        call.tts_cost = 0.0
+
+    call.cost_usd = (call.llm_cost or 0) + (call.stt_cost or 0) + (call.tts_cost or 0)
+    return _has_usage_metrics(call)
 
 
 def _backfill_usage_from_transcript_and_cost(call: CallModel, db: Session) -> bool:
@@ -5250,38 +5660,51 @@ def _backfill_usage_from_transcript_and_cost(call: CallModel, db: Session) -> bo
         if model:
             call.llm_model_used = model
 
-    call.llm_cost = _compute_llm_cost_usd(model, call.llm_tokens_in or 0, call.llm_tokens_out or 0)
-
-    metadata = ensure_custom_params(call.call_metadata)
-    tts_provider = normalize_tts_provider(metadata.get("tts_provider"), None)
-    if tts_provider == "xai":
-        voice_minutes = max((call.duration_seconds or 0) / 60.0, 0.0)
-        call.llm_cost = 0.0
-        call.stt_cost = 0.0
-        call.tts_cost = max(voice_minutes * XAI_VOICE_SESSION_RATE_PER_MINUTE, 0.001) if voice_minutes > 0 else 0.0
-        call.cost_usd = call.tts_cost or 0.0
-        return True
-
-    stt_minutes = (call.stt_duration_ms or 0) / 60000.0
-    if stt_minutes > 0:
-        stt_model = ensure_custom_params(call.call_metadata).get("stt_model") or "nova-3"
-        stt_rate = 0.006 if ("nova-3" in str(stt_model).lower() or "conversationalai" in str(stt_model).lower()) else 0.004
-        call.stt_cost = max(stt_minutes * stt_rate, 0.001)
-
-    tts_model_used = metadata.get("tts_model")
-    tts_chars = call.tts_characters or 0
-    if tts_chars > 0:
-        if tts_provider == "elevenlabs":
-            tts_rate = FALLBACK_ELEVENLABS_TTS_RATE_PER_1K_CHARS.get(
-                tts_model_used or DEFAULT_ELEVENLABS_MODEL,
-                FALLBACK_ELEVENLABS_TTS_RATE_PER_1K_CHARS[DEFAULT_ELEVENLABS_MODEL],
-            )
-        else:
-            tts_rate = 0.015
-        call.tts_cost = max((tts_chars / 1000.0) * tts_rate, 0.001)
-
-    call.cost_usd = (call.llm_cost or 0) + (call.stt_cost or 0) + (call.tts_cost or 0)
+    _recompute_call_costs_from_usage(call, db)
     return True
+
+
+def _hydrate_call_record_metrics(call: Optional["CallModel"], db: Session) -> bool:
+    if not call:
+        return False
+
+    changed = False
+
+    if _is_stale_active_call(call):
+        if not call.ended_at:
+            call.ended_at = datetime.utcnow()
+            changed = True
+        base_start = call.started_at or call.created_at
+        if base_start:
+            derived_duration = max(int((call.ended_at - base_start).total_seconds()), 0)
+            if derived_duration != int(call.duration_seconds or 0):
+                call.duration_seconds = derived_duration
+                changed = True
+        final_status, inferred_error = _infer_terminal_status_for_call(call, db)
+        normalized_status = str(call.status or "").strip().lower()
+        if normalized_status != final_status:
+            call.status = final_status
+            changed = True
+        if inferred_error and not (call.error_message or "").strip():
+            call.error_message = inferred_error
+            changed = True
+
+    if (call.duration_seconds is None or call.duration_seconds <= 0) and call.ended_at:
+        base_start = call.started_at or call.created_at
+        if base_start:
+            derived_duration = max(int((call.ended_at - base_start).total_seconds()), 0)
+            if derived_duration > 0 and derived_duration != int(call.duration_seconds or 0):
+                call.duration_seconds = derived_duration
+                changed = True
+
+    if _looks_like_missing_usage(call):
+        if _backfill_usage_from_transcript_and_cost(call, db):
+            changed = True
+    if not _has_cost_metrics(call):
+        if _recompute_call_costs_from_usage(call, db):
+            changed = True
+
+    return changed
 
 
 class CallUsageUpdate(BaseModel):
@@ -5480,6 +5903,8 @@ class AgentCallCreate(BaseModel):
     call_type: str = "phone"
     from_number: Optional[str] = None
     to_number: Optional[str] = None
+    sip_trunk_id: Optional[str] = None
+    dispatch_name_hint: Optional[str] = None
 
 
 @app.post("/api/calls/create-from-agent")
@@ -5488,6 +5913,8 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
     normalized_direction = normalize_call_direction(call_data.direction, default="inbound")
     normalized_from_number = normalize_phone_lookup(call_data.from_number)
     normalized_to_number = normalize_phone_lookup(call_data.to_number)
+    normalized_sip_trunk_id = str(call_data.sip_trunk_id or "").strip() or None
+    normalized_dispatch_name = str(call_data.dispatch_name_hint or "").strip() or None
     inbound_routing = None
     resolved_agent_id = call_data.agent_id
 
@@ -5495,10 +5922,18 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
         inbound_routing = resolve_inbound_agent_id(
             db,
             called_number=normalized_to_number,
+            sip_trunk_id=normalized_sip_trunk_id,
             room_name=call_data.room_name,
             fallback_agent_id=call_data.agent_id,
         )
         resolved_agent_id = inbound_routing["agent_id"]
+        weak_sources = {"fallback_agent", "default_first_agent", "room_name", "single_inbound_mapping"}
+        if normalized_dispatch_name and inbound_routing.get("source") in weak_sources:
+            dispatch_agent = _find_agent_by_dispatch_name_value(db, normalized_dispatch_name)
+            if dispatch_agent:
+                resolved_agent_id = int(dispatch_agent.id)
+                inbound_routing["agent_id"] = resolved_agent_id
+                inbound_routing["source"] = "dispatch_name"
     resolved_agent = db.query(AgentModel).filter(AgentModel.id == resolved_agent_id).first()
 
     # Reuse only active call rows for this room; create a fresh row for ended/failed calls.
@@ -5538,6 +5973,10 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
                 metadata["inbound_routing_source"] = inbound_routing["source"]
                 if inbound_routing.get("normalized_called_number"):
                     metadata["resolved_called_number"] = inbound_routing["normalized_called_number"]
+                if normalized_sip_trunk_id:
+                    metadata["sip_trunk_id"] = normalized_sip_trunk_id
+                if normalized_dispatch_name:
+                    metadata["dispatch_name_hint"] = normalized_dispatch_name
                 changed = True
             if resolved_agent:
                 merged_metadata = merge_call_metadata_with_agent(resolved_agent, metadata)
@@ -5567,6 +6006,10 @@ async def create_call_from_agent(call_data: AgentCallCreate, db: Session = Depen
         call_metadata["inbound_routing_source"] = inbound_routing["source"]
         if inbound_routing.get("normalized_called_number"):
             call_metadata["resolved_called_number"] = inbound_routing["normalized_called_number"]
+    if normalized_sip_trunk_id:
+        call_metadata["sip_trunk_id"] = normalized_sip_trunk_id
+    if normalized_dispatch_name:
+        call_metadata["dispatch_name_hint"] = normalized_dispatch_name
     if resolved_agent:
         call_metadata = merge_call_metadata_with_agent(resolved_agent, call_metadata)
 
@@ -5669,6 +6112,12 @@ async def get_call_history(
     total = query.count()
     offset = (page - 1) * limit
     calls = query.order_by(CallModel.created_at.desc()).offset(offset).limit(limit).all()
+    hydrated_calls = False
+    for call in calls:
+        if _hydrate_call_record_metrics(call, db):
+            hydrated_calls = True
+    if hydrated_calls:
+        db.commit()
     
     # Enrich with agent names
     result = []
@@ -5678,6 +6127,8 @@ async def get_call_history(
             TranscriptModel.call_id == call.call_id
         ).order_by(TranscriptModel.timestamp).all()
         latency_summary = _summarize_call_latency(transcripts)
+        metadata = ensure_custom_params(call.call_metadata)
+        transfer_events = _normalize_call_transfer_events(metadata.get("call_transfers"))
         
         # Calculate duration from timestamps if null
         duration = call.duration_seconds
@@ -5708,10 +6159,13 @@ async def get_call_history(
             "llm_model_used": call.llm_model_used,
             "stt_duration_ms": call.stt_duration_ms or 0,
             "tts_characters": call.tts_characters or 0,
-            "tts_provider": ensure_custom_params(call.call_metadata).get("tts_provider", DEFAULT_TTS_PROVIDER),
-            "tts_model_used": ensure_custom_params(call.call_metadata).get("tts_model"),
+            "tts_provider": metadata.get("tts_provider", DEFAULT_TTS_PROVIDER),
+            "tts_model_used": metadata.get("tts_model"),
             "transcript_count": len(transcripts),
             "transcript_summary": call.transcript_summary,
+            "transfer_to": metadata.get("last_transfer_phone"),
+            "transfer_status": metadata.get("last_transfer_status"),
+            "transfer_count": len(transfer_events),
             "error_message": call.error_message,
             "latency_ms": latency_summary["total_avg_ms"],
             "latency_source": latency_summary["source"],
@@ -5733,6 +6187,8 @@ async def get_call_details(call_id: str, db: Session = Depends(get_database)):
     call = db.query(CallModel).filter(CallModel.call_id == call_id).first()
     if not call:
         raise HTTPException(status_code=404, detail="Call not found")
+    if _hydrate_call_record_metrics(call, db):
+        db.commit()
     
     agent = db.query(AgentModel).filter(AgentModel.id == call.agent_id).first()
     
@@ -5766,6 +6222,8 @@ async def get_call_details(call_id: str, db: Session = Depends(get_database)):
             "duration_seconds": duration,
             "recording_url": call.recording_url,
             "error_message": call.error_message,
+            "transfer_to": metadata.get("last_transfer_phone"),
+            "transfer_status": metadata.get("last_transfer_status"),
         },
         "costs": {
             "total_usd": round(call.cost_usd or 0, 6),
@@ -5798,6 +6256,12 @@ async def get_call_details(call_id: str, db: Session = Depends(get_database)):
             "source": latency_summary["source"],
         },
         "handoffs": handoffs,
+        "transfer": {
+            "last_phone": metadata.get("last_transfer_phone"),
+            "last_status": metadata.get("last_transfer_status"),
+            "last_error": metadata.get("last_transfer_error"),
+            "events": _normalize_call_transfer_events(metadata.get("call_transfers")),
+        },
         "transcript": [
             {
                 "role": t.role,

@@ -6,7 +6,7 @@ import {
     Bot, BookOpen, Phone, PhoneCall, History, MessageSquare,
     BarChart3, Settings, Key, Sparkles, Plus, Trash2, Copy,
     Check, AlertCircle, ExternalLink, Play, HelpCircle, Info, RefreshCw,
-    Webhook
+    Webhook, X
 } from 'lucide-react';
 import axios from 'axios';
 
@@ -49,13 +49,7 @@ interface SipEndpoint {
 export default function PhoneNumbersPage() {
     const emptyFormData = {
         phone_number: '',
-        description: '',
         termination_uri: '',
-        sip_trunk_username: '',
-        sip_trunk_password: '',
-        twilio_account_sid: '',
-        twilio_auth_token: '',
-        twilio_sip_trunk_sid: '',
         inbound_agent_id: 0,
         outbound_agent_id: 0,
         enable_inbound: true,
@@ -76,6 +70,7 @@ export default function PhoneNumbersPage() {
     const [formLoading, setFormLoading] = useState(false);
     const [formError, setFormError] = useState('');
     const [formSuccess, setFormSuccess] = useState('');
+    const [showSipSetupPopup, setShowSipSetupPopup] = useState(false);
     // Outbound call state
     const [showOutboundModal, setShowOutboundModal] = useState(false);
     const [outboundTargetPhone, setOutboundTargetPhone] = useState('');
@@ -134,14 +129,7 @@ export default function PhoneNumbersPage() {
         setEditingPhoneId(phone.id);
         setFormData({
             phone_number: phone.phone_number,
-            description: phone.description || '',
             termination_uri: phone.termination_uri || '',
-            sip_trunk_username: phone.sip_trunk_username || '',
-            // Never prefill secrets from API responses.
-            sip_trunk_password: '',
-            twilio_account_sid: phone.twilio_account_sid || '',
-            twilio_auth_token: '',
-            twilio_sip_trunk_sid: phone.twilio_sip_trunk_sid || '',
             inbound_agent_id: phone.inbound_agent_id || 0,
             outbound_agent_id: phone.outbound_agent_id || 0,
             enable_inbound: !!phone.enable_inbound,
@@ -162,13 +150,7 @@ export default function PhoneNumbersPage() {
         try {
             const payload = {
                 phone_number: formData.phone_number,
-                description: formData.description || null,
                 termination_uri: formData.termination_uri || null,
-                sip_trunk_username: formData.sip_trunk_username || null,
-                sip_trunk_password: formData.sip_trunk_password || null,
-                twilio_account_sid: formData.twilio_account_sid || null,
-                twilio_auth_token: formData.twilio_auth_token || null,
-                twilio_sip_trunk_sid: formData.twilio_sip_trunk_sid || null,
                 inbound_agent_id: formData.inbound_agent_id || null,
                 outbound_agent_id: formData.outbound_agent_id || null,
                 enable_inbound: formData.enable_inbound,
@@ -355,10 +337,19 @@ export default function PhoneNumbersPage() {
                             {showForm && (
                                 <div className="bg-white rounded-xl border border-gray-200 mb-8 overflow-hidden">
                                     <div className="p-6 border-b border-gray-200 bg-indigo-50">
-                                        <h2 className="text-lg font-semibold text-indigo-900">
-                                            {editingPhoneId ? 'Edit Phone Number Configuration' : 'Add Phone Number (SIP Trunking)'}
-                                        </h2>
-                                        <p className="text-sm text-indigo-700 mt-1">Configure your Twilio SIP Trunk to work with LiveKit. IP Access Control is the recommended authentication method.</p>
+                                        <div className="flex items-center justify-between gap-3">
+                                            <h2 className="text-lg font-semibold text-indigo-900">
+                                                {editingPhoneId ? 'Edit Phone Number Configuration' : 'Add Phone Number'}
+                                            </h2>
+                                            <button
+                                                type="button"
+                                                onClick={() => setShowSipSetupPopup(true)}
+                                                className="inline-flex items-center gap-2 rounded-lg border border-indigo-200 bg-white px-3 py-2 text-sm font-medium text-indigo-700 hover:bg-indigo-50"
+                                            >
+                                                <Info className="h-4 w-4" />
+                                                SIP Setup
+                                            </button>
+                                        </div>
                                     </div>
 
                                     <form onSubmit={handleSubmit} className="p-6">
@@ -397,109 +388,26 @@ export default function PhoneNumbersPage() {
                                                 </p>
                                             </div>
 
-                                            {/* Description */}
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    Description
-                                                </label>
-                                                <input
-                                                    type="text"
-                                                    value={formData.description}
-                                                    onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-                                                    placeholder="Sales hotline, Support line, etc."
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                                                />
-                                            </div>
-
-                                            {/* Twilio Account SID */}
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    Twilio Account SID <span className="text-gray-400 font-normal">(Optional if using Pure SIP)</span>
-                                                </label>
-                                                <input
-                                                    type="text"
-                                                    value={formData.twilio_account_sid}
-                                                    onChange={(e) => setFormData({ ...formData, twilio_account_sid: e.target.value })}
-                                                    placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                                                />
-                                                <p className="text-xs text-gray-500 mt-1">
-                                                    <a href="https://console.twilio.com/account" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
-                                                        Find in Twilio Console →
-                                                    </a>
-                                                </p>
-                                            </div>
-
-                                            {/* Twilio Auth Token */}
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    Twilio Auth Token <span className="text-gray-400 font-normal">(Optional if using Pure SIP)</span>
-                                                </label>
-                                                <input
-                                                    type="password"
-                                                    value={formData.twilio_auth_token}
-                                                    onChange={(e) => setFormData({ ...formData, twilio_auth_token: e.target.value })}
-                                                    placeholder="Your Twilio auth token"
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                                                />
-                                                <p className="text-xs text-gray-500 mt-1">
-                                                    Found in Twilio Console under Account Info
-                                                </p>
-                                            </div>
-
                                             {/* Pure SIP Termination URI */}
                                             <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    Termination URI (For Outbound) <span className="text-gray-400 font-normal">(e.g. your-trunk.pstn.twilio.com)</span>
-                                                </label>
+                                                <div className="mb-1 flex items-center justify-between gap-2">
+                                                    <label className="block text-sm font-medium text-gray-700">
+                                                        Termination URI (For Outbound) <span className="text-red-500">*</span>
+                                                    </label>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setShowSipSetupPopup(true)}
+                                                        className="text-xs font-medium text-blue-600 hover:text-blue-700"
+                                                    >
+                                                        Where do I get this?
+                                                    </button>
+                                                </div>
                                                 <input
                                                     type="text"
                                                     value={formData.termination_uri}
                                                     onChange={(e) => setFormData({ ...formData, termination_uri: e.target.value })}
-                                                    placeholder="example.pstn.twilio.com"
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                                                />
-                                                <p className="text-xs text-gray-500 mt-1">Found in Twilio SIP Trunk → Termination → Termination SIP URI.</p>
-                                            </div>
-
-                                            {/* SIP Trunk Credentials Note */}
-                                            <div className="md:col-span-2 p-3 bg-blue-50 border border-blue-100 rounded-lg">
-                                                <div className="flex gap-2">
-                                                    <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-                                                    <div>
-                                                        <p className="text-xs font-semibold text-blue-900">Authentication Method</p>
-                                                        <p className="text-xs text-blue-800 mt-0.5">
-                                                            If you added this server's IP (<code className="bg-white px-1">13.135.81.172</code>) to Twilio's **IP Access Control List**, you can leave Username and Password **blank**.
-                                                            Use Credentials only if IP-based access is not possible.
-                                                        </p>
-                                                    </div>
-                                                </div>
-                                            </div>
-
-                                            {/* SIP Trunk Username */}
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    SIP Trunk Username <span className="text-gray-400 font-normal">(Optional if using IP Access)</span>
-                                                </label>
-                                                <input
-                                                    type="text"
-                                                    value={formData.sip_trunk_username}
-                                                    onChange={(e) => setFormData({ ...formData, sip_trunk_username: e.target.value })}
-                                                    placeholder="my-sip-user"
-                                                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                                                />
-                                            </div>
-
-                                            {/* SIP Trunk Password */}
-                                            <div>
-                                                <label className="block text-sm font-medium text-gray-700 mb-1">
-                                                    SIP Trunk Password <span className="text-gray-400 font-normal">(Optional if using IP Access)</span>
-                                                </label>
-                                                <input
-                                                    type="password"
-                                                    value={formData.sip_trunk_password}
-                                                    onChange={(e) => setFormData({ ...formData, sip_trunk_password: e.target.value })}
-                                                    placeholder="••••••••••••"
+                                                    placeholder="your-trunk.pstn.twilio.com"
+                                                    required
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                                                 />
                                             </div>
@@ -1208,6 +1116,41 @@ export default function PhoneNumbersPage() {
 
                 </div>
             </main>
+
+            {showSipSetupPopup && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+                    <div className="w-full max-w-md rounded-2xl bg-white shadow-2xl">
+                        <div className="flex items-center justify-between border-b border-gray-100 px-5 py-4">
+                            <div>
+                                <h3 className="text-base font-semibold text-gray-900">SIP Setup</h3>
+                                <p className="text-sm text-gray-500">Only the required Twilio details for IP ACL setup.</p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setShowSipSetupPopup(false)}
+                                className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
+                            >
+                                <X className="h-5 w-5" />
+                            </button>
+                        </div>
+                        <div className="space-y-3 px-5 py-4 text-sm text-gray-700">
+                            <p>Keep the Twilio phone number assigned to the SIP trunk.</p>
+                            <p>Paste the trunk&apos;s <span className="font-medium text-gray-900">Termination SIP URI</span> into this form.</p>
+                            <p>Add this server IP to your Twilio IP Access Control List: <code className="rounded bg-gray-100 px-1.5 py-0.5 text-xs">13.135.81.172</code></p>
+                            <p>Nothing else is needed in this form for your IP ACL setup.</p>
+                        </div>
+                        <div className="border-t border-gray-100 px-5 py-4">
+                            <button
+                                type="button"
+                                onClick={() => setShowSipSetupPopup(false)}
+                                className="w-full rounded-lg bg-purple-600 px-4 py-2 text-sm font-medium text-white hover:bg-purple-700"
+                            >
+                                Close
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Outbound Call Modal */}
             {showOutboundModal && (
