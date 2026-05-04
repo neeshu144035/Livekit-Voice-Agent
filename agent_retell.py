@@ -4189,8 +4189,9 @@ async def entrypoint(ctx: JobContext):
                 usage.add_transcript("agent", content)
                 asyncio.ensure_future(send_transcript_to_api(call_id, "agent", content))
                 logger.info(f"[transcript] Agent: {content[:60]}...")
-                if hasattr(agent, "_schedule_spoken_transfer_fallback"):
-                    agent._schedule_spoken_transfer_fallback(content)
+                # We removed the spoken transfer fallback so the agent relies on native tool calling.
+                # if hasattr(agent, "_schedule_spoken_transfer_fallback"):
+                #     agent._schedule_spoken_transfer_fallback(content)
 
                 if getattr(agent, "_pending_end_call_after_speech", False) and not getattr(agent, "_end_call_handoff_started", False):
                     setattr(agent, "_pending_end_call_after_speech", False)
