@@ -438,7 +438,6 @@ def _build_xai_realtime_model(
     native_init_error = None
     if xai is not None and hasattr(xai, "realtime") and hasattr(xai.realtime, "RealtimeModel"):
         native_kwargs: Dict[str, Any] = {
-            "model": model_name,
             "api_key": xai_api_key,
             "voice": runtime_voice,
         }
@@ -1660,7 +1659,8 @@ def merge_builtin_functions_into_runtime(
     custom_params = config.get("custom_params", {}) or {}
     builtin_funcs = custom_params.get("builtin_functions", {}) or {}
 
-    if builtin_funcs.get('builtin_transfer_call', {}).get('enabled') and not ({"transfer_call", "call_transfer"} & existing_names):
+    has_transfer_tool = any(_is_transfer_tool(f) for f in runtime_functions)
+    if builtin_funcs.get('builtin_transfer_call', {}).get('enabled') and not has_transfer_tool:
         transfer_entry = builtin_funcs['builtin_transfer_call']
         transfer_cfg = transfer_entry.get('config', {})
         phone_number = transfer_cfg.get('phone_number', '')
