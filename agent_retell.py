@@ -3005,9 +3005,11 @@ class DynamicPropertyAgent(Agent):
         if not normalized:
             return
         self._recent_tool_call_times[normalized] = time.time()
-        pending = self._pending_transfer_fallback_tasks.pop(normalized, None)
+        pending = self._pending_transfer_fallback_tasks.get(normalized, None)
         if pending and not pending.done():
-            pending.cancel()
+            if pending != asyncio.current_task():
+                pending.cancel()
+            self._pending_transfer_fallback_tasks.pop(normalized, None)
 
     def _get_function_cfg(self, tool_name):
         normalized = _canonical_tool_name(tool_name)
