@@ -43,7 +43,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent-retell")
 
 DASHBOARD_API_URL = os.getenv("DASHBOARD_API_URL", "http://host.docker.internal:8000").rstrip("/")
-DEFAULT_WORKER_DISPATCH_NAME = (os.getenv("LIVEKIT_WORKER_AGENT_NAME", "sarah") or "sarah").strip().lower()
+DEFAULT_WORKER_DISPATCH_NAME = (
+    os.getenv("LIVEKIT_WORKER_AGENT_NAME", "voice-agent") or "voice-agent"
+).strip().lower()
 MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "1800"))
 DEFAULT_TTS_PROVIDER = "deepgram"
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
@@ -115,6 +117,15 @@ ELEVENLABS_VOICE_MAP = {
     "james": "VR6AewLTigWG4xSOukaG",  # Arnold
 }
 XAI_VOICE_IDS = {"eve", "ara", "rex", "sal", "leo"}
+XAI_VOICE_NAME_MAP = {
+    "ara": "Ara",
+    "eve": "Eve",
+    "leo": "Leo",
+    "rex": "Rex",
+    "sal": "Sal",
+}
+CANONICAL_TRANSFER_TOOL_NAME = "call_transfer"
+TRANSFER_DUPLICATE_SUPPRESS_SEC = float(os.getenv("TRANSFER_DUPLICATE_SUPPRESS_SEC", "20"))
 DOUBLE_TEMPLATE_VAR_PATTERN = re.compile(r"\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}")
 SINGLE_TEMPLATE_VAR_PATTERN = re.compile(r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})")
 
@@ -197,6 +208,18 @@ def get_elevenlabs_api_key() -> str:
 
 def get_xai_api_key() -> str:
     return (os.getenv("XAI_API_KEY") or "").strip()
+
+
+def normalize_xai_voice_id(value: Any, default: str = "eve") -> str:
+    voice_id = str(value or default).strip().lower() or default
+    if voice_id not in XAI_VOICE_IDS:
+        logger.warning("Unsupported xAI voice '%s'; falling back to %s", voice_id, default)
+        return default
+    return voice_id
+
+
+def resolve_xai_runtime_voice_name(value: Any, default: str = "eve") -> str:
+    return XAI_VOICE_NAME_MAP.get(normalize_xai_voice_id(value, default=default), XAI_VOICE_NAME_MAP["eve"])
 
 
 def normalize_agent_language(language: Any, default: str = "en-GB") -> str:
@@ -396,40 +419,81 @@ def _build_xai_realtime_model(
     xai_api_key: str,
 ) -> tuple[Any, str]:
     turn_detection = _build_openai_realtime_turn_detection()
-    
+
+    model_name = voice_realtime_model or DEFAULT_XAI_REALTIME_MODEL
+    runtime_voice = resolve_xai_runtime_voice_name(selected_voice)
+
+    if turn_detection is not None:
+        if isinstance(turn_detection, dict):
+            turn_detection = dict(turn_detection)
+            turn_detection["silence_duration_ms"] = max(int(turn_detection.get("silence_duration_ms") or 0), 800)
+        else:
+            try:
+                current_silence = int(getattr(turn_detection, "silence_duration_ms", 0) or 0)
+                if current_silence < 800:
+                    setattr(turn_detection, "silence_duration_ms", 800)
+            except Exception:
+                pass
+
+    native_init_error = None
+    if xai is not None and hasattr(xai, "realtime") and hasattr(xai.realtime, "RealtimeModel"):
+        native_kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "api_key": xai_api_key,
+            "voice": runtime_voice,
+        }
+        if XAI_REALTIME_BASE_URL:
+            native_kwargs["base_url"] = XAI_REALTIME_BASE_URL
+        if turn_detection is not None:
+            native_kwargs["turn_detection"] = turn_detection
+        try:
+            logger.info(
+                "Instantiating xAI realtime model (native plugin) | Model: %s | Voice: %s",
+                model_name,
+                runtime_voice,
+            )
+            return xai.realtime.RealtimeModel(**native_kwargs), model_name
+        except Exception as exc:
+            native_init_error = exc
+            logger.warning(
+                "Native xAI realtime model init failed; falling back to OpenAI-compatible mode: %s",
+                exc,
+            )
+
     if not hasattr(openai, "realtime") or not hasattr(openai.realtime, "RealtimeModel"):
+        if native_init_error is not None:
+            raise RuntimeError(
+                "xAI unified voice could not initialize via the native xAI plugin, and the OpenAI-compatible "
+                "RealtimeModel fallback is unavailable."
+            ) from native_init_error
         raise RuntimeError(
-            "xAI unified voice requires livekit-plugins-openai to be installed for RealtimeModel support."
+            "xAI unified voice requires livekit-plugins-xai or livekit-plugins-openai realtime support."
         )
 
-    # Use the specific model name xAI expects for realtime
-    model_name = voice_realtime_model or "grok-voice-think-fast-1.0"
-    
-    realtime_kwargs: Dict[str, Any] = {
+    fallback_kwargs: Dict[str, Any] = {
         "model": model_name,
         "api_key": xai_api_key,
         "base_url": XAI_REALTIME_BASE_URL,
-        "voice": selected_voice,
-        "modalities": ["audio", "text"],
+        "voice": runtime_voice,
+        "modalities": ["audio"],
     }
-    
-    # xAI Realtime Beta often requires explicit transcription for 'audio' only mode
+
     try:
         from livekit.plugins.openai.realtime.models import AudioTranscription
-        realtime_kwargs["input_audio_transcription"] = AudioTranscription(model="whisper-1")
+
+        fallback_kwargs["input_audio_transcription"] = AudioTranscription(model="whisper-1")
     except Exception:
         pass
-        
+
     if turn_detection is not None:
-        # Increase silence duration slightly to prevent "choppiness" leading to 429s
-        if isinstance(turn_detection, dict):
-            turn_detection["silence_duration_ms"] = 800
-        realtime_kwargs["turn_detection"] = turn_detection
-        
-    logger.info("Instantiating xAI realtime model (Bypass Mode) | Model: %s | Modalities: [audio, text]", model_name)
-    rt_model = openai.realtime.RealtimeModel(**realtime_kwargs)
-    
-    return rt_model, model_name
+        fallback_kwargs["turn_detection"] = turn_detection
+
+    logger.info(
+        "Instantiating xAI realtime model (OpenAI-compatible fallback) | Model: %s | Voice: %s",
+        model_name,
+        runtime_voice,
+    )
+    return openai.realtime.RealtimeModel(**fallback_kwargs), model_name
 
 
 def resolve_llm_temperature(config: Dict[str, Any]) -> float:
@@ -549,9 +613,54 @@ def _is_transfer_tool(func_cfg: Dict[str, Any]) -> bool:
     return (
         system_type in ("transfer_call", "agent_transfer")
         or url in ("builtin://transfer_call", "builtin://agent_transfer")
-        or tool_name in ("transfer_call", "agent_transfer")
+        or tool_name in ("transfer_call", "call_transfer", "agent_transfer")
         or tool_name.endswith("_agent_transfer")
     )
+
+
+def _is_generic_transfer_tool_name(tool_name: str) -> bool:
+    return _normalize_tool_name(tool_name) in {"transfer_call", "call_transfer"}
+
+
+def _canonical_tool_name(tool_name: str) -> str:
+    normalized = _normalize_tool_name(tool_name)
+    if _is_generic_transfer_tool_name(normalized):
+        return CANONICAL_TRANSFER_TOOL_NAME
+    return normalized
+
+
+def _extract_transfer_topic(tool_name: str) -> str:
+    normalized = _canonical_tool_name(tool_name)
+    if normalized.endswith("_agent_transfer"):
+        normalized = normalized[: -len("_agent_transfer")]
+    elif normalized.endswith("_transfer_call"):
+        normalized = normalized[: -len("_transfer_call")]
+    elif normalized in {"transfer_call", "call_transfer", "agent_transfer"}:
+        normalized = ""
+    return normalized.strip("_")
+
+
+def _spoken_transfer_hints_for_tool(tool_name: str) -> List[str]:
+    normalized = _normalize_tool_name(tool_name)
+    topic = _extract_transfer_topic(normalized)
+    hints = set(_tool_aliases(normalized))
+    if topic:
+        hints.update(
+            {
+                topic,
+                topic.replace("_", " "),
+                f"{topic} team",
+            }
+        )
+
+    team_hints = {
+        "renting": {"lettings", "letting", "lettings team", "renting", "renting team"},
+        "buying": {"buying", "buying team", "buyer", "buyers"},
+        "selling": {"selling", "selling team", "sales", "sales team"},
+        "maintenance": {"maintenance", "maintenance team", "repair", "repairs"},
+    }
+    hints.update(team_hints.get(topic, set()))
+    return [hint for hint in hints if hint]
 
 
 def _tool_speech_instruction_line(func_cfg: Dict[str, Any]) -> str:
@@ -602,7 +711,7 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
     if not instructions:
         return ""
     return (
-        "TRANSFER RULES — FOLLOW STRICTLY:\n"
+        "\nTRANSFER RULES — FOLLOW STRICTLY:\n"
         + "\n".join(instructions)
         + "\nDO NOT ask the user if they want to be transferred if they have already requested it or agreed to it. "
         + "\nCRITICAL SYSTEM INSTRUCTION: You MUST execute the ACTUAL JSON function call for the transfer tool. DO NOT simply say 'I am transferring you' and stop. You MUST trigger the tool itself. "
@@ -1144,15 +1253,20 @@ atexit.register(_atexit_handler)
 
 async def send_transcript_to_api(call_id, role, content):
     if not call_id:
-        return
-    try:
-        await get_dashboard_api_client().post(
-            f"{DASHBOARD_API_URL}/api/calls/{call_id}/transcript",
-            json={"role": role, "content": content, "is_final": True},
-            timeout=5.0,
-        )
-    except Exception as e:
-        logger.error(f"Error sending transcript: {e}")
+        return False
+    payload = {"role": role, "content": content, "is_final": True}
+    for attempt in range(1, 4):
+        try:
+            await get_dashboard_api_client().post(
+                f"{DASHBOARD_API_URL}/api/calls/{call_id}/transcript",
+                json=payload,
+                timeout=8.0,
+            )
+            return True
+        except Exception as e:
+            logger.error("Error sending transcript for %s (attempt %s/3): %s", call_id, attempt, e)
+            await asyncio.sleep(0.35 * attempt)
+    return False
 
 
 async def send_usage_to_api(call_id, tracker):
@@ -1294,7 +1408,8 @@ async def send_usage_to_api(call_id, tracker):
 
 
 async def create_call_record(room_name, agent_id, direction="outbound",
-                              from_number=None, to_number=None):
+                              from_number=None, to_number=None,
+                              sip_trunk_id=None, dispatch_name_hint=None):
     try:
         resp = await get_dashboard_api_client().post(
             f"{DASHBOARD_API_URL}/api/calls/create-from-agent",
@@ -1305,6 +1420,8 @@ async def create_call_record(room_name, agent_id, direction="outbound",
                 "call_type": "phone" if direction == "inbound" or from_number or to_number else "web",
                 "from_number": from_number,
                 "to_number": to_number,
+                "sip_trunk_id": str(sip_trunk_id or "").strip() or None,
+                "dispatch_name_hint": str(dispatch_name_hint or "").strip() or None,
             },
             timeout=5.0,
         )
@@ -1327,6 +1444,69 @@ async def end_call_record(call_id):
         await get_dashboard_api_client().post(f"{DASHBOARD_API_URL}/api/calls/{call_id}/end", timeout=5.0)
     except Exception as e:
         logger.error(f"Error ending call: {e}")
+
+
+def _normalize_transcript_entry_signature(entry: Dict[str, Any]) -> tuple[str, str]:
+    role = str(entry.get("role", "") or "").strip().lower()
+    content = re.sub(r"\s+", " ", str(entry.get("content", "") or "").strip())
+    return role, content
+
+
+def _missing_transcript_suffix(
+    local_entries: List[Dict[str, Any]],
+    persisted_entries: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not local_entries:
+        return []
+    if not persisted_entries:
+        return list(local_entries)
+
+    local_signatures = [_normalize_transcript_entry_signature(entry) for entry in local_entries]
+    persisted_signatures = [_normalize_transcript_entry_signature(entry) for entry in persisted_entries]
+
+    persisted_idx = 0
+    last_local_match = -1
+    for local_idx, signature in enumerate(local_signatures):
+        if persisted_idx >= len(persisted_signatures):
+            break
+        if signature == persisted_signatures[persisted_idx]:
+            persisted_idx += 1
+            last_local_match = local_idx
+
+    if persisted_idx < len(persisted_signatures):
+        return []
+    return list(local_entries[last_local_match + 1 :])
+
+
+async def backfill_missing_transcripts(call_id: str, tracker: "UsageTracker") -> None:
+    if not call_id or tracker is None or not tracker.transcript_entries:
+        return
+    try:
+        resp = await get_dashboard_api_client().get(
+            f"{DASHBOARD_API_URL}/calls/{call_id}/transcript",
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        persisted_entries = payload.get("entries", []) if isinstance(payload, dict) else []
+        if not isinstance(persisted_entries, list):
+            persisted_entries = []
+    except Exception as e:
+        logger.error("Error fetching persisted transcript for %s: %s", call_id, e)
+        persisted_entries = []
+
+    missing_entries = _missing_transcript_suffix(tracker.transcript_entries, persisted_entries)
+    if not missing_entries:
+        logger.info("Transcript backfill not needed for %s", call_id)
+        return
+
+    logger.warning(
+        "Backfilling %s missing transcript entries for %s",
+        len(missing_entries),
+        call_id,
+    )
+    for entry in missing_entries:
+        await send_transcript_to_api(call_id, entry.get("role", ""), entry.get("content", ""))
 
 
 # ==================== Agent Config ====================
@@ -1480,7 +1660,7 @@ def merge_builtin_functions_into_runtime(
     custom_params = config.get("custom_params", {}) or {}
     builtin_funcs = custom_params.get("builtin_functions", {}) or {}
 
-    if builtin_funcs.get('builtin_transfer_call', {}).get('enabled') and "transfer_call" not in existing_names:
+    if builtin_funcs.get('builtin_transfer_call', {}).get('enabled') and not ({"transfer_call", "call_transfer"} & existing_names):
         transfer_entry = builtin_funcs['builtin_transfer_call']
         transfer_cfg = transfer_entry.get('config', {})
         phone_number = transfer_cfg.get('phone_number', '')
@@ -1492,26 +1672,33 @@ def merge_builtin_functions_into_runtime(
         if not transfer_speak_during and not transfer_speak_after:
             transfer_speak_during, transfer_speak_after = True, False
         runtime_functions.append({
-            'name': 'transfer_call',
+            'name': CANONICAL_TRANSFER_TOOL_NAME,
             'description': (
                 'Use ONLY when caller explicitly asks to transfer/escalate/connect to a human. '
                 'Do not call this for normal conversation.'
             ),
-            'url': '',
-            'method': 'POST',
+            'url': 'builtin://transfer_call',
+            'method': 'SYSTEM',
+            'system_type': 'transfer_call',
+            'system_config': {
+                'phone_number': phone_number,
+            },
             'parameters_schema': {
                 'type': 'object',
                 'properties': {
-                    'phone_number': {'type': 'string', 'description': 'Target phone number in E.164 format, e.g. +447123456789'}
+                    'phone_number': {
+                        'type': 'string',
+                        'description': 'Optional override. The configured transfer target will be used automatically.'
+                    }
                 },
-                'required': ['phone_number']
+                'required': []
             },
             'phone_number': phone_number,
             'speak_during_execution': transfer_speak_during,
             'speak_after_execution': transfer_speak_after,
         })
-        logger.info(f"Added builtin transfer_call function with phone: {phone_number}")
-        existing_names.add("transfer_call")
+        logger.info(f"Added builtin {CANONICAL_TRANSFER_TOOL_NAME} function with phone: {phone_number}")
+        existing_names.update({"transfer_call", "call_transfer"})
 
     if builtin_funcs.get('builtin_end_call', {}).get('enabled') and "end_call" not in existing_names:
         end_entry = builtin_funcs['builtin_end_call']
@@ -2164,6 +2351,14 @@ async def run_transfer_handoff(
                 "skipped": True,
                 "reason": "sip_refer_transfer",
             }
+            # Even with REFER, we should try to remove the agent from the room 
+            # to prevent it from continuing to talk to an empty room.
+            try:
+                agent_identity = (getattr(room.local_participant, "identity", "") or "").strip()
+                if agent_identity:
+                    await remove_room_participant(room.name, agent_identity)
+            except Exception as cleanup_exc:
+                logger.warning(f"Failed to remove agent after SIP REFER: {cleanup_exc}")
             return transfer_result
         else:
             logger.warning(f"SIP REFER transfer failed: {transfer_result.get('error')}. Falling back to bridged transfer.")
@@ -2250,10 +2445,7 @@ def build_runtime_engines_for_config(
     if tts_provider == "elevenlabs":
         selected_voice = ELEVENLABS_VOICE_MAP.get(str(selected_voice).lower(), selected_voice)
     elif tts_provider == "xai":
-        selected_voice = str(selected_voice or "eve").strip().lower() or "eve"
-        if selected_voice not in XAI_VOICE_IDS:
-            logger.warning("Unsupported xAI voice '%s'; falling back to eve", selected_voice)
-            selected_voice = "eve"
+        selected_voice = normalize_xai_voice_id(selected_voice)
     selected_tts_model = (
         config.get("tts_model")
         or custom_params.get("tts_model")
@@ -2492,6 +2684,8 @@ def _paralyze_old_session(agent_obj: Any):
         # We'll try a very wide search since the attribute names are unstable
         session_candidates = [
             getattr(agent_obj, "_session", None),
+            getattr(agent_obj, "_runtime_session", None),
+            getattr(agent_obj, "_session_impl", None),
             getattr(getattr(agent_obj, "_activity", object()), "_session", None),
             getattr(getattr(agent_obj, "_activity", object()), "_rt_session", None),
         ]
@@ -2796,9 +2990,262 @@ class DynamicPropertyAgent(Agent):
         self.vad_instance = vad_instance
         self._transfer_in_progress = False
         self._agent_transfer_in_progress = False
+        self._recent_tool_call_times = {{}}
+        self._pending_transfer_fallback_tasks = {{}}
+        self._last_transfer_request_ts = 0.0
+        self._last_transfer_target = ""
         self._pending_end_call_after_speech = False
         self._end_call_handoff_started = False
         super().__init__(instructions=instructions, chat_ctx=chat_ctx, llm=llm_engine, tts=tts_engine, stt=stt_engine, vad=vad_instance)
+    def _mark_tool_call_observed(self, tool_name):
+        normalized = _canonical_tool_name(tool_name)
+        if not normalized:
+            return
+        self._recent_tool_call_times[normalized] = time.time()
+        pending = self._pending_transfer_fallback_tasks.pop(normalized, None)
+        if pending and not pending.done():
+            pending.cancel()
+
+    def _get_function_cfg(self, tool_name):
+        normalized = _canonical_tool_name(tool_name)
+        for cfg in self.functions_config:
+            if _canonical_tool_name(cfg.get("name", "")) == normalized:
+                return cfg
+        return None
+
+    async def _execute_configured_pstn_transfer(self, func_cfg, payload=None, tool_name=""):
+        import json
+        payload = payload or {{}}
+        normalized_name = _canonical_tool_name(tool_name or func_cfg.get("name", ""))
+        url = str(func_cfg.get("url", "")).strip()
+        system_type = _normalize_tool_name(func_cfg.get("system_type", ""))
+
+        sys_cfg = func_cfg.get("system_config") or {{}}
+        if isinstance(sys_cfg, str):
+            try:
+                sys_cfg = json.loads(sys_cfg)
+            except Exception:
+                sys_cfg = {{}}
+
+        vars_cfg = func_cfg.get("variables") or {{}}
+        target_phone = (
+            str(sys_cfg.get("phone_number") or "").strip()
+            or str(vars_cfg.get("__transfer_phone__") or "").strip()
+            or str(func_cfg.get("phone_number") or "").strip()
+            or str(payload.get("phone_number") or "").strip()
+        )
+
+        self._mark_tool_call_observed(normalized_name)
+        logger.info(f"PSTN Transfer Triggered ({{normalized_name}}) -> {{target_phone}}")
+
+        if not (
+            system_type == "transfer_call"
+            or url == "builtin://transfer_call"
+            or str(func_cfg.get("variables", {{}})).find("__transfer_phone__") != -1
+        ):
+            return {{"success": False, "error": "Function is not configured as a PSTN transfer"}}
+        if not target_phone:
+            return {{"success": False, "error": "Transfer phone number is not configured"}}
+        if not self.room:
+            return {{"success": False, "error": "Room not available for transfer"}}
+        if self._transfer_in_progress:
+            return {{"success": False, "error": "Transfer is already in progress"}}
+        now_ts = time.time()
+        if (
+            self._last_transfer_target
+            and target_phone == self._last_transfer_target
+            and (now_ts - float(self._last_transfer_request_ts or 0.0)) < TRANSFER_DUPLICATE_SUPPRESS_SEC
+        ):
+            return {{
+                "success": True,
+                "action": normalized_name,
+                "phone_number": target_phone,
+                "status": "duplicate_suppressed",
+                "message": "Transfer already initiated recently; skipping duplicate request.",
+            }}
+
+        _paralyze_old_session(self)
+        if hasattr(self, "interrupt"):
+            self.interrupt()
+        self._last_transfer_request_ts = now_ts
+        self._last_transfer_target = target_phone
+        if hasattr(self, "call_id") and self.call_id:
+            await report_builtin_action(
+                self.call_id,
+                "transfer_call",
+                {{"tool_name": normalized_name, "phone_number": target_phone, "status": "handoff_queued"}},
+            )
+        self._transfer_in_progress = True
+
+        async def _do_pstn_handoff():
+            try:
+                handoff_result = await run_transfer_handoff(
+                    self.room,
+                    getattr(self, "call_id", None),
+                    target_phone,
+                )
+                logger.info(f"PSTN handoff result: {{handoff_result}}")
+                if hasattr(self, "call_id") and self.call_id:
+                    payload = {{"tool_name": normalized_name, "phone_number": target_phone}}
+                    if isinstance(handoff_result, dict):
+                        payload.update(handoff_result)
+                    await report_builtin_action(self.call_id, "transfer_call", payload)
+            except Exception as handoff_exc:
+                logger.error(f"PSTN handoff failed: {{handoff_exc}}")
+                if hasattr(self, "call_id") and self.call_id:
+                    await report_builtin_action(
+                        self.call_id,
+                        "transfer_call",
+                        {{
+                            "tool_name": normalized_name,
+                            "phone_number": target_phone,
+                            "status": "failed",
+                            "error": str(handoff_exc),
+                        }},
+                    )
+            finally:
+                self._transfer_in_progress = False
+
+        asyncio.create_task(_do_pstn_handoff())
+        return {{
+            "success": True,
+            "action": "transfer_call",
+            "phone_number": target_phone,
+            "status": "handoff_queued",
+            "message": "Handoff queued; announce transfer to caller now.",
+        }}
+
+    def _match_spoken_transfer_tool(self, content):
+        text = re.sub(r"\\s+", " ", str(content or "").strip().lower())
+        if not text:
+            return ""
+        transfer_language = (
+            "transfer" in text
+            or "connecting you" in text
+            or "connect you" in text
+            or "put you through" in text
+            or "putting you through" in text
+        )
+        generic_transfer_tool = ""
+        for func_cfg in self.functions_config:
+            if not _is_transfer_tool(func_cfg):
+                continue
+            tool_name = _normalize_tool_name(func_cfg.get("name", ""))
+            if not tool_name:
+                continue
+            hints = _spoken_transfer_hints_for_tool(tool_name)
+            if tool_name in text:
+                return tool_name
+            if _is_generic_transfer_tool_name(tool_name):
+                if any(hint and hint in text for hint in hints):
+                    return tool_name
+                if not generic_transfer_tool:
+                    generic_transfer_tool = tool_name
+                continue
+            if transfer_language and any(hint and hint in text for hint in hints):
+                return tool_name
+        if transfer_language and generic_transfer_tool:
+            return generic_transfer_tool
+        return ""
+
+    def _schedule_spoken_transfer_fallback(self, content):
+        tool_name = self._match_spoken_transfer_tool(content)
+        normalized_tool_name = _canonical_tool_name(tool_name)
+        if not normalized_tool_name:
+            return
+        if (
+            self._last_transfer_target
+            and (time.time() - float(self._last_transfer_request_ts or 0.0)) < TRANSFER_DUPLICATE_SUPPRESS_SEC
+        ):
+            return
+        existing = self._pending_transfer_fallback_tasks.get(normalized_tool_name)
+        if existing and not existing.done():
+            return
+
+        async def _runner():
+            try:
+                await asyncio.sleep(0.35)
+                if self._transfer_in_progress or self._agent_transfer_in_progress:
+                    return
+                last_seen = float(self._recent_tool_call_times.get(normalized_tool_name, 0.0) or 0.0)
+                if last_seen and (time.time() - last_seen) < 1.0:
+                    return
+
+                func_cfg = self._get_function_cfg(normalized_tool_name)
+                if not func_cfg:
+                    return
+
+                # Immediately silence the agent before the actual handoff so it
+                # stops producing bleed-through speech while the transfer executes.
+                _paralyze_old_session(self)
+                if hasattr(self, "interrupt"):
+                    self.interrupt()
+
+                logger.warning(
+                    "Transfer speech detected without tool call; forcing fallback for %s",
+                    normalized_tool_name,
+                )
+                fallback_payload = {{"trigger": "spoken_transfer_fallback"}}
+                if hasattr(self, "call_id") and self.call_id:
+                    try:
+                        msg = f"[Calling tool: {{normalized_tool_name}}] {{json.dumps(fallback_payload)}}"
+                        asyncio.ensure_future(send_transcript_to_api(self.call_id, "tool_call", msg))
+                    except Exception:
+                        pass
+                if self.room:
+                    try:
+                        asyncio.ensure_future(self.room.local_participant.publish_data(
+                            json.dumps({{"type": "tool_call", "tool_name": normalized_tool_name, "args": fallback_payload, "speech_mode": "default"}}),
+                            topic="room"
+                        ))
+                    except Exception as publish_exc:
+                        logger.error(f"Failed to publish spoken transfer fallback tool_call event: {{publish_exc}}")
+                system_type = _normalize_tool_name(func_cfg.get("system_type", ""))
+                url = str(func_cfg.get("url", "")).strip()
+                if (
+                    system_type == "transfer_call"
+                    or url == "builtin://transfer_call"
+                    or str(func_cfg.get("variables", {{}})).find("__transfer_phone__") != -1
+                ):
+                    result = await self._execute_configured_pstn_transfer(
+                        func_cfg,
+                        tool_name=normalized_tool_name,
+                    )
+                else:
+                    self._mark_tool_call_observed(normalized_tool_name)
+                    result = await perform_agent_transfer_handoff(
+                        self,
+                        normalized_tool_name,
+                        func_cfg,
+                        "default",
+                    )
+                if hasattr(self, "call_id") and self.call_id:
+                    try:
+                        msg = f"[Tool response: {{normalized_tool_name}}] {{json.dumps(result)}}"
+                        asyncio.ensure_future(send_transcript_to_api(self.call_id, "tool_response", msg))
+                    except Exception:
+                        pass
+                if self.room:
+                    try:
+                        asyncio.ensure_future(self.room.local_participant.publish_data(
+                            json.dumps({{"type": "tool_response", "tool_name": normalized_tool_name, "response": result}}),
+                            topic="room"
+                        ))
+                    except Exception as publish_exc:
+                        logger.error(f"Failed to publish spoken transfer fallback tool_response event: {{publish_exc}}")
+                logger.info("Forced transfer fallback result (%s): %s", normalized_tool_name, result)
+            except asyncio.CancelledError:
+                pass
+            except Exception as fallback_exc:
+                logger.error(
+                    "Forced transfer fallback failed for %s: %s",
+                    normalized_tool_name,
+                    fallback_exc,
+                )
+            finally:
+                self._pending_transfer_fallback_tasks.pop(normalized_tool_name, None)
+
+        self._pending_transfer_fallback_tasks[normalized_tool_name] = asyncio.create_task(_runner())
 {on_enter_method}"""
 
     for func in functions_config:
@@ -2818,6 +3265,7 @@ class DynamicPropertyAgent(Agent):
             speak_after = False
             speech_mode = "default"
             desc = func.get('description', '').strip().replace('"', "'").replace('\n', ' ')
+            desc = f"{desc} IMPORTANT: First say 'I am transferring you now', THEN call this tool immediately."
         else:
             speech_hint = (
                 "Before calling this tool, first tell the caller what you are doing; then share a concise result."
@@ -2855,14 +3303,14 @@ class DynamicPropertyAgent(Agent):
     async def {func_name}({args_str}) -> dict:
         import json
         payload = {{ {payload_body_str} }}
-        normalized_tool_name = "{func_name}"
+        normalized_tool_name = _canonical_tool_name("{func_name}")
         speech_mode = "{speech_mode}"
         # For builtin transfer, force payload phone_number from dashboard config.
         # This prevents model-provided numbers from overriding configured transfer target.
         _is_pstn_transfer = False
         _configured_phone = ""
         for _cfg in self.functions_config:
-            if _normalize_tool_name(_cfg.get("name", "")) == normalized_tool_name:
+            if _canonical_tool_name(_cfg.get("name", "")) == normalized_tool_name:
                 _url = _cfg.get("url", "")
                 _sys_type = _normalize_tool_name(_cfg.get("system_type", ""))
                 if _sys_type == "transfer_call" or _url == "builtin://transfer_call":
@@ -2879,13 +3327,14 @@ class DynamicPropertyAgent(Agent):
         
         if _is_pstn_transfer and _configured_phone:
             payload["phone_number"] = _configured_phone
-        logger.info(f"Tool {func_name} called with args: {{payload}}")
+        logger.info(f"Tool {{normalized_tool_name}} called with args: {{payload}}")
+        self._mark_tool_call_observed(normalized_tool_name)
         
         # Send tool call transcript
         if hasattr(self, 'call_id') and self.call_id:
             try:
                 import httpx
-                msg = f"[Calling tool: {func_name}] {{json.dumps(payload)}}"
+                msg = f"[Calling tool: {{normalized_tool_name}}] {{json.dumps(payload)}}"
                 asyncio.ensure_future(send_transcript_to_api(self.call_id, "tool_call", msg))
             except:
                 pass
@@ -2893,7 +3342,7 @@ class DynamicPropertyAgent(Agent):
         if self.room:
             try:
                 asyncio.ensure_future(self.room.local_participant.publish_data(
-                    json.dumps({{"type": "tool_call", "tool_name": "{func_name}", "args": payload, "speech_mode": speech_mode}}),
+                    json.dumps({{"type": "tool_call", "tool_name": normalized_tool_name, "args": payload, "speech_mode": speech_mode}}),
                     topic="room"
                 ))
             except Exception as e:
@@ -2902,8 +3351,8 @@ class DynamicPropertyAgent(Agent):
         result = {{"error": "Tool execution failed"}}
 
         for func_cfg in self.functions_config:
-            if _normalize_tool_name(func_cfg.get("name", "")) == "{func_name}":
-                normalized_name = _normalize_tool_name(func_cfg.get("name", ""))
+            if _canonical_tool_name(func_cfg.get("name", "")) == normalized_tool_name:
+                normalized_name = _canonical_tool_name(func_cfg.get("name", ""))
                 url = func_cfg.get("url", "")
                 method = func_cfg.get("method", "POST").upper()
                 timeout_ms = func_cfg.get("timeout_ms", 120000)
@@ -2921,62 +3370,13 @@ class DynamicPropertyAgent(Agent):
 
                 normalized_name = normalized_tool_name
                 if system_type == "transfer_call" or url == "builtin://transfer_call" or str(func_cfg.get("variables", {{}})).find("__transfer_phone__") != -1:
-                    # PSTN transfer function. 
-                    # If it's a SYSTEM tool, we use system_config.phone_number.
-                    # If it's a legacy imported tool, we check variables.__transfer_phone__.
-                    # If it's the generic builtin, we check phone_number.
-                    
-                    sys_cfg = func_cfg.get("system_config") or {{}}
-                    if isinstance(sys_cfg, str):
-                        try:
-                            sys_cfg = json.loads(sys_cfg)
-                        except:
-                            sys_cfg = {{}}
-                    
-                    vars_cfg = func_cfg.get("variables") or {{}}
-                    
-                    target_phone = (
-                        str(sys_cfg.get("phone_number") or "").strip() or 
-                        str(vars_cfg.get("__transfer_phone__") or "").strip() or
-                        str(func_cfg.get("phone_number") or "").strip() or
-                        str(payload.get("phone_number") or "").strip()
+                    result = await self._execute_configured_pstn_transfer(
+                        func_cfg,
+                        payload=payload,
+                        tool_name=normalized_name,
                     )
-                    
-                    logger.info(f"PSTN Transfer Triggered ({{normalized_name}}) ΓåÆ {{target_phone}}")
-                    if not target_phone:
-                        result = {{"success": False, "error": "Transfer phone number is not configured"}}
-                    elif not self.room:
-                        result = {{"success": False, "error": "Room not available for transfer"}}
-                    elif self._transfer_in_progress:
-                        result = {{"success": False, "error": "Transfer is already in progress"}}
-                    else:
-                        _paralyze_old_session(self)
-                        if hasattr(self, "interrupt"):
-                            self.interrupt()
-                        if hasattr(self, "call_id") and self.call_id:
-                            await report_builtin_action(self.call_id, "transfer_call", {{"phone_number": target_phone}})
-                        self._transfer_in_progress = True
-                        async def _do_pstn_handoff():
-                            try:
-                                handoff_result = await run_transfer_handoff(
-                                    self.room,
-                                    getattr(self, "call_id", None),
-                                    target_phone,
-                                )
-                                logger.info(f"PSTN handoff result: {{handoff_result}}")
-                            except Exception as handoff_exc:
-                                logger.error(f"PSTN handoff failed: {{handoff_exc}}")
-                            finally:
-                                self._transfer_in_progress = False
-                        asyncio.create_task(_do_pstn_handoff())
-                        result = {{
-                            "success": True,
-                            "action": "transfer_call",
-                            "phone_number": target_phone,
-                            "status": "handoff_queued",
-                            "message": "Handoff queued; announce transfer to caller now.",
-                        }}
-                elif system_type in ("agent_transfer", "transfer_call") or url == "builtin://agent_transfer" or normalized_tool_name.endswith("_agent_transfer"):
+                    break
+                elif system_type == "agent_transfer" or url == "builtin://agent_transfer" or normalized_tool_name.endswith("_agent_transfer"):
                     if hasattr(self, "interrupt"):
                         self.interrupt()
                     result = await perform_agent_transfer_handoff(
@@ -3087,7 +3487,12 @@ def get_sip_phone_numbers(participant):
     if hasattr(participant, 'attributes') and participant.attributes:
         attrs = participant.attributes
         from_number = attrs.get("sip.callerNumber") or attrs.get("sip.from", "")
-        to_number = attrs.get("sip.calledNumber") or attrs.get("sip.to", "")
+        to_number = (
+            attrs.get("sip.calledNumber")
+            or attrs.get("sip.phoneNumber")
+            or attrs.get("sip.trunkPhoneNumber")
+            or attrs.get("sip.to", "")
+        )
     
     def normalize_phone(phone):
         if not phone:
@@ -3100,6 +3505,15 @@ def get_sip_phone_numbers(participant):
     from_number = normalize_phone(from_number)
     to_number = normalize_phone(to_number)
     return from_number, to_number
+
+
+def get_sip_trunk_id(participant: Any) -> Optional[str]:
+    attrs = getattr(participant, "attributes", None) or {}
+    for key in ("sip.trunkID", "sip.trunkId", "sip.trunk_id"):
+        value = str(attrs.get(key, "") or "").strip()
+        if value:
+            return value
+    return None
 
 
 async def wait_for_inbound_sip_participant(room: Any, timeout_sec: float = 8.0):
@@ -3137,6 +3551,34 @@ class TranscriptCollector:
     def stop(self):
         self._running = False
 
+    @staticmethod
+    def _resolve_message_attr(item: Any, attr_name: str) -> Any:
+        value = getattr(item, attr_name, None)
+        if callable(value):
+            try:
+                value = value()
+            except TypeError:
+                return None
+            except Exception:
+                return None
+        return value
+
+    @classmethod
+    def _extract_message_text(cls, item: Any) -> str:
+        content = cls._resolve_message_attr(item, "content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(str(c) for c in content if c)
+
+        text = cls._resolve_message_attr(item, "text")
+        if isinstance(text, str):
+            return text
+        if isinstance(text, list):
+            return " ".join(str(c) for c in text if c)
+
+        return ""
+
     async def monitor_chat_context(self, session):
         """Periodically check chat context for new messages"""
         self._session = session
@@ -3165,24 +3607,18 @@ class TranscriptCollector:
                 if not ctx:
                     continue
                 
-                logger.debug(f"Got chat_ctx: {type(ctx)}, items: {hasattr(ctx, 'items')}")
-                
                 messages = []
-                if hasattr(ctx, 'items'):
-                    messages = ctx.items
-                elif hasattr(ctx, 'messages'):
-                    messages = ctx.messages
+                try:
+                    if hasattr(ctx, 'messages'):
+                        messages = ctx.messages
+                        if callable(messages):
+                            messages = messages()
+                except Exception as e:
+                    logger.debug(f"Error reading messages: {e}")
                 
                 for msg in messages:
-                    role = getattr(msg, 'role', '')
-                    content = ''
-                    if hasattr(msg, 'content'):
-                        if isinstance(msg.content, str):
-                            content = msg.content
-                        elif isinstance(msg.content, list):
-                            content = ' '.join(str(c) for c in msg.content if c)
-                    elif hasattr(msg, 'text'):
-                        content = msg.text
+                    role = self._resolve_message_attr(msg, 'role') or ''
+                    content = self._extract_message_text(msg)
                     
                     if not content or role == 'system':
                         continue
@@ -3227,6 +3663,7 @@ async def entrypoint(ctx: JobContext):
     direction = "outbound"
     from_number = None
     to_number = None
+    sip_trunk_id = None
     dispatch_name_hint = None
 
     try:
@@ -3268,7 +3705,8 @@ async def entrypoint(ctx: JobContext):
         sip_participant = await wait_for_inbound_sip_participant(ctx.room)
         if sip_participant:
             from_number, to_number = get_sip_phone_numbers(sip_participant)
-            logger.info(f"Inbound from: {from_number} to: {to_number}")
+            sip_trunk_id = get_sip_trunk_id(sip_participant)
+            logger.info(f"Inbound from: {from_number} to: {to_number} (trunk_id={sip_trunk_id})")
 
             # Try to find agent by phone number - try both to_number and from_number
             if to_number:
@@ -3328,6 +3766,8 @@ async def entrypoint(ctx: JobContext):
         direction=direction,
         from_number=from_number,
         to_number=to_number,
+        sip_trunk_id=sip_trunk_id,
+        dispatch_name_hint=dispatch_name_hint,
     )
     if resolved_agent_id and resolved_agent_id != agent_id:
         logger.info(
@@ -3370,6 +3810,11 @@ async def entrypoint(ctx: JobContext):
     functions = merge_builtin_functions_into_runtime(functions, config)
     logger.info(f"Agent: {config.get('name')}, Functions: {len(functions)}")
 
+    transfer_guidance = build_transfer_instructions(functions)
+    if transfer_guidance:
+        sys_prompt = f"{sys_prompt}\n\n{transfer_guidance}"
+        logger.info("Appended transfer instructions to system prompt (length now %d)", len(sys_prompt))
+
     is_phone_call = bool(
         from_number
         or to_number
@@ -3386,10 +3831,7 @@ async def entrypoint(ctx: JobContext):
     if tts_provider == "elevenlabs":
         selected_voice = ELEVENLABS_VOICE_MAP.get(selected_voice.lower(), selected_voice)
     elif tts_provider == "xai":
-        selected_voice = str(selected_voice or "eve").strip().lower() or "eve"
-        if selected_voice not in XAI_VOICE_IDS:
-            logger.warning("Unsupported xAI voice '%s'; falling back to eve", selected_voice)
-            selected_voice = "eve"
+        selected_voice = normalize_xai_voice_id(selected_voice)
     selected_tts_model = (
         config.get("tts_model")
         or (config.get("custom_params") or {}).get("tts_model")
@@ -3710,25 +4152,7 @@ async def entrypoint(ctx: JobContext):
     initial_greeting_lock = asyncio.Lock()
     initial_greeting_task: Optional[asyncio.Task] = None
 
-    @session.on("metrics_collected")
-    def on_metrics_collected(event):
-        try:
-            for metric in event.metrics:
-                if hasattr(metric, 'type') and 'llm' in str(metric.type).lower():
-                    if hasattr(metric, 'tokens'):
-                        usage.llm_tokens_in = getattr(metric, 'tokens_input', 0) or 0
-                        usage.llm_tokens_out = getattr(metric, 'tokens_output', 0) or 0
-                        logger.info(f"[metrics] LLM tokens: {usage.llm_tokens_in}/{usage.llm_tokens_out}")
-                if hasattr(metric, 'type') and 'tts' in str(metric.type).lower():
-                    if hasattr(metric, 'characters'):
-                        usage.tts_characters = getattr(metric, 'characters', 0) or 0
-                        logger.info(f"[metrics] TTS chars: {usage.tts_characters}")
-                if hasattr(metric, 'type') and 'stt' in str(metric.type).lower():
-                    if hasattr(metric, 'duration'):
-                        usage.stt_duration_ms = int((getattr(metric, 'duration', 0) or 0) * 1000)
-                        logger.info(f"[metrics] STT duration: {usage.stt_duration_ms}ms")
-        except Exception as e:
-            logger.debug(f"Error in metrics_collected: {e}")
+
 
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
@@ -3738,111 +4162,30 @@ async def entrypoint(ctx: JobContext):
             item = event.item
             if not item:
                 return
-            role = getattr(item, 'role', '')
-            content = ''
-            if hasattr(item, 'content'):
-                if isinstance(item.content, str):
-                    content = item.content
-                elif isinstance(item.content, list):
-                    content = ' '.join(str(c) for c in item.content if c)
-            elif hasattr(item, 'text'):
-                content = item.text
+            role = TranscriptCollector._resolve_message_attr(item, 'role') or ''
+            content = TranscriptCollector._extract_message_text(item)
             if not content or role == 'system':
                 return
+                
             if role == 'user':
                 has_user_spoken = True
                 last_activity_ts = time.time()
-                word_count = len(content.split())
-                est_duration = int((word_count / 150.0) * 60 * 1000)
+                word_count = max(1, len(content.split()))
+                est_duration = max(700, int((word_count / 2.5) * 1000))
                 usage.add_stt_duration(est_duration)
-                usage.add_llm_usage(tokens_in=len(content) // 4, model=runtime_llm_model)
+                usage.add_llm_usage(tokens_in=max(1, len(content) // 4), model=runtime_llm_model)
                 usage.add_transcript("user", content)
                 asyncio.ensure_future(send_transcript_to_api(call_id, "user", content))
-                try:
-                    asyncio.ensure_future(
-                        ctx.room.local_participant.publish_data(
-                            json.dumps({"type": "transcript", "role": "user", "text": content}),
-                            topic="room",
-                        )
-                    )
-                except Exception as publish_err:
-                    logger.debug(f"Failed to publish user transcript event: {publish_err}")
                 logger.info(f"[transcript] User: {content[:60]}...")
             elif role == 'assistant':
                 last_activity_ts = time.time()
                 usage.add_tts_characters(len(content))
-                usage.add_llm_usage(tokens_out=len(content) // 4, model=runtime_llm_model)
+                usage.add_llm_usage(tokens_out=max(1, len(content) // 4), model=runtime_llm_model)
                 usage.add_transcript("agent", content)
                 asyncio.ensure_future(send_transcript_to_api(call_id, "agent", content))
-                try:
-                    asyncio.ensure_future(
-                        ctx.room.local_participant.publish_data(
-                            json.dumps({"type": "transcript", "role": "agent", "text": content}),
-                            topic="room",
-                        )
-                    )
-                except Exception as publish_err:
-                    logger.debug(f"Failed to publish agent transcript event: {publish_err}")
                 logger.info(f"[transcript] Agent: {content[:60]}...")
-
-                # FALLBACK: If xAI model roleplays a transfer but fails to call the tool natively
-                if not getattr(agent, "_transfer_in_progress", False):
-                    content_lower = content.lower()
-                    if "transferring you" in content_lower or "transfer you" in content_lower or "get you straight to" in content_lower:
-                        target_tool = None
-                        if "sale" in content_lower or "buy" in content_lower:
-                            target_tool = "selling_agent_transfer" if "sale" in content_lower else "buying_agent_transfer"
-                        elif "mainten" in content_lower or "repair" in content_lower:
-                            target_tool = "maintenance_agent_transfer"
-                        elif "letting" in content_lower or "rent" in content_lower:
-                            target_tool = "renting_agent_transfer"
-                            
-                        if target_tool:
-                            logger.warning(f"FALLBACK: Agent roleplayed transfer to {target_tool}. Forcing manual swap.")
-                            setattr(agent, "_transfer_in_progress", True)
-                            
-                            async def _force_swap():
-                                try:
-                                    target_payload = next((f for f in getattr(agent, "functions_config", []) if _normalize_tool_name(f.get("name", "")) == target_tool), None)
-                                    if not target_payload:
-                                        logger.warning("FALLBACK failed: Could not find target tool payload.")
-                                        return
-                                        
-                                    new_agent = await perform_agent_transfer_handoff(
-                                        agent,
-                                        target_tool,
-                                        target_payload,
-                                        "realtime" if getattr(agent, "tts", None) is None else "turn"
-                                    )
-                                    
-                                    participant = detect_primary_sip_participant(ctx.room)
-                                    if not participant and ctx.room.remote_participants:
-                                        participant = list(ctx.room.remote_participants.values())[0]
-                                        
-                                    if participant:
-                                        # Force the session to recognize the new agent.
-                                        # In v1.5.2, updating the session's agent reference is the primary way to swap.
-                                        if hasattr(session, "update_agent"):
-                                            await session.update_agent(new_agent)
-                                        elif hasattr(agent, "_runtime_session") and hasattr(agent._runtime_session, "update_agent"):
-                                            await agent._runtime_session.update_agent(new_agent)
-                                        else:
-                                            # Last resort: try to replace the internal reference
-                                            logger.warning("AgentSession.update_agent not found; attempting direct reference swap.")
-                                            if hasattr(agent, "_runtime_session"):
-                                                agent._runtime_session.agent = new_agent
-                                        
-                                        logger.info("FALLBACK: Manual agent swap complete.")
-                                        
-                                        # Manually disconnect the old agent to free the mic
-                                        await asyncio.sleep(0.5)
-                                        if hasattr(agent, "_activity") and agent._activity:
-                                            agent._activity.cancel()
-                                            
-                                except Exception as e:
-                                    logger.error(f"FALLBACK swap failed: {e}")
-                                    
-                            asyncio.create_task(_force_swap())
+                if hasattr(agent, "_schedule_spoken_transfer_fallback"):
+                    agent._schedule_spoken_transfer_fallback(content)
 
                 if getattr(agent, "_pending_end_call_after_speech", False) and not getattr(agent, "_end_call_handoff_started", False):
                     setattr(agent, "_pending_end_call_after_speech", False)
@@ -3865,7 +4208,9 @@ async def entrypoint(ctx: JobContext):
     def on_function_calls_collected(event):
         try:
             for fc in event.function_calls:
-                tool_name = fc.function.name
+                tool_name = _canonical_tool_name(fc.function.name)
+                if hasattr(agent, "_mark_tool_call_observed"):
+                    agent._mark_tool_call_observed(tool_name)
                 args_str = str(fc.function.arguments)
                 msg = f"[Calling tool: {tool_name}] {args_str}"
                 usage.add_transcript("tool_call", msg)
@@ -3878,7 +4223,7 @@ async def entrypoint(ctx: JobContext):
     def on_function_calls_finished(event):
         try:
             for fc in event.function_calls:
-                tool_name = fc.function.name
+                tool_name = _canonical_tool_name(fc.function.name)
                 output = fc.output if fc.output else str(fc.exception) if fc.exception else "no output"
                 msg = f"[Tool response: {tool_name}] {output}"
                 usage.add_transcript("tool_response", msg)
@@ -4004,14 +4349,14 @@ async def entrypoint(ctx: JobContext):
             if topic == "room":
                 data = json.loads(_decode_payload(payload))
                 if data.get("type") == "tool_call":
-                    tool_name = data.get("tool_name", "unknown")
+                    tool_name = _canonical_tool_name(data.get("tool_name", "unknown"))
                     args = data.get("args", {})
                     msg = f"[Tool invoked: {tool_name}] {json.dumps(args)}"
                     usage.add_transcript("tool_invocation", msg)
                     asyncio.ensure_future(send_transcript_to_api(call_id, "tool_invocation", msg))
                     logger.info(f"[transcript] Tool invoked: {tool_name}")
                 elif data.get("type") == "tool_response":
-                    tool_name = data.get("tool_name", "unknown")
+                    tool_name = _canonical_tool_name(data.get("tool_name", "unknown"))
                     response = data.get("response", {})
                     msg = f"[Tool result: {tool_name}] {json.dumps(response)}"
                     usage.add_transcript("tool_result", msg)
@@ -4241,6 +4586,7 @@ async def entrypoint(ctx: JobContext):
         # ALWAYS send usage, even on crash/disconnect
         logger.info(f"Sending final usage for {call_id}: LLM={usage.llm_tokens_in}/{usage.llm_tokens_out}, STT={usage.stt_duration_ms}ms, TTS={usage.tts_characters}chars")
         if call_id:
+            await backfill_missing_transcripts(call_id, usage)
             await send_usage_to_api(call_id, usage)
             await end_call_record(call_id)
         _active_call_id = None
@@ -4253,5 +4599,5 @@ if __name__ == "__main__":
     cli.run_app(WorkerOptions(
         entrypoint_fnc=entrypoint,
         prewarm_fnc=prewarm,
-        agent_name="sarah"
+        agent_name=DEFAULT_WORKER_DISPATCH_NAME
     ))
