@@ -1802,7 +1802,11 @@ def build_effective_runtime_prompt(
 def _normalize_phone(value: Optional[str]) -> str:
     if not value:
         return ""
-    return re.sub(r"\s+", "", str(value).strip())
+    # Remove everything except digits and +
+    val_str = str(value).strip()
+    is_plus = val_str.startswith("+")
+    digits = re.sub(r"\D", "", val_str)
+    return f"+{digits}" if is_plus else digits
 
 
 def _is_missing_tool_value(value: Any) -> bool:
@@ -2108,7 +2112,6 @@ async def resolve_transfer_outbound_trunk_id(
                 ("sip_trunk_phone_number", sip_attrs.get("sip.trunkPhoneNumber")),
                 ("resolved_called_number", metadata.get("resolved_called_number")),
                 ("call_to_number", call_data.get("to_number")),
-                ("call_from_number", call_data.get("from_number")),
             ):
                 normalized_value = _normalize_phone(raw_value)
                 if normalized_value and normalized_value not in seen_numbers:
@@ -2248,16 +2251,16 @@ async def start_sip_transfer(
             # (~15s). That kills ringing to international numbers before they can
             # answer. Instead we let the dial run asynchronously and detect answer
             # via the room-participant polling + wait_for_transfer_established below.
-            await lk_api.sip.create_sip_participant(
-                livekit_api.CreateSIPParticipantRequest(
-                    sip_trunk_id=trunk_id,
-                    sip_call_to=phone_number,
-                    room_name=room_name,
-                    participant_identity=participant_identity,
-                    play_ringtone=True,
-                    wait_until_answered=False,
-                )
+            req = livekit_api.CreateSIPParticipantRequest(
+                sip_trunk_id=trunk_id,
+                sip_call_to=phone_number,
+                room_name=room_name,
+                participant_identity=participant_identity,
+                play_ringtone=True,
+                wait_until_answered=False,
             )
+            logger.info(f"!!! SENDING SIP REQUEST: {{req}}")
+            await lk_api.sip.create_sip_participant(req)
 
             if room:
                 joined = False
@@ -2352,26 +2355,9 @@ async def run_transfer_handoff(
     if delay_sec > 0:
         await asyncio.sleep(delay_sec)
 
-    sip_participant = detect_primary_sip_participant(room)
-    if sip_participant:
-        transfer_result = await transfer_room_sip_participant(room, target_phone)
-        if transfer_result.get("success"):
-            transfer_result["agent_removed"] = {
-                "success": True,
-                "skipped": True,
-                "reason": "sip_refer_transfer",
-            }
-            # Even with REFER, we should try to remove the agent from the room 
-            # to prevent it from continuing to talk to an empty room.
-            try:
-                agent_identity = (getattr(room.local_participant, "identity", "") or "").strip()
-                if agent_identity:
-                    await remove_room_participant(room.name, agent_identity)
-            except Exception as cleanup_exc:
-                logger.warning(f"Failed to remove agent after SIP REFER: {cleanup_exc}")
-            return transfer_result
-        else:
-            logger.warning(f"SIP REFER transfer failed: {transfer_result.get('error')}. Falling back to bridged transfer.")
+    # Force bridged transfer (fresh call leg) per user request
+    # This ensures the transfer is handled as a fresh outbound call rather than a SIP REFER swap.
+    pass
     
     # Fallback or primary: start a new SIP leg and bridge
     transfer_result = await start_sip_transfer(room.name, target_phone, call_id, room)
@@ -3085,45 +3071,43 @@ class DynamicPropertyAgent(Agent):
                 sys_cfg = {{}}
 
         vars_cfg = func_cfg.get("variables") or {{}}
+        self._mark_tool_call_observed(normalized_name)
+        logger.info(f"!!! DEBUG: PSTN Transfer Config: {{func_cfg}}")
         target_phone = (
             str(sys_cfg.get("phone_number") or "").strip()
             or str(vars_cfg.get("__transfer_phone__") or "").strip()
             or str(func_cfg.get("phone_number") or "").strip()
             or str(payload.get("phone_number") or "").strip()
         )
+        
+        # If no phone number, but we have a target_agent_id, resolve the agent's phone number
+        if not target_phone:
+            target_agent_id = sys_cfg.get("target_agent_id") or func_cfg.get("target_agent_id")
+            if target_agent_id:
+                logger.info(f"Resolving phone number for target agent {{target_agent_id}} for fresh PSTN transfer")
+                try:
+                    agent_info = await fetch_agent_config(target_agent_id)
+                    target_phone = str(agent_info.get("phone_number") or "").strip()
+                    if target_phone:
+                        # Ensure E.164 format for PSTN dialing
+                        if target_phone.isdigit() and not target_phone.startswith("+"):
+                            target_phone = f"+{{target_phone}}"
+                        elif target_phone.startswith("0") and not target_phone.startswith("+"):
+                            # Assuming UK default if leading zero, can be adjusted
+                            pass 
+                        logger.info(f"Resolved agent {{target_agent_id}} to phone number {{target_phone}}")
+                except Exception as e:
+                    logger.error(f"Failed to resolve agent {{target_agent_id}} phone number: {{e}}")
 
-        self._mark_tool_call_observed(normalized_name)
-        logger.info(f"PSTN Transfer Triggered ({{normalized_name}}) -> {{target_phone}}")
-
-        if target_phone:
-            internal_agent = await fetch_agent_by_phone(target_phone)
-            internal_agent_id = None
-            if internal_agent:
-                internal_agent_id = internal_agent.get("agent_id") or internal_agent.get("id")
+        if target_phone and target_phone.isdigit() and not target_phone.startswith("+"):
+            target_phone = f"+{{target_phone}}"
             
-            if internal_agent_id:
-                logger.info(f"Target phone {{target_phone}} maps to internal agent {{internal_agent_id}}. Upgrading PSTN transfer to seamless Agent Transfer.")
-                if isinstance(func_cfg.get("system_config"), str):
-                    try:
-                        import json
-                        func_cfg["system_config"] = json.loads(func_cfg["system_config"])
-                    except Exception:
-                        func_cfg["system_config"] = {{}}
-                if not isinstance(func_cfg.get("system_config"), dict):
-                    func_cfg["system_config"] = {{}}
-                
-                func_cfg["system_config"]["target_agent_id"] = str(internal_agent_id)
-                func_cfg["system_type"] = "agent_transfer"
-                self._mark_tool_call_observed(normalized_name)
-                return await perform_agent_transfer_handoff(
-                    self,
-                    normalized_name,
-                    func_cfg,
-                    "default"
-                )
+        self._mark_tool_call_observed(normalized_name)
+        logger.info(f"!!! PSTN TRANSFER INITIATED: Tool={{normalized_name}} Target={{target_phone}}")
 
         if not (
             system_type == "transfer_call"
+            or system_type == "agent_transfer"
             or url == "builtin://transfer_call"
             or normalized_name == "call_transfer"
             or str(func_cfg.get("variables", {{}})).find("__transfer_phone__") != -1
@@ -3361,7 +3345,7 @@ class DynamicPropertyAgent(Agent):
                     break
 
                 normalized_name = normalized_tool_name
-                if system_type == "transfer_call" or url == "builtin://transfer_call" or normalized_name == "call_transfer":
+                if system_type == "transfer_call" or system_type == "agent_transfer" or url == "builtin://transfer_call" or normalized_name == "call_transfer" or normalized_tool_name.endswith("_agent_transfer"):
                     result = await self._execute_configured_pstn_transfer(
                         func_cfg,
                         payload=payload,
@@ -3485,11 +3469,21 @@ def get_sip_phone_numbers(participant):
         )
         to_number = (
             attrs.get("sip.calledNumber")
-            or attrs.get("sip.phoneNumber")
             or attrs.get("sip.trunkPhoneNumber")
+            or attrs.get("sip.phoneNumber")
             or attrs.get("sip.localPhoneNumber")
-            or attrs.get("sip.to", "")
+            or attrs.get("sip.to")
+            or attrs.get("sip.header.To")
+            or attrs.get("sip.header.X-Twilio-To")
+            or attrs.get("sip.header.X-Forwarded-To")
+            or ""
         )
+        if not to_number:
+            # Search all attributes for anything that looks like a 'to' or 'called' number
+            for k, v in attrs.items():
+                if k.lower().endswith((".to", ".callednumber", ".phonenumber")):
+                    to_number = v
+                    break
     
     def normalize_phone(phone):
         if not phone:
@@ -3680,8 +3674,8 @@ async def entrypoint(ctx: JobContext):
             # Handle call__PHONE_... (inbound/transfer)
             elif len(parts) >= 3 and parts[1] == "" and parts[2].startswith("+"):
                 direction = "inbound"
-                to_number = parts[2]
-                logger.info(f"Inbound call detected from room name number: {to_number}")
+                from_number = parts[2]
+                logger.info(f"Inbound call detected from room name, from_number: {from_number}")
             else:
                 # Room like "call_sarah" from dispatch rule - treat as inbound.
                 direction = "inbound"
@@ -3720,8 +3714,11 @@ async def entrypoint(ctx: JobContext):
         phone_agent = None
         sip_participant = await wait_for_inbound_sip_participant(ctx.room)
         if sip_participant:
-            from_number, to_number = get_sip_phone_numbers(sip_participant)
+            logger.info(f"!!! DEBUG: SIP Participant Attributes: {getattr(sip_participant, 'attributes', {})}")
+            sip_from, sip_to = get_sip_phone_numbers(sip_participant)
             sip_trunk_id = get_sip_trunk_id(sip_participant)
+            from_number = sip_from or from_number
+            to_number = sip_to or to_number
             logger.info(f"Routing lookup: from={from_number}, to={to_number}, trunk={sip_trunk_id}")
 
             # Try to find agent by phone number - try both to_number and from_number
@@ -3731,11 +3728,10 @@ async def entrypoint(ctx: JobContext):
                 if phone_agent:
                     logger.info(f"Success! Found agent by to_number: agent_id={phone_agent.get('agent_id')}")
 
-            # If not found, try from_number
-            if not phone_agent and from_number:
-                phone_agent = await fetch_agent_by_phone(from_number)
-                if phone_agent:
-                    logger.info(f"Found agent by from_number {from_number}: agent_id={phone_agent.get('agent_id')}")
+            # If not found by to_number, we DO NOT fall back to from_number (the caller)
+            # as that would incorrectly match an agent to the person calling.
+            if not phone_agent:
+                logger.info("Agent not found by to_number; will use fallback logic.")
         else:
             logger.warning("Inbound call did not expose SIP participant metadata within wait window for room %s", ctx.room.name)
 
