@@ -2737,6 +2737,54 @@ def _paralyze_old_session(agent_obj: Any):
     except Exception as e:
         logger.warning(f"Failed to paralyze old session: {e}")
 
+async def play_ringing_tone(room: Any, duration_sec: float = 4.0):
+    """Plays a ringing sound file to the room for the specified duration."""
+    try:
+        import wave
+        import os
+        import time
+        import asyncio
+        from livekit import rtc
+        
+        file_path = "ringing.wav"
+        if not os.path.exists(file_path):
+            file_path = "/app/ringing.wav"
+            if not os.path.exists(file_path):
+                logger.warning("ringing.wav not found, skipping ringtone.")
+                return
+                
+        with wave.open(file_path, 'rb') as wf:
+            sample_rate = wf.getframerate()
+            channels = wf.getnchannels()
+            
+            source = rtc.AudioSource(sample_rate, channels)
+            track = rtc.LocalAudioTrack.create_audio_track("ringing_tone", source)
+            publication = await room.local_participant.publish_track(track)
+            
+            chunk_size = int(sample_rate / 100) # 10ms chunk
+            start_time = time.time()
+            
+            while time.time() - start_time < duration_sec:
+                frames = wf.readframes(chunk_size)
+                if not frames:
+                    wf.rewind()
+                    frames = wf.readframes(chunk_size)
+                if not frames:
+                    break
+                    
+                audio_frame = rtc.AudioFrame(
+                    data=frames,
+                    sample_rate=sample_rate,
+                    num_channels=channels,
+                    samples_per_channel=len(frames) // (2 * channels)
+                )
+                await source.capture_frame(audio_frame)
+                await asyncio.sleep(0.01)
+                
+            await room.local_participant.unpublish_track(publication.sid)
+    except Exception as e:
+        logger.error(f"Failed to play ringing tone: {e}")
+
 
 async def perform_agent_transfer_handoff(
     agent_obj: Any,
@@ -2891,6 +2939,9 @@ async def perform_agent_transfer_handoff(
         logger.warning("Could not instantiate fresh RealtimeModel for subagent; falling back to shared session: %s", llm_err)
 
     try:
+        # Play ringing tone to cover dead air during transfer
+        ringing_task = asyncio.create_task(play_ringing_tone(agent_obj.room, 4.0))
+        
         # Give the interruption a moment to settle before swapping agents.
         await asyncio.sleep(max(0.05, TRANSFER_HANDOFF_DELAY_SEC))
         
