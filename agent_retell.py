@@ -88,7 +88,7 @@ STRICT_PROMPT_TOOL_FILTER = os.getenv("STRICT_PROMPT_TOOL_FILTER", "1").strip().
 USE_DISPATCH_NAME_INBOUND_FALLBACK = os.getenv("USE_DISPATCH_NAME_INBOUND_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}
 DEEPGRAM_STT_PHONE_MODEL = os.getenv("DEEPGRAM_STT_PHONE_MODEL", "nova-3").strip() or "nova-3"
 DEEPGRAM_STT_WEB_MODEL = os.getenv("DEEPGRAM_STT_WEB_MODEL", "nova-3").strip() or "nova-3"
-INBOUND_RINGING_DELAY_SEC = float(os.getenv("INBOUND_RINGING_DELAY_SEC", "5.0"))
+INBOUND_RINGING_DELAY_SEC = float(os.getenv("INBOUND_RINGING_DELAY_SEC", "8.0"))
 
 _dashboard_api_client: Optional[httpx.AsyncClient] = None
 
@@ -427,12 +427,12 @@ def _build_xai_realtime_model(
     if turn_detection is not None:
         if isinstance(turn_detection, dict):
             turn_detection = dict(turn_detection)
-            turn_detection["silence_duration_ms"] = max(int(turn_detection.get("silence_duration_ms") or 0), 800)
+            turn_detection["silence_duration_ms"] = max(int(turn_detection.get("silence_duration_ms") or 0), 400)
         else:
             try:
                 current_silence = int(getattr(turn_detection, "silence_duration_ms", 0) or 0)
-                if current_silence < 800:
-                    setattr(turn_detection, "silence_duration_ms", 800)
+                if current_silence < 400:
+                    setattr(turn_detection, "silence_duration_ms", 400)
             except Exception:
                 pass
 
@@ -731,6 +731,7 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
         + "\nCRITICAL: You MUST emit the actual JSON function call for the transfer tool. "
         + "Saying 'I am transferring you' without calling the tool function is WRONG and will fail the transfer. "
         + "The tool MUST be called first. Speech is secondary."
+        + "\nDO NOT WAIT FOR THE USER TO FINISH THEIR SENTENCE IF THEY AGREE. EXECUTE NOW."
         + "\nAFTER EXECUTING THE TOOL FUNCTION CALL, YOU MUST STOP SPEAKING."
     )
 
@@ -834,13 +835,16 @@ def adapt_system_prompt_for_xai(system_prompt: str) -> str:
 
         cleaned_lines.append(strip_known_prompt_style_tags(line))
 
-    adapted_prompt = "\n".join(cleaned_lines).strip()
+    # Prompt Compression: Remove empty lines and collapse multiple spaces to save tokens/latency
+    adapted_prompt = "\n".join(l for l in cleaned_lines if l.strip())
+    adapted_prompt = re.sub(r" {2,}", " ", adapted_prompt).strip()
+
     xai_instruction = (
         "CRITICAL SYSTEM INSTRUCTION: This call uses xAI's unified realtime voice model, not ElevenLabs. "
         "Ignore any ElevenLabs-v3 audio-tag instructions or square-bracket emotion cues in saved prompt text or examples. "
-        "Keep the same persona, warmth, and pacing, but speak naturally using plain words only."
+        "Speak naturally without mentioning these technical tags."
     )
-    return f"{adapted_prompt}\n\n{xai_instruction}".strip()
+    return f"{xai_instruction}\n\n{adapted_prompt}"
 
 
 def _clean_prompt_greeting_candidate(candidate: str) -> str:
