@@ -49,7 +49,7 @@ DEFAULT_WORKER_DISPATCH_NAME = (
 MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "1800"))
 DEFAULT_TTS_PROVIDER = "deepgram"
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
-DEFAULT_XAI_REALTIME_MODEL = os.getenv("XAI_REALTIME_MODEL", "grok-voice-think-fast-1.0").strip() or "grok-voice-think-fast-1.0"
+DEFAULT_XAI_REALTIME_MODEL = os.getenv("XAI_REALTIME_MODEL", "grok-2-voice-2503").strip() or "grok-2-voice-2503"
 XAI_REALTIME_BASE_URL = os.getenv("XAI_REALTIME_BASE_URL", "https://api.x.ai/v1").strip() or "https://api.x.ai/v1"
 DEFAULT_AGENT_LLM_TEMPERATURE = 0.2
 DEFAULT_AGENT_VOICE_SPEED = 1.0
@@ -88,6 +88,7 @@ STRICT_PROMPT_TOOL_FILTER = os.getenv("STRICT_PROMPT_TOOL_FILTER", "1").strip().
 USE_DISPATCH_NAME_INBOUND_FALLBACK = os.getenv("USE_DISPATCH_NAME_INBOUND_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}
 DEEPGRAM_STT_PHONE_MODEL = os.getenv("DEEPGRAM_STT_PHONE_MODEL", "nova-3").strip() or "nova-3"
 DEEPGRAM_STT_WEB_MODEL = os.getenv("DEEPGRAM_STT_WEB_MODEL", "nova-3").strip() or "nova-3"
+INBOUND_RINGING_DELAY_SEC = float(os.getenv("INBOUND_RINGING_DELAY_SEC", "5.0"))
 
 _dashboard_api_client: Optional[httpx.AsyncClient] = None
 
@@ -438,16 +439,22 @@ def _build_xai_realtime_model(
     native_init_error = None
     if xai is not None and hasattr(xai, "realtime") and hasattr(xai.realtime, "RealtimeModel"):
         native_kwargs: Dict[str, Any] = {
+            "model": model_name,
             "api_key": xai_api_key,
             "voice": runtime_voice,
         }
+        # Only pass tool_choice / parallel_tool_calls when the constructor supports them
+        if _callable_supports_kwarg(xai.realtime.RealtimeModel, "tool_choice"):
+            native_kwargs["tool_choice"] = "auto"
+        if _callable_supports_kwarg(xai.realtime.RealtimeModel, "parallel_tool_calls"):
+            native_kwargs["parallel_tool_calls"] = True
         if XAI_REALTIME_BASE_URL:
             native_kwargs["base_url"] = XAI_REALTIME_BASE_URL
         if turn_detection is not None:
             native_kwargs["turn_detection"] = turn_detection
         try:
             logger.info(
-                "Instantiating xAI realtime model (native plugin) | Model: %s | Voice: %s",
+                "Instantiating xAI realtime model (native plugin) | Model: %s | Voice: %s | tool_choice=auto",
                 model_name,
                 runtime_voice,
             )
@@ -476,10 +483,12 @@ def _build_xai_realtime_model(
         "voice": runtime_voice,
         "modalities": ["audio"],
     }
+    # Only pass tool_choice when the OpenAI-compatible constructor supports it
+    if _callable_supports_kwarg(openai.realtime.RealtimeModel, "tool_choice"):
+        fallback_kwargs["tool_choice"] = "auto"
 
     try:
         from livekit.plugins.openai.realtime.models import AudioTranscription
-
         fallback_kwargs["input_audio_transcription"] = AudioTranscription(model="whisper-1")
     except Exception:
         pass
@@ -488,7 +497,7 @@ def _build_xai_realtime_model(
         fallback_kwargs["turn_detection"] = turn_detection
 
     logger.info(
-        "Instantiating xAI realtime model (OpenAI-compatible fallback) | Model: %s | Voice: %s",
+        "Instantiating xAI realtime model (OpenAI-compatible fallback) | Model: %s | Voice: %s | tool_choice=auto",
         model_name,
         runtime_voice,
     )
@@ -701,11 +710,17 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
             trigger = "If the caller asks to transfer, escalate, or speak to a human"
         else:
             trigger = "If the caller asks for another team/person or agrees to be transferred"
+        # Respect dashboard speak_during_execution setting for transfer tools
+        speak_during = bool(fn.get("speak_during_execution", True))
+        if speak_during:
+            speech_part = "While the tool executes, say 'I am transferring you now.' and then STOP SPEAKING. "
+        else:
+            speech_part = "Do NOT speak while the tool executes. Stay COMPLETELY SILENT during execution. "
         instructions.append(
-            f"{len(instructions)+1}. {trigger} -> DO NOT ask for permission or confirmation. -> "
-            f"First say exactly 'I am transferring you now.' -> "
-            f"immediately CALL `{tool_name}` TOOL -> STOP SPEAKING IMMEDIATELY. "
-            "Do not add any explanations, helpful tips, or goodbye messages after calling the tool."
+            f"{len(instructions)+1}. {trigger} -> "
+            f"IMMEDIATELY CALL `{tool_name}` TOOL (emit the JSON function call) WITHOUT asking for confirmation. "
+            f"{speech_part}"
+            "Do not add any explanations, helpful tips, or goodbye messages."
         )
     if not instructions:
         return ""
@@ -713,7 +728,9 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
         "\nTRANSFER RULES — FOLLOW STRICTLY:\n"
         + "\n".join(instructions)
         + "\nDO NOT ask the user if they want to be transferred if they have already requested it or agreed to it. "
-        + "\nCRITICAL SYSTEM INSTRUCTION: You MUST execute the ACTUAL JSON function call for the transfer tool. DO NOT simply say 'I am transferring you' and stop. You MUST trigger the tool itself. "
+        + "\nCRITICAL: You MUST emit the actual JSON function call for the transfer tool. "
+        + "Saying 'I am transferring you' without calling the tool function is WRONG and will fail the transfer. "
+        + "The tool MUST be called first. Speech is secondary."
         + "\nAFTER EXECUTING THE TOOL FUNCTION CALL, YOU MUST STOP SPEAKING."
     )
 
@@ -1543,7 +1560,9 @@ async def fetch_agent_config(agent_id):
 
 
 async def fetch_agent_by_phone(phone_number):
-    url = f"{DASHBOARD_API_URL}/api/agents/by-phone/{phone_number}"
+    import urllib.parse
+    safe_phone = urllib.parse.quote(str(phone_number or "").strip())
+    url = f"{DASHBOARD_API_URL}/api/agents/by-phone/{safe_phone}"
     try:
         resp = await get_dashboard_api_client().get(url, timeout=5.0)
         if resp.status_code == 200:
@@ -2276,20 +2295,8 @@ async def start_sip_transfer(
                         "participant_identity": participant_identity,
                     }
 
-                # Give international numbers (e.g. India) up to 45 s to answer.
-                established = await wait_for_transfer_established(room, participant_identity, timeout_sec=45.0)
-                if not established.get("ready"):
-                    return {
-                        "success": True,
-                        "action": "transfer_call",
-                        "phone_number": phone_number,
-                        "status": "dialing",
-                        "trunk_id": trunk_id,
-                        "trunk_source": trunk_source,
-                        "participant_identity": participant_identity,
-                        "transfer_established": False,
-                        "establishment_reason": established.get("reason") or "pending",
-                    }
+                # Return immediately so the current agent disconnects and the caller
+                # hears ringing while the transfer connects in the background.
 
             return {
                 "success": True,
@@ -2994,7 +3001,6 @@ class DynamicPropertyAgent(Agent):
         self._transfer_in_progress = False
         self._agent_transfer_in_progress = False
         self._recent_tool_call_times = {{}}
-        self._pending_transfer_fallback_tasks = {{}}
         self._last_transfer_request_ts = 0.0
         self._last_transfer_target = ""
         self._pending_end_call_after_speech = False
@@ -3005,11 +3011,6 @@ class DynamicPropertyAgent(Agent):
         if not normalized:
             return
         self._recent_tool_call_times[normalized] = time.time()
-        pending = self._pending_transfer_fallback_tasks.get(normalized, None)
-        if pending and not pending.done():
-            if pending != asyncio.current_task():
-                pending.cancel()
-            self._pending_transfer_fallback_tasks.pop(normalized, None)
 
     def _get_function_cfg(self, tool_name):
         normalized = _canonical_tool_name(tool_name)
@@ -3043,9 +3044,37 @@ class DynamicPropertyAgent(Agent):
         self._mark_tool_call_observed(normalized_name)
         logger.info(f"PSTN Transfer Triggered ({{normalized_name}}) -> {{target_phone}}")
 
+        if target_phone:
+            internal_agent = await fetch_agent_by_phone(target_phone)
+            internal_agent_id = None
+            if internal_agent:
+                internal_agent_id = internal_agent.get("agent_id") or internal_agent.get("id")
+            
+            if internal_agent_id:
+                logger.info(f"Target phone {{target_phone}} maps to internal agent {{internal_agent_id}}. Upgrading PSTN transfer to seamless Agent Transfer.")
+                if isinstance(func_cfg.get("system_config"), str):
+                    try:
+                        import json
+                        func_cfg["system_config"] = json.loads(func_cfg["system_config"])
+                    except Exception:
+                        func_cfg["system_config"] = {{}}
+                if not isinstance(func_cfg.get("system_config"), dict):
+                    func_cfg["system_config"] = {{}}
+                
+                func_cfg["system_config"]["target_agent_id"] = str(internal_agent_id)
+                func_cfg["system_type"] = "agent_transfer"
+                self._mark_tool_call_observed(normalized_name)
+                return await perform_agent_transfer_handoff(
+                    self,
+                    normalized_name,
+                    func_cfg,
+                    "default"
+                )
+
         if not (
             system_type == "transfer_call"
             or url == "builtin://transfer_call"
+            or normalized_name == "call_transfer"
             or str(func_cfg.get("variables", {{}})).find("__transfer_phone__") != -1
         ):
             return {{"success": False, "error": "Function is not configured as a PSTN transfer"}}
@@ -3153,104 +3182,6 @@ class DynamicPropertyAgent(Agent):
             return generic_transfer_tool
         return ""
 
-    def _schedule_spoken_transfer_fallback(self, content):
-        tool_name = self._match_spoken_transfer_tool(content)
-        normalized_tool_name = _canonical_tool_name(tool_name)
-        if not normalized_tool_name:
-            return
-        if (
-            self._last_transfer_target
-            and (time.time() - float(self._last_transfer_request_ts or 0.0)) < TRANSFER_DUPLICATE_SUPPRESS_SEC
-        ):
-            return
-        existing = self._pending_transfer_fallback_tasks.get(normalized_tool_name)
-        if existing and not existing.done():
-            return
-
-        async def _runner():
-            try:
-                await asyncio.sleep(0.35)
-                if self._transfer_in_progress or self._agent_transfer_in_progress:
-                    return
-                last_seen = float(self._recent_tool_call_times.get(normalized_tool_name, 0.0) or 0.0)
-                if last_seen and (time.time() - last_seen) < 1.0:
-                    return
-
-                func_cfg = self._get_function_cfg(normalized_tool_name)
-                if not func_cfg:
-                    return
-
-                # Immediately silence the agent before the actual handoff so it
-                # stops producing bleed-through speech while the transfer executes.
-                _paralyze_old_session(self)
-                if hasattr(self, "interrupt"):
-                    self.interrupt()
-
-                logger.warning(
-                    "Transfer speech detected without tool call; forcing fallback for %s",
-                    normalized_tool_name,
-                )
-                fallback_payload = {{"trigger": "spoken_transfer_fallback"}}
-                if hasattr(self, "call_id") and self.call_id:
-                    try:
-                        msg = f"[Calling tool: {{normalized_tool_name}}] {{json.dumps(fallback_payload)}}"
-                        asyncio.ensure_future(send_transcript_to_api(self.call_id, "tool_call", msg))
-                    except Exception:
-                        pass
-                if self.room:
-                    try:
-                        asyncio.ensure_future(self.room.local_participant.publish_data(
-                            json.dumps({{"type": "tool_call", "tool_name": normalized_tool_name, "args": fallback_payload, "speech_mode": "default"}}),
-                            topic="room"
-                        ))
-                    except Exception as publish_exc:
-                        logger.error(f"Failed to publish spoken transfer fallback tool_call event: {{publish_exc}}")
-                system_type = _normalize_tool_name(func_cfg.get("system_type", ""))
-                url = str(func_cfg.get("url", "")).strip()
-                if (
-                    system_type == "transfer_call"
-                    or url == "builtin://transfer_call"
-                    or str(func_cfg.get("variables", {{}})).find("__transfer_phone__") != -1
-                ):
-                    result = await self._execute_configured_pstn_transfer(
-                        func_cfg,
-                        tool_name=normalized_tool_name,
-                    )
-                else:
-                    self._mark_tool_call_observed(normalized_tool_name)
-                    result = await perform_agent_transfer_handoff(
-                        self,
-                        normalized_tool_name,
-                        func_cfg,
-                        "default",
-                    )
-                if hasattr(self, "call_id") and self.call_id:
-                    try:
-                        msg = f"[Tool response: {{normalized_tool_name}}] {{json.dumps(result)}}"
-                        asyncio.ensure_future(send_transcript_to_api(self.call_id, "tool_response", msg))
-                    except Exception:
-                        pass
-                if self.room:
-                    try:
-                        asyncio.ensure_future(self.room.local_participant.publish_data(
-                            json.dumps({{"type": "tool_response", "tool_name": normalized_tool_name, "response": result}}),
-                            topic="room"
-                        ))
-                    except Exception as publish_exc:
-                        logger.error(f"Failed to publish spoken transfer fallback tool_response event: {{publish_exc}}")
-                logger.info("Forced transfer fallback result (%s): %s", normalized_tool_name, result)
-            except asyncio.CancelledError:
-                pass
-            except Exception as fallback_exc:
-                logger.error(
-                    "Forced transfer fallback failed for %s: %s",
-                    normalized_tool_name,
-                    fallback_exc,
-                )
-            finally:
-                self._pending_transfer_fallback_tasks.pop(normalized_tool_name, None)
-
-        self._pending_transfer_fallback_tasks[normalized_tool_name] = asyncio.create_task(_runner())
 {on_enter_method}"""
 
     for func in functions_config:
@@ -3265,19 +3196,24 @@ class DynamicPropertyAgent(Agent):
             fallback_after=True,
         )
         speech_mode = "during" if speak_during else "after" if speak_after else "default"
-        # Transfer tools: never speak after execution to prevent double-talk
+        # Transfer tools: honour dashboard speak_during flag; never speak after.
         if _is_transfer_tool(func):
             speak_after = False
-            speech_mode = "default"
+            speech_mode = "during" if speak_during else "default"
             desc = func.get('description', '').strip().replace('"', "'").replace('\n', ' ')
-            desc = f"{desc} IMPORTANT: First say 'I am transferring you now', THEN call this tool immediately."
+            if speak_during:
+                desc = f"{desc} CRITICAL: CALL THIS TOOL IMMEDIATELY — do NOT ask for confirmation. Say 'I am transferring you now' simultaneously while the tool executes. You MUST emit the JSON function call for this tool."
+            else:
+                desc = f"{desc} CRITICAL: CALL THIS TOOL IMMEDIATELY — do NOT ask for confirmation. Do NOT speak while the tool executes. You MUST emit the JSON function call for this tool."
         else:
-            speech_hint = (
-                "Before calling this tool, first tell the caller what you are doing; then share a concise result."
-                if speak_during
-                else "Call this tool first, then explain the result after it finishes."
-            )
-            desc = f"{func.get('description', '').strip()} {speech_hint}".strip().replace('"', "'").replace('\n', ' ')
+            if speak_during:
+                speech_hint = "Before calling this tool, first tell the caller what you are doing; then share a concise result."
+            elif speak_after:
+                speech_hint = "Call this tool silently first, then explain the result after it finishes. Do NOT speak while the tool is executing."
+            else:
+                speech_hint = ""
+            raw_desc = func.get('description', '').strip()
+            desc = f"{raw_desc} {speech_hint}".strip().replace('"', "'").replace('\n', ' ')
 
         variables = func.get("variables", {})
         if not variables:
@@ -3374,7 +3310,7 @@ class DynamicPropertyAgent(Agent):
                     break
 
                 normalized_name = normalized_tool_name
-                if system_type == "transfer_call" or url == "builtin://transfer_call" or str(func_cfg.get("variables", {{}})).find("__transfer_phone__") != -1:
+                if system_type == "transfer_call" or url == "builtin://transfer_call" or normalized_name == "call_transfer":
                     result = await self._execute_configured_pstn_transfer(
                         func_cfg,
                         payload=payload,
@@ -3491,11 +3427,16 @@ def get_sip_phone_numbers(participant):
     to_number = None
     if hasattr(participant, 'attributes') and participant.attributes:
         attrs = participant.attributes
-        from_number = attrs.get("sip.callerNumber") or attrs.get("sip.from", "")
+        from_number = (
+            attrs.get("sip.callerNumber") 
+            or attrs.get("sip.remotePhoneNumber")
+            or attrs.get("sip.from", "")
+        )
         to_number = (
             attrs.get("sip.calledNumber")
             or attrs.get("sip.phoneNumber")
             or attrs.get("sip.trunkPhoneNumber")
+            or attrs.get("sip.localPhoneNumber")
             or attrs.get("sip.to", "")
         )
     
@@ -3677,6 +3618,7 @@ async def entrypoint(ctx: JobContext):
 
         if room_name.startswith("call_"):
             parts = room_name.split("_")
+            # Handle call_AGENTID_... (outbound)
             if len(parts) >= 3 and parts[1].isdigit():
                 try:
                     agent_id = int(parts[1])
@@ -3684,6 +3626,11 @@ async def entrypoint(ctx: JobContext):
                     logger.info(f"Web/outbound call for agent_id: {agent_id}")
                 except:
                     agent_id = 5
+            # Handle call__PHONE_... (inbound/transfer)
+            elif len(parts) >= 3 and parts[1] == "" and parts[2].startswith("+"):
+                direction = "inbound"
+                to_number = parts[2]
+                logger.info(f"Inbound call detected from room name number: {to_number}")
             else:
                 # Room like "call_sarah" from dispatch rule - treat as inbound.
                 direction = "inbound"
@@ -3703,6 +3650,19 @@ async def entrypoint(ctx: JobContext):
     except Exception as e:
         logger.error(f"Error parsing room name: {e}")
 
+
+    # CRITICAL: Deployment Verification Log
+    logger.info(f"!!! CRITICAL: AGENT STARTING - DELAY={INBOUND_RINGING_DELAY_SEC}s - ROOM={room_name}")
+
+    # Apply natural ringing delay ONLY for INBOUND phone calls
+    # Outbound calls must connect immediately with zero delay.
+    is_likely_phone = room_name.startswith(("call_", "sip-", "call-"))
+    if is_likely_phone and direction == "inbound" and INBOUND_RINGING_DELAY_SEC > 0:
+        logger.info(f"Simulating ringing delay for {INBOUND_RINGING_DELAY_SEC}s (Direction: {direction})...")
+        await asyncio.sleep(INBOUND_RINGING_DELAY_SEC)
+    elif is_likely_phone and direction == "outbound":
+        logger.info(f"Outbound call — skipping ringing delay (Direction: {direction})")
+
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     if direction == "inbound":
@@ -3711,13 +3671,14 @@ async def entrypoint(ctx: JobContext):
         if sip_participant:
             from_number, to_number = get_sip_phone_numbers(sip_participant)
             sip_trunk_id = get_sip_trunk_id(sip_participant)
-            logger.info(f"Inbound from: {from_number} to: {to_number} (trunk_id={sip_trunk_id})")
+            logger.info(f"Routing lookup: from={from_number}, to={to_number}, trunk={sip_trunk_id}")
 
             # Try to find agent by phone number - try both to_number and from_number
             if to_number:
+                logger.info(f"Looking up agent by to_number: {to_number}")
                 phone_agent = await fetch_agent_by_phone(to_number)
                 if phone_agent:
-                    logger.info(f"Found agent by to_number {to_number}: agent_id={phone_agent.get('agent_id')}")
+                    logger.info(f"Success! Found agent by to_number: agent_id={phone_agent.get('agent_id')}")
 
             # If not found, try from_number
             if not phone_agent and from_number:
@@ -3813,7 +3774,7 @@ async def entrypoint(ctx: JobContext):
     custom_params = config.get("custom_params", {}) or {}
 
     functions = merge_builtin_functions_into_runtime(functions, config)
-    logger.info(f"Agent: {config.get('name')}, Functions: {len(functions)}")
+    logger.info(f"Loaded Agent: {config.get('name')} (ID: {agent_id}), Functions: {len(functions)}")
 
     # transfer guidance is already appended to sys_prompt inside build_effective_runtime_prompt
 
@@ -4186,9 +4147,8 @@ async def entrypoint(ctx: JobContext):
                 usage.add_transcript("agent", content)
                 asyncio.ensure_future(send_transcript_to_api(call_id, "agent", content))
                 logger.info(f"[transcript] Agent: {content[:60]}...")
-                # We removed the spoken transfer fallback so the agent relies on native tool calling.
-                # if hasattr(agent, "_schedule_spoken_transfer_fallback"):
-                #     agent._schedule_spoken_transfer_fallback(content)
+                # Spoken transfer fallback was removed completely to prevent double transfers
+                pass
 
                 if getattr(agent, "_pending_end_call_after_speech", False) and not getattr(agent, "_end_call_handoff_started", False):
                     setattr(agent, "_pending_end_call_after_speech", False)

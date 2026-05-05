@@ -1990,24 +1990,7 @@ export default function AgentDetailPage() {
                                     </div>
                                 </button>
 
-                                <button
-                                    onClick={() => {
-                                        setShowFunctionSelector(false);
-                                        setSelectedCallTransferFunction(null);
-                                        setShowCallTransferModal(true);
-                                    }}
-                                    className="w-full text-left p-3 rounded-lg border border-green-200 bg-green-50 hover:bg-green-100 transition-colors"
-                                >
-                                    <div className="flex items-center gap-3">
-                                        <div className="w-8 h-8 rounded-full bg-green-500 flex items-center justify-center">
-                                            <PhoneForwarded className="h-4 w-4 text-white" />
-                                        </div>
-                                        <div>
-                                            <p className="text-sm font-medium text-gray-900">Call Transfer</p>
-                                            <p className="text-xs text-gray-500">Create a named PSTN handoff tool to external numbers</p>
-                                        </div>
-                                    </div>
-                                </button>
+
 
                                 {/* Custom Function Option */}
                                 <button

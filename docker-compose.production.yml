@@ -54,6 +54,7 @@ services:
       - "50000-50100:50000-50100/udp"
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml
+      - ./livekit-company-key.pem:/etc/livekit-company-key.pem:ro
       - recordings:/var/lib/livekit/recordings
     command: --config /etc/livekit.yaml --node-ip=13.135.81.172
     networks:
