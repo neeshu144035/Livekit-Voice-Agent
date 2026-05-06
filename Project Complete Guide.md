@@ -18,6 +18,7 @@
 15. [Truly Direct Greeting & Ultra-Low Latency (April 30, 2026)](#truly-direct-greeting-ultra-low-latency-april-30-2026)
 16. [xAI Plugin Bypass & Modality Optimization (April 30, 2026 - Night Update)](#xai-plugin-bypass--modality-optimization-april-30-2026---night-update)
 17. [Final Agent Transfer & Greeting Resolution (April 30, 2026 - Final)](#final-agent-transfer--greeting-resolution-april-30-2026---final)
+18. [Safety & Stability Guardrails (May 2026)](#safety--stability-guardrails-may-2026)
 
 ---
 
@@ -1238,6 +1239,34 @@ Initial greetings via `generate_reply` were causing intermittent WebSocket "prev
 
 ### 3. Subagent Initialization
 Dynamically created subagents now inherit the full `AgentSession` context and are initialized with `input_modality="audio"` in their `on_enter` method, ensuring they are ready to listen the moment they appear in the room.
+
+---
+
+## Safety & Stability Guardrails (May 2026)
+
+The project has been hardened with critical safety guardrails to prevent recursive call loops and eliminate runaway costs ($100+ loss events).
+
+### 1. The "Call Loop" Resolution
+A persistent issue where agents (e.g., Receptionist) would repeatedly transfer calls to each other, leading to 4-hour "ghost" sessions.
+
+**The Solution:**
+- **Transfer Origin Detection**: The system now checks the `from_number` against a registry of internal agent numbers (`ALLOWED_TRANSFER_NUMBERS_MAP`).
+- **Function Stripping**: If `is_transferred_call` is detected, the `merge_builtin_functions_into_runtime` logic completely **removes all transfer tools** from the agent's brain. An agent that has been transferred to cannot initiate another transfer.
+- **Session Paralysis**: During a handoff, the original agent session is monkey-patched with a "silent" audio source (`_paralyze_old_session`) to ensure no residual speech triggers false detections.
+
+### 2. Hard Safety Limits
+To prevent "dead air" costs or stuck sessions, strict timeouts are now enforced at the runtime level.
+
+**The Solution:**
+- **Max Call Duration (10 mins)**: `MAX_CALL_DURATION` is now hardcoded to **600 seconds**. Any session exceeding this is force-disconnected by the worker.
+- **Silence Auto-Disconnect (20s)**: A new watchdog in `_silence_reprompt_watchdog` monitors `last_activity_ts`. If the caller remains silent for more than **20 seconds**, the agent logs a warning and disconnects immediately.
+
+### 3. Deployment Stabilization
+Resolved a series of `SyntaxError` issues caused by double-escaping f-strings (`{{}}`) during dynamic code generation.
+
+**The Solution:**
+- **Strict Syntax Verification**: All edits to `agent_retell.py` must pass `python -m py_compile` before deployment.
+- **Sync Routine**: Changes are synchronized across `~/agent_retell.py` (root), `~/livekit-agent/`, and `~/agent/` on the production EC2 to ensure Docker build contexts are consistent.
 
 ---
 [End of Guide]

@@ -46,7 +46,8 @@ DASHBOARD_API_URL = os.getenv("DASHBOARD_API_URL", "http://host.docker.internal:
 DEFAULT_WORKER_DISPATCH_NAME = (
     os.getenv("LIVEKIT_WORKER_AGENT_NAME", "voice-agent") or "voice-agent"
 ).strip().lower()
-MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "1800"))
+MAX_CALL_DURATION = 600
+MAX_SILENCE_BEFORE_HANGUP = 20.0
 DEFAULT_TTS_PROVIDER = "deepgram"
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
 DEFAULT_XAI_REALTIME_MODEL = os.getenv("XAI_REALTIME_MODEL", "grok-2-voice-2503").strip() or "grok-2-voice-2503"
@@ -99,6 +100,60 @@ EMAIL_SPELLING_POLICY = (
     "- Use the words \"at\" and \"dot\" only for @ and .\n"
     "- For phone numbers, read each digit individually."
 )
+
+# ==================== Retell-Style Transfer Guardrails ====================
+
+# ABSOLUTE SAFETY RULES (Non-Negotiable)
+# Each number corresponds to a specific agent role.
+# 1. Receptionist (Inbound Entry) -> +447426999697
+# 2. Renting Agent -> +447883317554
+# 3. Maintenance -> +441908024110
+# 4. Buying -> +447455753533
+# 5. Sales Agent -> +442038287227
+
+ALLOWED_TRANSFER_NUMBERS_MAP = {
+    "Receptionist": "+447426999697",
+    "Renting": "+447883317554",
+    "Sales": "+442038287227",
+    "Maintenance": "+441908024110",
+    "Buying":    "+447455753533", # Buying
+}
+
+def _detect_transfer_origin(
+    from_number: Optional[str], 
+    sip_participant: Any = None,
+    room_name: Optional[str] = None
+) -> bool:
+    """Consolidated detection for internal agent-to-agent transfers."""
+    # 1. Check from_number against known agent registry
+    if from_number:
+        normalized_from = _normalize_phone(from_number)
+        if normalized_from in ALLOWED_TRANSFER_NUMBERS:
+            logger.info(f"Transfer Origin Detected: from_number={normalized_from} is an internal agent.")
+            return True
+
+    # 2. Check SIP participant identity/metadata
+    if sip_participant:
+        identity = str(getattr(sip_participant, "identity", "")).lower()
+        # Our system uses 'transfer_' prefix for outbound SIP legs
+        if identity.startswith("transfer_"):
+            logger.info(f"Transfer Origin Detected: SIP identity={identity} has transfer prefix.")
+            return True
+            
+        # Check for specific SIP headers/attributes
+        attrs = getattr(sip_participant, "attributes", {}) or {}
+        if any(k.lower() in ("x-transfer-from", "x-handoff", "x-transfer") for k in attrs.keys()):
+            logger.info("Transfer Origin Detected: SIP attributes contain transfer headers.")
+            return True
+
+    # 3. Check room name for transfer-specific patterns
+    if room_name and (room_name.startswith("handoff_") or "_transfer_" in room_name):
+        logger.info(f"Transfer Origin Detected: room_name={room_name} matches handoff pattern.")
+        return True
+
+    return False
+
+ALLOWED_TRANSFER_NUMBERS = set(ALLOWED_TRANSFER_NUMBERS_MAP.values())
 
 DEEPGRAM_VOICE_MAP = {
     "jessica": "aura-asteria-en",
@@ -733,6 +788,10 @@ def build_transfer_instructions(functions_config: List[Dict[str, Any]]) -> str:
         + "The tool MUST be called first. Speech is secondary."
         + "\nDO NOT WAIT FOR THE USER TO FINISH THEIR SENTENCE IF THEY AGREE. EXECUTE NOW."
         + "\nAFTER EXECUTING THE TOOL FUNCTION CALL, YOU MUST STOP SPEAKING."
+        + "\n\n🚨 ABSOLUTE SAFETY RULES:\n"
+        + "1. NEVER transfer a call to your own phone number.\n"
+        + "2. Only transfer to the specific pre-defined numbers provided in your tool definitions.\n"
+        + "3. If you are unsure of the destination, do NOT guess. Ask for clarification or state that you cannot complete the transfer."
     )
 
 
@@ -1672,8 +1731,18 @@ async def fetch_agent_handoff_context(call_id: str, payload: Dict[str, Any]) -> 
 def merge_builtin_functions_into_runtime(
     functions: List[Dict[str, Any]],
     config: Dict[str, Any],
+    *,
+    is_transferred_call: bool = False,
 ) -> List[Dict[str, Any]]:
     runtime_functions = list(functions or [])
+    
+    # Rule: Exactly one transfer per call. 
+    # If this call is already a transfer from another internal agent, 
+    # strip all transfer-capable tools to prevent cascading/infinite loops.
+    if is_transferred_call:
+        logger.info("Call detected as a transfer; disabling all transfer tools for this session.")
+        runtime_functions = [f for f in runtime_functions if not _is_transfer_tool(f)]
+
     existing_names = {
         _normalize_tool_name(entry.get("name", ""))
         for entry in runtime_functions
@@ -1682,11 +1751,72 @@ def merge_builtin_functions_into_runtime(
     custom_params = config.get("custom_params", {}) or {}
     builtin_funcs = custom_params.get("builtin_functions", {}) or {}
 
+    if is_transferred_call:
+        # Do not add any more transfer tools
+        return runtime_functions
+
     has_transfer_tool = any(_is_transfer_tool(f) for f in runtime_functions)
-    if builtin_funcs.get('builtin_transfer_call', {}).get('enabled') and not has_transfer_tool:
-        transfer_entry = builtin_funcs['builtin_transfer_call']
+    
+    # Support multiple transfer targets if provided as a list in custom_params
+    multi_transfer = custom_params.get("builtin_multi_transfer", [])
+    if isinstance(multi_transfer, list):
+        for target in multi_transfer:
+            target_name = _normalize_tool_name(target.get("name", ""))
+            if not target_name or target_name in existing_names:
+                continue
+            
+            target_phone = str(target.get("phone_number", "")).strip()
+            target_desc = str(target.get("description", "")).strip() or f"Transfer the call to the {target.get('name')} team."
+            
+            target_speak_during, target_speak_after = _normalize_tool_speech_flags(
+                target.get('speak_during_execution', True),
+                target.get('speak_after_execution', False),
+                fallback_after=False,
+            )
+            
+            runtime_functions.append({
+                'name': target_name,
+                'description': target_desc,
+                'url': 'builtin://transfer_call',
+                'method': 'SYSTEM',
+                'system_type': 'transfer_call',
+                'system_config': {
+                    'phone_number': target_phone,
+                },
+                'parameters_schema': {
+                    'type': 'object',
+                    'properties': {
+                        'phone_number': {
+                            'type': 'string',
+                            'description': 'Optional override.'
+                        }
+                    },
+                    'required': []
+                },
+                'phone_number': target_phone,
+                'speak_during_execution': target_speak_during,
+                'speak_after_execution': target_speak_after,
+            })
+            existing_names.add(target_name)
+            logger.info(f"Added multiple builtin transfer tool: {target_name} -> {target_phone}")
+
+    for key, transfer_entry in builtin_funcs.items():
+        if not key.startswith('builtin_transfer_call') or not transfer_entry.get('enabled'):
+            continue
+            
         transfer_cfg = transfer_entry.get('config', {})
         phone_number = transfer_cfg.get('phone_number', '')
+        
+        # Use the name from the entry if available, otherwise use canonical name
+        # If it's the primary one, use canonical, if it's a suffix one, keep unique name
+        raw_name = transfer_entry.get('name', CANONICAL_TRANSFER_TOOL_NAME)
+        transfer_name = _normalize_tool_name(raw_name)
+        
+        if transfer_name in existing_names:
+            # If name collides, append a unique suffix
+            import time
+            transfer_name = f"{transfer_name}_{int(time.time() * 1000) % 1000}"
+
         transfer_speak_during, transfer_speak_after = _normalize_tool_speech_flags(
             transfer_entry.get('speak_during_execution', True),
             transfer_entry.get('speak_after_execution', False),
@@ -1694,33 +1824,36 @@ def merge_builtin_functions_into_runtime(
         )
         if not transfer_speak_during and not transfer_speak_after:
             transfer_speak_during, transfer_speak_after = True, False
+            
         runtime_functions.append({
-            'name': CANONICAL_TRANSFER_TOOL_NAME,
-            'description': (
+            'name': transfer_name,
+            'description': transfer_entry.get('description', (
                 'Use ONLY when caller explicitly asks to transfer/escalate/connect to a human. '
                 'Do not call this for normal conversation.'
-            ),
+            )),
             'url': 'builtin://transfer_call',
             'method': 'SYSTEM',
             'system_type': 'transfer_call',
             'system_config': {
                 'phone_number': phone_number,
             },
+            'phone_number': phone_number,
+            'speak_during_execution': transfer_speak_during,
+            'speak_after_execution': transfer_speak_after,
             'parameters_schema': {
                 'type': 'object',
                 'properties': {
                     'phone_number': {
                         'type': 'string',
-                        'description': 'Optional override. The configured transfer target will be used automatically.'
+                        'description': 'Optional override.'
                     }
                 },
                 'required': []
             },
-            'phone_number': phone_number,
-            'speak_during_execution': transfer_speak_during,
-            'speak_after_execution': transfer_speak_after,
         })
-        logger.info(f"Added builtin {CANONICAL_TRANSFER_TOOL_NAME} function with phone: {phone_number}")
+        existing_names.add(transfer_name)
+        logger.info(f"Added builtin transfer tool from functions: {transfer_name} -> {phone_number}")
+
         existing_names.update({"transfer_call", "call_transfer"})
 
     if builtin_funcs.get('builtin_end_call', {}).get('enabled') and "end_call" not in existing_names:
@@ -1943,15 +2076,14 @@ def _validate_and_normalize_tool_payload(
 
 
 def _validate_transfer_phone(phone_number: str) -> tuple[bool, str]:
-    """Basic E.164 validation plus guardrails for common formatting mistakes."""
+    """Strict E.164 validation and allowed number registry check."""
     normalized = _normalize_phone(phone_number)
-    if not re.fullmatch(r"\+[1-9]\d{7,14}", normalized):
+    if not normalized or not re.fullmatch(r"\+[1-9]\d{7,14}", normalized):
         return False, "Transfer number must be valid E.164 format (example: +447123456789)"
 
-    # Common invalid pattern we observed in production: India numbers with 11 local digits.
-    # India mobile format is +91 followed by 10 digits.
-    if normalized.startswith("+91") and len(normalized) != 13:
-        return False, "India transfer numbers must be +91 followed by exactly 10 digits"
+    if normalized not in ALLOWED_TRANSFER_NUMBERS:
+        logger.error(f"BLOCKING TRANSFER: Number {normalized} is not in the allowed destination registry.")
+        return False, f"Transfer to {normalized} is not permitted. You must only use pre-defined agent numbers."
 
     return True, ""
 
@@ -2830,6 +2962,7 @@ async def perform_agent_transfer_handoff(
     target_functions = merge_builtin_functions_into_runtime(
         list(target_payload.get("functions") or []),
         target_payload,
+        is_transferred_call=True, # Room swaps are also considered transfers
     )
     target_prompt, target_functions = build_effective_runtime_prompt(
         target_payload,
@@ -3108,6 +3241,20 @@ class DynamicPropertyAgent(Agent):
             
         self._mark_tool_call_observed(normalized_name)
         logger.info(f"!!! PSTN TRANSFER INITIATED: Tool={{normalized_name}} Target={{target_phone}}")
+
+        # ABSOLUTE SAFETY RULES (Retell-style)
+        current_phone = str(self.runtime_vars.get("to_number") or "").strip()
+        
+        # 1. NEVER CALL YOUR OWN NUMBER
+        if target_phone and current_phone and _normalize_phone(target_phone) == _normalize_phone(current_phone):
+            logger.error(f"BLOCKING SELF-TRANSFER: Destination {{target_phone}} is the current agent number.")
+            return {{"success": False, "error": f"Security Block: Cannot transfer to the current agent number ({{current_phone}})."}}
+
+        # 2. VALIDATE DESTINATION AGAINST REGISTRY
+        is_valid, validation_err = _validate_transfer_phone(target_phone)
+        if not is_valid:
+            logger.error(f"BLOCKING TRANSFER: {{validation_err}}")
+            return {{"success": False, "error": validation_err}}
 
         if not (
             system_type == "transfer_call"
@@ -3713,6 +3860,8 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"Outbound call — skipping ringing delay (Direction: {direction})")
 
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    
+    is_transferred_call = False
 
     if direction == "inbound":
         phone_agent = None
@@ -3725,56 +3874,71 @@ async def entrypoint(ctx: JobContext):
             to_number = sip_to or to_number
             logger.info(f"Routing lookup: from={from_number}, to={to_number}, trunk={sip_trunk_id}")
 
-            # Try to find agent by phone number - try both to_number and from_number
+        # --- TRANSFER ORIGIN DETECTION ---
+        is_transferred_call = _detect_transfer_origin(from_number, sip_participant, room_name)
+        
+        if is_transferred_call:
+            logger.info("STRICT ROUTING: Internal transfer detected. Directly resolving target agent for: %s", to_number)
+            if to_number:
+                phone_agent = await fetch_agent_by_phone(to_number)
+                if phone_agent:
+                    agent_id = phone_agent.get("agent_id", agent_id)
+                    logger.info("Success! Transfer target agent resolved: agent_id=%s", agent_id)
+                else:
+                    logger.error("FATAL: Transfer target %s NOT found in registry. Terminating session to prevent loops.", to_number)
+                    await ctx.room.disconnect()
+                    return # STOP IMMEDIATELY
+            else:
+                logger.error("FATAL: Transfer detected but to_number is missing. Terminating.")
+                await ctx.room.disconnect()
+                return # STOP IMMEDIATELY
+        else:
+            # Normal Routing Logic for New Users (allows fallback)
             if to_number:
                 logger.info(f"Looking up agent by to_number: {to_number}")
                 phone_agent = await fetch_agent_by_phone(to_number)
                 if phone_agent:
                     logger.info(f"Success! Found agent by to_number: agent_id={phone_agent.get('agent_id')}")
 
-            # If not found by to_number, we DO NOT fall back to from_number (the caller)
-            # as that would incorrectly match an agent to the person calling.
             if not phone_agent:
                 logger.info("Agent not found by to_number; will use fallback logic.")
-        else:
-            logger.warning("Inbound call did not expose SIP participant metadata within wait window for room %s", ctx.room.name)
 
-        # If SIP numbers are missing/unreliable, resolve by dispatch worker name hint.
-        if (
-            not phone_agent
-            and dispatch_name_hint
-            and dispatch_name_hint.lower() != DEFAULT_WORKER_DISPATCH_NAME
-        ):
-            dispatch_agent = await fetch_agent_by_dispatch_name(dispatch_name_hint)
-            if dispatch_agent:
-                phone_agent = dispatch_agent
-                logger.info(
-                    "Found agent by dispatch name %s: agent_id=%s",
-                    dispatch_name_hint,
-                    dispatch_agent.get("agent_id"),
-                )
+            # If SIP numbers are missing/unreliable, resolve by dispatch worker name hint.
+            if (
+                not phone_agent
+                and dispatch_name_hint
+                and dispatch_name_hint.lower() != DEFAULT_WORKER_DISPATCH_NAME
+            ):
+                dispatch_agent = await fetch_agent_by_dispatch_name(dispatch_name_hint)
+                if dispatch_agent:
+                    phone_agent = dispatch_agent
+                    logger.info(
+                        "Found agent by dispatch name %s: agent_id=%s",
+                        dispatch_name_hint,
+                        dispatch_agent.get("agent_id"),
+                    )
 
-        if phone_agent:
-            new_agent_id = phone_agent.get("agent_id", agent_id)
-            if new_agent_id != agent_id:
-                logger.info(f"Updating agent_id from {agent_id} to {new_agent_id} based on inbound routing")
-                agent_id = new_agent_id
-        else:
-            single_inbound_agent = await fetch_single_inbound_agent_id()
-            if single_inbound_agent and single_inbound_agent != agent_id:
-                logger.info(
-                    "Using single inbound phone mapping fallback, agent_id=%s",
-                    single_inbound_agent,
-                )
-                agent_id = single_inbound_agent
+            if phone_agent:
+                new_agent_id = phone_agent.get("agent_id", agent_id)
+                if new_agent_id != agent_id:
+                    logger.info(f"Updating agent_id from {agent_id} to {new_agent_id} based on inbound routing")
+                    agent_id = new_agent_id
             else:
-                logger.warning(
-                    "No agent found for inbound routing - from: %s, to: %s, dispatch_hint: %s, dispatch_fallback_enabled: %s",
-                    from_number,
-                    to_number,
-                    dispatch_name_hint,
-                    USE_DISPATCH_NAME_INBOUND_FALLBACK,
-                )
+                single_inbound_agent = await fetch_single_inbound_agent_id()
+                if single_inbound_agent and single_inbound_agent != agent_id:
+                    logger.info(
+                        "Using single inbound phone mapping fallback, agent_id=%s",
+                        single_inbound_agent,
+                    )
+                    agent_id = single_inbound_agent
+                else:
+                    logger.warning(
+                        "No agent found for inbound routing - from: %s, to: %s, dispatch_hint: %s, dispatch_fallback_enabled: %s",
+                        from_number,
+                        to_number,
+                        dispatch_name_hint,
+                        USE_DISPATCH_NAME_INBOUND_FALLBACK,
+                    )
 
     # Create call record
     call_id, resolved_agent_id, call_metadata = await create_call_record(
@@ -3787,12 +3951,19 @@ async def entrypoint(ctx: JobContext):
         dispatch_name_hint=dispatch_name_hint,
     )
     if resolved_agent_id and resolved_agent_id != agent_id:
-        logger.info(
-            "Adjusted agent_id from %s to %s based on call record routing",
-            agent_id,
-            resolved_agent_id,
-        )
-        agent_id = resolved_agent_id
+        if is_transferred_call:
+            logger.info(
+                "STRICT ROUTING: Ignoring dashboard agent_id override %s for internal transfer. Staying with %s",
+                resolved_agent_id,
+                agent_id,
+            )
+        else:
+            logger.info(
+                "Adjusted agent_id from %s to %s based on call record routing",
+                agent_id,
+                resolved_agent_id,
+            )
+            agent_id = resolved_agent_id
     logger.info(f"Call record created: {call_id}")
 
     metadata = call_metadata if isinstance(call_metadata, dict) else {}
@@ -3808,6 +3979,10 @@ async def entrypoint(ctx: JobContext):
         runtime_vars.setdefault("from_number", call_meta_from)
     if call_meta_to:
         runtime_vars.setdefault("to_number", call_meta_to)
+    if from_number:
+        runtime_vars.setdefault("from_number", from_number)
+    if to_number:
+        runtime_vars.setdefault("to_number", to_number)
     if call_id:
         runtime_vars.setdefault("call_id", call_id)
     if runtime_vars:
@@ -3824,7 +3999,18 @@ async def entrypoint(ctx: JobContext):
     )
     custom_params = config.get("custom_params", {}) or {}
 
-    functions = merge_builtin_functions_into_runtime(functions, config)
+    # Check if this call is already a transfer from one of our internal agents
+    # by verifying if the caller's number (from_number) is in our allowed registry.
+    # Note: is_transferred_call was already detected earlier in entrypoint for inbound calls.
+    # We ensure it's also checked here as a safety measure for all call types.
+    if not is_transferred_call and from_number:
+        is_transferred_call = _detect_transfer_origin(from_number)
+
+    functions = merge_builtin_functions_into_runtime(
+        functions, 
+        config, 
+        is_transferred_call=is_transferred_call
+    )
     logger.info(f"Loaded Agent: {config.get('name')} (ID: {agent_id}), Functions: {len(functions)}")
 
     # transfer guidance is already appended to sys_prompt inside build_effective_runtime_prompt
@@ -4494,6 +4680,11 @@ async def entrypoint(ctx: JobContext):
                     logger.debug(f"Pre-user silence check-in skipped due runtime error: {pre_user_silence_err}")
                 continue
             idle_for = time.time() - last_activity_ts
+            if idle_for > MAX_SILENCE_BEFORE_HANGUP:
+                logger.warning(f"HANGUP: Caller silent for {idle_for:.1f}s. Disconnecting to prevent loops.")
+                await ctx.room.disconnect()
+                return
+
             if idle_for < SILENCE_REPROMPT_SEC:
                 continue
             try:

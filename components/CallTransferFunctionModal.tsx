@@ -35,7 +35,7 @@ export interface CallTransferFunctionData {
 }
 
 const DEFAULT_FUNCTION: CallTransferFunctionData = {
-  name: '',
+  name: 'Call Transfer',
   description: '',
   method: 'SYSTEM',
   url: 'builtin://transfer_call',
@@ -83,20 +83,28 @@ export default function CallTransferFunctionModal({
   const [loading, setLoading] = useState(false);
   const [formData, setFormData] = useState<CallTransferFunctionData>(DEFAULT_FUNCTION);
 
+  // Convert a DB-normalized underscore name (e.g. "sales_transfer") to
+  // a display-friendly Title Case label (e.g. "Sales Transfer") for the form.
+  const toDisplayName = (raw: string): string =>
+    (raw || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
   useEffect(() => {
     if (!isOpen) return;
-    const nextData = functionData
-      ? {
-          ...DEFAULT_FUNCTION,
-          ...functionData,
-          ...normalizeSpeechFlags(functionData),
-          system_type: 'transfer_call',
-          method: 'SYSTEM',
-          url: 'builtin://transfer_call',
-          system_config: normalizeSystemConfig(functionData.system_config),
-        }
-      : DEFAULT_FUNCTION;
-    setFormData(nextData);
+    if (functionData) {
+      const displayName = toDisplayName(functionData.name || '');
+      setFormData({
+        ...DEFAULT_FUNCTION,
+        ...functionData,
+        name: displayName,
+        ...normalizeSpeechFlags(functionData),
+        system_type: 'transfer_call',
+        method: 'SYSTEM',
+        url: 'builtin://transfer_call',
+        system_config: normalizeSystemConfig(functionData.system_config),
+      });
+    } else {
+      setFormData(DEFAULT_FUNCTION);
+    }
   }, [functionData, isOpen]);
 
   const handleSubmit = async (event: FormEvent) => {
@@ -127,6 +135,7 @@ export default function CallTransferFunctionModal({
           properties: {},
         },
         variables: {},
+        system_type: 'transfer_call',
         system_config: systemConfig,
         ...speechFlags,
       };
