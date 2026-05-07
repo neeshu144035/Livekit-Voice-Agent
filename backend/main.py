@@ -4110,13 +4110,127 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
         flag_modified(call, "call_metadata")
         db.commit()
 
-        return {
+return {
             "success": True,
             "action": SYSTEM_FUNCTION_AGENT_TRANSFER,
             "call_id": call_id,
             "handoff": handoff_event,
             "message": f"Agent transfer initiated to {target_payload.get('name')}",
         }
+    
+    elif action_type == "check_availability":
+        import httpx
+        
+        username = params.get("username")
+        event_type_slug = params.get("event_type_slug")
+        start_date = params.get("start_date")
+        end_date = params.get("end_date")
+        timezone = params.get("timezone", "UTC")
+        
+        if not username or not event_type_slug or not start_date or not end_date:
+            raise HTTPException(status_code=400, detail="username, event_type_slug, start_date, and end_date are required")
+        
+        agent_config = ensure_custom_params(call.agent.custom_params) if call.agent else {}
+        cal_config = agent_config.get("builtin_functions", {}).get("builtin_check_availability", {}).get("config", {})
+        cal_api_key = cal_config.get("api_key", os.getenv("CAL_API_KEY", ""))
+        
+        headers = {
+            "cal-api-version": "2024-09-04"
+        }
+        if cal_api_key:
+            headers["Authorization"] = f"Bearer {cal_api_key}"
+        
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                response = await client.get(
+                    "https://api.cal.com/v2/slots",
+                    params={
+                        "username": username,
+                        "eventTypeSlug": event_type_slug,
+                        "start": start_date,
+                        "end": end_date,
+                        "timeZone": timezone
+                    },
+                    headers=headers
+                )
+                response.raise_for_status()
+                slots_data = response.json()
+                
+                available_slots = []
+                slots = slots_data.get("data", {}).get("slots", {})
+                for date, slot_list in slots.items():
+                    for slot in slot_list:
+                        available_slots.append(slot.get("time"))
+                
+                return {
+                    "success": True,
+                    "action": "check_availability",
+                    "call_id": call_id,
+                    "available_slots": available_slots[:20],
+                    "message": f"Found {len(available_slots)} available time slots" if available_slots else "No available slots found for the selected dates"
+                }
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=400, detail=f"Cal.com availability check failed: {str(e)}")
+    
+    elif action_type == "book_meeting":
+        import httpx
+        
+        username = params.get("username")
+        event_type_slug = params.get("event_type_slug")
+        start_time = params.get("start_time")
+        attendee_name = params.get("attendee_name")
+        attendee_email = params.get("attendee_email")
+        attendee_timezone = params.get("attendee_timezone", "UTC")
+        notes = params.get("notes", "")
+        
+        if not username or not event_type_slug or not start_time or not attendee_name or not attendee_email:
+            raise HTTPException(status_code=400, detail="username, event_type_slug, start_time, attendee_name, and attendee_email are required")
+        
+        agent_config = ensure_custom_params(call.agent.custom_params) if call.agent else {}
+        cal_config = agent_config.get("builtin_functions", {}).get("builtin_book_meeting", {}).get("config", {})
+        cal_api_key = cal_config.get("api_key", os.getenv("CAL_API_KEY", ""))
+        
+        headers = {
+            "cal-api-version": "2024-09-04",
+            "Content-Type": "application/json"
+        }
+        if cal_api_key:
+            headers["Authorization"] = f"Bearer {cal_api_key}"
+        
+        booking_payload = {
+            "eventTypeSlug": event_type_slug,
+            "username": username,
+            "start": start_time,
+            "attendee": {
+                "name": attendee_name,
+                "email": attendee_email,
+                "timeZone": attendee_timezone
+            }
+        }
+        if notes:
+            booking_payload["notes"] = notes
+        
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            try:
+                response = await client.post(
+                    "https://api.cal.com/v2/bookings",
+                    json=booking_payload,
+                    headers=headers
+                )
+                response.raise_for_status()
+                booking_data = response.json()
+                
+                booking = booking_data.get("data", {})
+                return {
+                    "success": True,
+                    "action": "book_meeting",
+                    "call_id": call_id,
+                    "booking_id": booking.get("id"),
+                    "booking_url": booking.get("url"),
+                    "message": f"Meeting booked successfully for {start_time}"
+                }
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=400, detail=f"Cal.com booking failed: {str(e)}")
     
     else:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action_type}")
@@ -4273,7 +4387,7 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         },
-        {
+{
             "id": "builtin_transfer_call",
             "agent_id": agent_id,
             "name": "call_transfer",
@@ -4300,6 +4414,100 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
             "variables": {},
             "speak_during_execution": True,
             "speak_after_execution": False,
+            "is_builtin": True,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        },
+        {
+            "id": "builtin_check_availability",
+            "agent_id": agent_id,
+            "name": "check_availability",
+            "description": "Check available time slots for booking a meeting using Cal.com. Use this when the user wants to know when a meeting can be scheduled.",
+            "method": "SYSTEM",
+            "url": "builtin://check_availability",
+            "timeout_ms": 15000,
+            "headers": {},
+            "query_params": {},
+            "parameters_schema": {
+                "type": "object",
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "description": "Cal.com username or organization slug"
+                    },
+                    "event_type_slug": {
+                        "type": "string",
+                        "description": "The event type slug (e.g., '30min', '15min', 'consultation')"
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date for availability check (YYYY-MM-DD)"
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date for availability check (YYYY-MM-DD)"
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "Timezone for the slots (e.g., 'America/New_York', 'Europe/London')"
+                    }
+                },
+                "required": ["username", "event_type_slug", "start_date", "end_date"]
+            },
+            "variables": {},
+            "speak_during_execution": True,
+            "speak_after_execution": True,
+            "is_builtin": True,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        },
+        {
+            "id": "builtin_book_meeting",
+            "agent_id": agent_id,
+            "name": "book_meeting",
+            "description": "Book a meeting using Cal.com. Use this when the user confirms a time slot and wants to schedule a meeting.",
+            "method": "SYSTEM",
+            "url": "builtin://book_meeting",
+            "timeout_ms": 20000,
+            "headers": {},
+            "query_params": {},
+            "parameters_schema": {
+                "type": "object",
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "description": "Cal.com username or organization slug"
+                    },
+                    "event_type_slug": {
+                        "type": "string",
+                        "description": "The event type slug (e.g., '30min', '15min', 'consultation')"
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "description": "Meeting start time (ISO 8601 format, e.g., '2024-01-15T09:00:00Z')"
+                    },
+                    "attendee_name": {
+                        "type": "string",
+                        "description": "Name of the person booking the meeting"
+                    },
+                    "attendee_email": {
+                        "type": "string",
+                        "description": "Email address of the person booking the meeting"
+                    },
+                    "attendee_timezone": {
+                        "type": "string",
+                        "description": "Timezone of the attendee (e.g., 'America/New_York')"
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Optional notes or reason for the meeting"
+                    }
+                },
+                "required": ["username", "event_type_slug", "start_time", "attendee_name", "attendee_email"]
+            },
+            "variables": {},
+            "speak_during_execution": True,
+            "speak_after_execution": True,
             "is_builtin": True,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
@@ -4334,6 +4542,14 @@ async def save_builtin_functions(agent_id: int, config: dict, db: Session = Depe
                 cfg["phone_number"] = phone_number
         elif builtin_id == "builtin_end_call":
             default_during, default_after = False, True
+        elif builtin_id in ("builtin_check_availability", "builtin_book_meeting"):
+            default_during, default_after = True, True
+            if enabled:
+                api_key = str(cfg.get("api_key", "")).strip()
+                if not api_key and not os.getenv("CAL_API_KEY"):
+                    raise HTTPException(status_code=400, detail=f"{builtin_id} requires config.api_key or CAL_API_KEY environment variable")
+                if api_key:
+                    cfg["api_key"] = api_key
         else:
             default_during, default_after = False, True
 

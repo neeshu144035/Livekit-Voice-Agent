@@ -1887,6 +1887,80 @@ export default function AgentDetailPage() {
                                         </p>
                                     </div>
                                 )}
+
+                                {(builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'check_availability' ||
+                                    builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'book_meeting') && (
+                                    <>
+                                        <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                                            <label className="mb-2 block text-sm font-medium text-gray-700">
+                                                Cal.com API Key
+                                            </label>
+                                            <input
+                                                type="password"
+                                                autoComplete="off"
+                                                placeholder="cal_live_xxxxxxxxxxxxxxxx"
+                                                value={builtinDraftConfig.config?.api_key || ''}
+                                                onChange={(e) => {
+                                                    const nextValue = e.target.value;
+                                                    setBuiltinDraftConfig((prev) => prev ? ({
+                                                        ...prev,
+                                                        config: { ...(prev.config || {}), api_key: nextValue },
+                                                    }) : prev);
+                                                }}
+                                                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
+                                            />
+                                            <p className="mt-2 text-xs text-gray-500">
+                                                Your Cal.com API key. Get it from Cal.com Settings → API Keys. Optional if CAL_API_KEY is set on server.
+                                            </p>
+                                        </div>
+                                        
+                                        <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                                            <label className="mb-2 block text-sm font-medium text-gray-700">
+                                                Default Username
+                                            </label>
+                                            <input
+                                                type="text"
+                                                autoComplete="off"
+                                                placeholder="johndoe or company-slug"
+                                                value={builtinDraftConfig.config?.default_username || ''}
+                                                onChange={(e) => {
+                                                    const nextValue = e.target.value;
+                                                    setBuiltinDraftConfig((prev) => prev ? ({
+                                                        ...prev,
+                                                        config: { ...(prev.config || {}), default_username: nextValue },
+                                                    }) : prev);
+                                                }}
+                                                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
+                                            />
+                                            <p className="mt-2 text-xs text-gray-500">
+                                                Default Cal.com username or organization slug.
+                                            </p>
+                                        </div>
+
+                                        <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                                            <label className="mb-2 block text-sm font-medium text-gray-700">
+                                                Default Event Type Slug
+                                            </label>
+                                            <input
+                                                type="text"
+                                                autoComplete="off"
+                                                placeholder="30min, consultation, meeting"
+                                                value={builtinDraftConfig.config?.default_event_slug || ''}
+                                                onChange={(e) => {
+                                                    const nextValue = e.target.value;
+                                                    setBuiltinDraftConfig((prev) => prev ? ({
+                                                        ...prev,
+                                                        config: { ...(prev.config || {}), default_event_slug: nextValue },
+                                                    }) : prev);
+                                                }}
+                                                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
+                                            />
+                                            <p className="mt-2 text-xs text-gray-500">
+                                                Default event type slug (e.g., '30min', 'consultation').
+                                            </p>
+                                        </div>
+                                    </>
+                                )}
                             </div>
 
                             <div className="mt-6 flex items-center justify-end gap-3">
