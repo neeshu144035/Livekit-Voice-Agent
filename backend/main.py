@@ -4099,7 +4099,7 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
             "resolved_version": target_payload.get("resolved_version"),
             "handoff_summary": str(params.get("handoff_summary") or "").strip(),
             "caller_memory": ensure_custom_params(params.get("caller_memory")),
-            "recent_transcript": params.get("recent_transcript") if isinstance(params.get("recent_transcript"), list) else [],
+"recent_transcript": params.get("recent_transcript") if isinstance(params.get("recent_transcript"), list) else [],
         }
         handoffs.append(handoff_event)
         metadata["agent_handoffs"] = handoffs
@@ -4110,7 +4110,7 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
         flag_modified(call, "call_metadata")
         db.commit()
 
-return {
+        return {
             "success": True,
             "action": SYSTEM_FUNCTION_AGENT_TRANSFER,
             "call_id": call_id,
