@@ -1825,19 +1825,57 @@ export default function AgentDetailPage() {
                             <div className="mb-5 flex items-start justify-between gap-4">
                                 <div>
                                     <h3 className="text-lg font-semibold text-gray-900">
-                                        Configure {formatBuiltinFunctionName(builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name)}
+                                        Configure {builtinDraftConfig?.display_name || formatBuiltinFunctionName(builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name) || 'Tool'}
                                     </h3>
                                     <p className="mt-1 text-sm text-gray-500">
-                                        Match the built-in function layout to the cleaner custom function editing flow.
+                                        Configure the built-in function settings.
                                     </p>
                                 </div>
                                 <button
-                                    onClick={closeBuiltinConfigModal}
+                                    onClick={() => {
+                                        const baseId = builtinDraftConfig?._base_id || selectedBuiltinFunctionId;
+                                        if (baseId !== selectedBuiltinFunctionId) {
+                                            const next = { ...allBuiltinFunctions };
+                                            delete next[selectedBuiltinFunctionId];
+                                            setAllBuiltinFunctions(next);
+                                            void handleSaveBuiltinFunctions(next, true);
+                                        }
+                                        closeBuiltinConfigModal();
+                                    }}
                                     className="rounded-lg p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
                                 >
                                     <X className="h-5 w-5" />
                                 </button>
                             </div>
+
+                            <div className="space-y-4">
+                                <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                                    <label className="mb-2 block text-sm font-medium text-gray-700">
+                                        Tool Name
+                                    </label>
+                                    <input
+                                        type="text"
+                                        autoComplete="off"
+                                        placeholder="e.g., Sales Transfer, Support Transfer"
+                                        value={builtinDraftConfig?.display_name || ''}
+                                        onChange={(e) => {
+                                            const nextValue = e.target.value;
+                                            setBuiltinDraftConfig((prev) => prev ? ({
+                                                ...prev,
+                                                display_name: nextValue,
+                                            }) : prev);
+                                        }}
+                                        className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
+                                    />
+                                    <p className="mt-2 text-xs text-gray-500">
+                                        This name will be shown when the tool is added to the agent.
+                                    </p>
+                                </div>
+
+                                <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                                    <label className="mb-2 block text-sm font-medium text-gray-700">
+                                        Tool Speech Mode
+                                    </label>
 
                             <div className="space-y-4">
                                 <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
@@ -1861,7 +1899,8 @@ export default function AgentDetailPage() {
                                     </select>
                                 </div>
 
-                                {(builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'call_transfer' ||
+                                {(builtinDraftConfig?.name === 'call_transfer' || 
+                                    builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'call_transfer' ||
                                     builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'transfer_call') && (
                                     <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                         <label className="mb-2 block text-sm font-medium text-gray-700">
@@ -1893,12 +1932,12 @@ export default function AgentDetailPage() {
                                     <>
                                         <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                             <label className="mb-2 block text-sm font-medium text-gray-700">
-                                                Cal.com API Key
+                                                API Key (Cal.com)
                                             </label>
                                             <input
                                                 type="password"
                                                 autoComplete="off"
-                                                placeholder="cal_live_xxxxxxxxxxxxxxxx"
+                                                placeholder="Enter Cal.com API key"
                                                 value={builtinDraftConfig.config?.api_key || ''}
                                                 onChange={(e) => {
                                                     const nextValue = e.target.value;
@@ -1910,54 +1949,71 @@ export default function AgentDetailPage() {
                                                 className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
                                             />
                                             <p className="mt-2 text-xs text-gray-500">
-                                                Your Cal.com API key. Get it from Cal.com Settings → API Keys. Optional if CAL_API_KEY is set on server.
+                                                You can find the Event Type ID in your cal.com URL.
                                             </p>
                                         </div>
                                         
                                         <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                             <label className="mb-2 block text-sm font-medium text-gray-700">
-                                                Default Username
+                                                Username (Cal.com)
                                             </label>
                                             <input
                                                 type="text"
                                                 autoComplete="off"
-                                                placeholder="johndoe or company-slug"
-                                                value={builtinDraftConfig.config?.default_username || ''}
+                                                placeholder="Enter Cal.com username"
+                                                value={builtinDraftConfig.config?.username || builtinDraftConfig.config?.default_username || ''}
                                                 onChange={(e) => {
                                                     const nextValue = e.target.value;
                                                     setBuiltinDraftConfig((prev) => prev ? ({
                                                         ...prev,
-                                                        config: { ...(prev.config || {}), default_username: nextValue },
+                                                        config: { ...(prev.config || {}), username: nextValue, default_username: nextValue },
+                                                    }) : prev);
+                                                }}
+                                                className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
+                                            />
+                                        </div>
+
+                                        <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                                            <label className="mb-2 block text-sm font-medium text-gray-700">
+                                                Event Type ID (Cal.com)
+                                            </label>
+                                            <input
+                                                type="text"
+                                                autoComplete="off"
+                                                placeholder="Enter Event Type ID"
+                                                value={builtinDraftConfig.config?.event_type_id || builtinDraftConfig.config?.eventTypeId || ''}
+                                                onChange={(e) => {
+                                                    const nextValue = e.target.value;
+                                                    setBuiltinDraftConfig((prev) => prev ? ({
+                                                        ...prev,
+                                                        config: { ...(prev.config || {}), event_type_id: nextValue, eventTypeId: nextValue },
                                                     }) : prev);
                                                 }}
                                                 className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
                                             />
                                             <p className="mt-2 text-xs text-gray-500">
-                                                Default Cal.com username or organization slug.
+                                                You can find the Event Type ID in your cal.com URL.
                                             </p>
                                         </div>
 
                                         <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                             <label className="mb-2 block text-sm font-medium text-gray-700">
-                                                Default Event Type Slug
+                                                Timezone (Optional)
                                             </label>
                                             <input
                                                 type="text"
                                                 autoComplete="off"
-                                                placeholder="30min, consultation, meeting"
-                                                value={builtinDraftConfig.config?.default_event_slug || ''}
+                                                placeholder="America/Los_Angeles"
+                                                value={builtinDraftConfig.config?.timezone || ''}
                                                 onChange={(e) => {
                                                     const nextValue = e.target.value;
                                                     setBuiltinDraftConfig((prev) => prev ? ({
                                                         ...prev,
-                                                        config: { ...(prev.config || {}), default_event_slug: nextValue },
+                                                        config: { ...(prev.config || {}), timezone: nextValue },
                                                     }) : prev);
                                                 }}
                                                 className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
                                             />
-                                            <p className="mt-2 text-xs text-gray-500">
-                                                Default event type slug (e.g., '30min', 'consultation').
-                                            </p>
                                         </div>
                                     </>
                                 )}
@@ -2002,19 +2058,24 @@ export default function AgentDetailPage() {
 
                             <div className="space-y-2">
                                 {/* Built-in Functions */}
-                                {builtinFunctions.filter(f => f.name !== 'transfer_call').map((func) => {
+                                {builtinFunctions.filter(f => f.name !== 'transfer_call' && f.name !== 'end_call').map((func) => {
                                     const isSelected = allBuiltinFunctions[func.id]?.enabled;
+                                    const displayName = func.display_name || func.name;
                                     return (
                                         <button
                                             key={func.id}
                                             onClick={() => {
+                                                const newId = func.id + '_' + Date.now();
                                                 setAllBuiltinFunctions((prev: BuiltinFunctionsState) => {
                                                     const existing = prev[func.id] || {};
                                                     const next: BuiltinFunctionsState = {
                                                         ...prev,
-                                                        [func.id]: {
+                                                        [newId]: {
                                                             enabled: true,
                                                             config: existing.config || {},
+                                                            name: func.name,
+                                                            display_name: displayName,
+                                                            _base_id: func.id,
                                                             ...normalizeBuiltinSpeechFlags({
                                                                 speak_during_execution: existing.speak_during_execution ?? func.speak_during_execution,
                                                                 speak_after_execution: existing.speak_after_execution ?? func.speak_after_execution,
@@ -2022,10 +2083,21 @@ export default function AgentDetailPage() {
                                                         },
                                                     };
                                                     void handleSaveBuiltinFunctions(next, true);
+                                                    setSelectedBuiltinFunctionId(newId);
+                                                    setBuiltinDraftConfig({
+                                                        enabled: true,
+                                                        config: existing.config || {},
+                                                        name: func.name,
+                                                        display_name: displayName,
+                                                        ...normalizeBuiltinSpeechFlags({
+                                                            speak_during_execution: existing.speak_during_execution ?? func.speak_during_execution,
+                                                            speak_after_execution: existing.speak_after_execution ?? func.speak_after_execution,
+                                                        }),
+                                                    });
+                                                    setShowBuiltinConfigModal(true);
                                                     return next;
                                                 });
                                                 setBuiltinSaved(false);
-                                                setShowFunctionSelector(false);
                                             }}
                                             disabled={isSelected}
                                             className={`w-full text-left p-3 rounded-lg border transition-colors ${isSelected
@@ -2039,7 +2111,7 @@ export default function AgentDetailPage() {
                                                         <span className="text-white text-xs font-bold">S</span>
                                                     </div>
                                                     <div>
-                                                        <p className="text-sm font-medium text-gray-900">{func.name}</p>
+                                                        <p className="text-sm font-medium text-gray-900">{displayName}</p>
                                                         <p className="text-xs text-gray-500">{func.description}</p>
                                                     </div>
                                                 </div>
@@ -2050,6 +2122,52 @@ export default function AgentDetailPage() {
                                         </button>
                                     );
                                 })}
+
+                                {/* Call Transfer - Allow multiple with custom names */}
+                                <button
+                                    onClick={() => {
+                                        const newId = 'builtin_call_transfer_' + Date.now();
+                                        const displayName = 'Call Transfer';
+                                        setAllBuiltinFunctions((prev: BuiltinFunctionsState) => {
+                                            const next: BuiltinFunctionsState = {
+                                                ...prev,
+                                                [newId]: {
+                                                    enabled: true,
+                                                    config: { phone_number: '' },
+                                                    name: 'call_transfer',
+                                                    display_name: displayName,
+                                                    _base_id: 'builtin_transfer_call',
+                                                    speak_during_execution: true,
+                                                    speak_after_execution: false,
+                                                },
+                                            };
+                                            void handleSaveBuiltinFunctions(next, true);
+                                            setSelectedBuiltinFunctionId(newId);
+                                            setBuiltinDraftConfig({
+                                                enabled: true,
+                                                config: { phone_number: '' },
+                                                name: 'call_transfer',
+                                                display_name: displayName,
+                                                speak_during_execution: true,
+                                                speak_after_execution: false,
+                                            });
+                                            setShowBuiltinConfigModal(true);
+                                            return next;
+                                        });
+                                        setBuiltinSaved(false);
+                                    }}
+                                    className="w-full text-left p-3 rounded-lg border border-green-200 bg-green-50 hover:bg-green-100 transition-colors"
+                                >
+                                    <div className="flex items-center gap-3">
+                                        <div className="w-8 h-8 rounded-full bg-green-500 flex items-center justify-center">
+                                            <PhoneForwarded className="w-4 h-4 text-white" />
+                                        </div>
+                                        <div>
+                                            <p className="text-sm font-medium text-gray-900">Call Transfer</p>
+                                            <p className="text-xs text-gray-500">Transfer call to a phone number</p>
+                                        </div>
+                                    </div>
+                                </button>}
 
                                 <button
                                     onClick={() => {

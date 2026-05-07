@@ -4127,12 +4127,19 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
         end_date = params.get("end_date")
         timezone = params.get("timezone", "UTC")
         
-        if not username or not event_type_slug or not start_date or not end_date:
-            raise HTTPException(status_code=400, detail="username, event_type_slug, start_date, and end_date are required")
+        if not start_date or not end_date:
+            raise HTTPException(status_code=400, detail="start_date and end_date are required")
         
         agent_config = ensure_custom_params(call.agent.custom_params) if call.agent else {}
         cal_config = agent_config.get("builtin_functions", {}).get("builtin_check_availability", {}).get("config", {})
         cal_api_key = cal_config.get("api_key", os.getenv("CAL_API_KEY", ""))
+        cal_username = cal_config.get("username", cal_config.get("default_username", ""))
+        cal_event_type_id = cal_config.get("event_type_id", cal_config.get("eventTypeId", ""))
+        
+        if not cal_username:
+            raise HTTPException(status_code=400, detail="Cal.com username not configured. Please set it in builtin function settings.")
+        if not cal_event_type_id:
+            raise HTTPException(status_code=400, detail="Cal.com Event Type ID not configured. Please set it in builtin function settings.")
         
         headers = {
             "cal-api-version": "2024-09-04"
@@ -4145,11 +4152,11 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
                 response = await client.get(
                     "https://api.cal.com/v2/slots",
                     params={
-                        "username": username,
-                        "eventTypeSlug": event_type_slug,
+                        "username": cal_username,
+                        "eventTypeId": cal_event_type_id,
                         "start": start_date,
                         "end": end_date,
-                        "timeZone": timezone
+                        "timeZone": timezone or cal_config.get("timezone", "UTC")
                     },
                     headers=headers
                 )
@@ -4175,20 +4182,25 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
     elif action_type == "book_meeting":
         import httpx
         
-        username = params.get("username")
-        event_type_slug = params.get("event_type_slug")
         start_time = params.get("start_time")
         attendee_name = params.get("attendee_name")
         attendee_email = params.get("attendee_email")
-        attendee_timezone = params.get("attendee_timezone", "UTC")
+        attendee_timezone = params.get("attendee_timezone")
         notes = params.get("notes", "")
         
-        if not username or not event_type_slug or not start_time or not attendee_name or not attendee_email:
-            raise HTTPException(status_code=400, detail="username, event_type_slug, start_time, attendee_name, and attendee_email are required")
+        if not start_time or not attendee_name or not attendee_email:
+            raise HTTPException(status_code=400, detail="start_time, attendee_name, and attendee_email are required")
         
         agent_config = ensure_custom_params(call.agent.custom_params) if call.agent else {}
         cal_config = agent_config.get("builtin_functions", {}).get("builtin_book_meeting", {}).get("config", {})
         cal_api_key = cal_config.get("api_key", os.getenv("CAL_API_KEY", ""))
+        cal_username = cal_config.get("username", cal_config.get("default_username", ""))
+        cal_event_type_id = cal_config.get("event_type_id", cal_config.get("eventTypeId", ""))
+        
+        if not cal_username:
+            raise HTTPException(status_code=400, detail="Cal.com username not configured. Please set it in builtin function settings.")
+        if not cal_event_type_id:
+            raise HTTPException(status_code=400, detail="Cal.com Event Type ID not configured. Please set it in builtin function settings.")
         
         headers = {
             "cal-api-version": "2024-09-04",
@@ -4198,13 +4210,13 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
             headers["Authorization"] = f"Bearer {cal_api_key}"
         
         booking_payload = {
-            "eventTypeSlug": event_type_slug,
-            "username": username,
+            "eventTypeId": cal_event_type_id,
+            "username": cal_username,
             "start": start_time,
             "attendee": {
                 "name": attendee_name,
                 "email": attendee_email,
-                "timeZone": attendee_timezone
+                "timeZone": attendee_timezone or cal_config.get("timezone", "UTC")
             }
         }
         if notes:
@@ -4421,8 +4433,9 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
         {
             "id": "builtin_check_availability",
             "agent_id": agent_id,
-            "name": "check_availability",
-            "description": "Check available time slots for booking a meeting using Cal.com. Use this when the user wants to know when a meeting can be scheduled.",
+            "name": "check_availability_cal",
+            "display_name": "Check Calendar Availability (Cal.com)",
+            "description": "When users ask for availability, check the calendar and provide available slots.",
             "method": "SYSTEM",
             "url": "builtin://check_availability",
             "timeout_ms": 15000,
@@ -4431,14 +4444,6 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
             "parameters_schema": {
                 "type": "object",
                 "properties": {
-                    "username": {
-                        "type": "string",
-                        "description": "Cal.com username or organization slug"
-                    },
-                    "event_type_slug": {
-                        "type": "string",
-                        "description": "The event type slug (e.g., '30min', '15min', 'consultation')"
-                    },
                     "start_date": {
                         "type": "string",
                         "description": "Start date for availability check (YYYY-MM-DD)"
@@ -4449,10 +4454,10 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
                     },
                     "timezone": {
                         "type": "string",
-                        "description": "Timezone for the slots (e.g., 'America/New_York', 'Europe/London')"
+                        "description": "Timezone for the slots (e.g., America/Los_Angeles)"
                     }
                 },
-                "required": ["username", "event_type_slug", "start_date", "end_date"]
+                "required": ["start_date", "end_date"]
             },
             "variables": {},
             "speak_during_execution": True,
@@ -4464,8 +4469,9 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
         {
             "id": "builtin_book_meeting",
             "agent_id": agent_id,
-            "name": "book_meeting",
-            "description": "Book a meeting using Cal.com. Use this when the user confirms a time slot and wants to schedule a meeting.",
+            "name": "book_appointment_cal",
+            "display_name": "Book on the Calendar (Cal.com)",
+            "description": "When users ask to book an appointment, book it on the calendar.",
             "method": "SYSTEM",
             "url": "builtin://book_meeting",
             "timeout_ms": 20000,
@@ -4474,17 +4480,9 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
             "parameters_schema": {
                 "type": "object",
                 "properties": {
-                    "username": {
-                        "type": "string",
-                        "description": "Cal.com username or organization slug"
-                    },
-                    "event_type_slug": {
-                        "type": "string",
-                        "description": "The event type slug (e.g., '30min', '15min', 'consultation')"
-                    },
                     "start_time": {
                         "type": "string",
-                        "description": "Meeting start time (ISO 8601 format, e.g., '2024-01-15T09:00:00Z')"
+                        "description": "Meeting start time (ISO 8601 format, e.g., 2024-01-15T09:00:00Z)"
                     },
                     "attendee_name": {
                         "type": "string",
@@ -4496,14 +4494,14 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
                     },
                     "attendee_timezone": {
                         "type": "string",
-                        "description": "Timezone of the attendee (e.g., 'America/New_York')"
+                        "description": "Timezone of the attendee (e.g., America/Los_Angeles)"
                     },
                     "notes": {
                         "type": "string",
                         "description": "Optional notes or reason for the meeting"
                     }
                 },
-                "required": ["username", "event_type_slug", "start_time", "attendee_name", "attendee_email"]
+                "required": ["start_time", "attendee_name", "attendee_email"]
             },
             "variables": {},
             "speak_during_execution": True,
