@@ -59,7 +59,7 @@ export default function Sidebar() {
 
     const isActive = (href: string) => {
         if (href === '/') {
-            return pathname === '/';
+            return pathname === '/' || pathname === '/dashboard';
         }
         return pathname.startsWith(href);
     };
@@ -148,13 +148,13 @@ export default function Sidebar() {
 
                 {/* Navigation Menu */}
                 <nav className="p-3 space-y-6 overflow-y-auto h-[calc(100vh-140px)]">
-                    {Object.entries(SIDEBAR_MENU).map(([section, items]) => (
+                    {SIDEBAR_MENU && Object.entries(SIDEBAR_MENU).map(([section, items]) => (
                         <div key={section}>
                             <h3 className="px-3 text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">
                                 {section}
                             </h3>
                             <div className="space-y-1">
-                                {items.map((item) => (
+                                {Array.isArray(items) && items.map((item) => (
                                     <Link
                                         key={item.label}
                                         href={item.href}

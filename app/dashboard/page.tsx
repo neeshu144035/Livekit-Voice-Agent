@@ -16,7 +16,6 @@ import VoiceCallModal from '../../components/VoiceCallModal';
 import ImportModal from '../../components/ImportModal';
 import DuplicateAgentModal from '../../components/DuplicateAgentModal';
 import { useToast } from '../../components/ToastProvider';
-import Sidebar from '../components/Sidebar';
 
 // API URL - uses relative path to work with both HTTP and HTTPS
 const API_URL = '/api/';
@@ -99,7 +98,7 @@ export default function Dashboard() {
     const fetchAgents = async () => {
         try {
             const res = await axios.get<Agent[]>(`${API_URL}agents/`);
-            const agentsWithMetadata = res.data.map((agent) => ({
+            const agentsWithMetadata = (Array.isArray(res.data) ? res.data : []).map((agent) => ({
                 ...agent,
                 name: agent.display_name || agent.name,
                 type: agent.type || 'Single Prompt',
@@ -276,7 +275,7 @@ export default function Dashboard() {
                 {title}
             </h3>
             <div className="space-y-1">
-                {items.map((item) => (
+                {Array.isArray(items) && items?.map((item) => (
                     <Link
                         key={item.label}
                         href={item.href}
@@ -295,11 +294,7 @@ export default function Dashboard() {
     );
 
     return (
-        <div className="min-h-screen bg-gray-50 flex" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
-            <Sidebar />
-
-            {/* Main Content */}
-            <main className="flex-1 flex flex-col min-w-0">
+        <div className="flex flex-col h-full" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
                 {/* Mobile Header */}
                 <header className="lg:hidden bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
                     <button
@@ -310,7 +305,7 @@ export default function Dashboard() {
                     </button>
                     <div className="flex items-center gap-2">
                         <Sparkles className="w-5 h-5 text-gray-700" />
-                        <span className="font-semibold text-gray-900">Retell AI</span>
+                        <span className="font-semibold text-gray-900">Oyik AI</span>
                     </div>
                     <div className="w-9" />
                 </header>
@@ -318,7 +313,7 @@ export default function Dashboard() {
 
 
                 {/* Agents List - Expanded to fill full width */}
-                <div className="flex-1 flex flex-col bg-gray-50 min-w-0">
+                <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
                     {/* Header */}
                     <header className="bg-white border-b border-gray-200 px-4 md:px-6 py-3 md:py-4">
                         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 md:gap-4">
@@ -417,7 +412,7 @@ export default function Dashboard() {
                                                 </tr>
                                             </thead>
                                             <tbody className="divide-y divide-gray-50">
-                                                {filteredAgents.map((agent) => (
+                                                {Array.isArray(filteredAgents) && filteredAgents.map((agent) => (
                                                     <tr
                                                         key={agent.id}
                                                         className="hover:bg-gray-50 transition-colors group cursor-pointer"
@@ -520,7 +515,7 @@ export default function Dashboard() {
 
                                 {/* Mobile Card View */}
                                 <div className="md:hidden space-y-3 p-4">
-                                    {filteredAgents.map((agent) => (
+                                    {Array.isArray(filteredAgents) && filteredAgents.map((agent) => (
                                         <div
                                             key={agent.id}
                                             className="bg-white rounded-lg border border-gray-200 p-4 hover:shadow-sm transition-shadow"
@@ -610,7 +605,6 @@ export default function Dashboard() {
                         )}
                     </div>
                 </div>
-            </main>
 
             {/* Modals */}
             <VoiceCallModal

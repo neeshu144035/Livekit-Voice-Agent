@@ -1327,7 +1327,7 @@ function MobilePreview({ config, mode }: { config: Config; mode: PreviewMode }) 
               </div>
 
               <div className="widget-body">
-                {messages.map((m) => (
+                {Array.isArray(messages) && messages.map((m) => (
                   <div className="message-block" key={m.id}>
                     <div className={`row ${m.user ? 'u' : 'b'}`}>
                       {!m.user && (
@@ -1346,7 +1346,7 @@ function MobilePreview({ config, mode }: { config: Config; mode: PreviewMode }) 
                     </div>
                     {!m.user && !!m.properties?.length && (
                       <div className="property-rail">
-                        {m.properties.map((property) => (
+                        {Array.isArray(m.properties) && m.properties.map((property) => (
                           <article className="property-card" key={`${m.id}_${property.id}`}>
                             <div className="property-image">
                               {property.imageUrl ? (
@@ -1389,7 +1389,7 @@ function MobilePreview({ config, mode }: { config: Config; mode: PreviewMode }) 
 
                 {messages.length < 3 && (
                   <div className="quick-wrap">
-                    {config.quickReplies.map((q) => (
+                    {Array.isArray(config.quickReplies) && config.quickReplies.map((q) => (
                       <button key={q.id} onClick={() => send(q.text)}>
                         {q.icon} {q.text}
                       </button>
@@ -1775,7 +1775,7 @@ function ChatbotDashboardPageContent() {
                 }}
               >
                 <option value="">Standalone widget</option>
-                {agents.map((agent) => (
+                {Array.isArray(agents) && agents.map((agent) => (
                   <option key={agent.id} value={agent.id}>
                     {agent.display_name || agent.name}
                   </option>
@@ -1921,7 +1921,7 @@ function ChatbotDashboardPageContent() {
               </div>
               <label className="checkbox"><input type="checkbox" checked={config.autoOpen} onChange={(e) => setConfig((p) => ({ ...p, autoOpen: e.target.checked }))} /> Auto-open widget</label>
               <h3>Quick Replies</h3>
-              {config.quickReplies.map((q) => (
+              {Array.isArray(config.quickReplies) && config.quickReplies.map((q) => (
                 <div className="reply" key={q.id}>
                   <span>{q.icon}</span>
                   <span>{q.text}</span>

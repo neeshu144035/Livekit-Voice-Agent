@@ -2,7 +2,7 @@
 
 import { usePathname } from 'next/navigation';
 import { ToastProvider } from '../../components/ToastProvider';
-import Sidebar from '../../components/Sidebar';
+import Sidebar from './Sidebar';
 
 export default function AppWrapper({ children }: { children: React.ReactNode }) {
     const pathname = usePathname();
@@ -12,9 +12,8 @@ export default function AppWrapper({ children }: { children: React.ReactNode }) 
         pathname === '/chat-preview' ||
         pathname === '/chatbot-dashboard';
     const isAgentPage = pathname.startsWith('/agent/');
-    const isMainDashboard = pathname === '/';
 
-    if (isLoginPage || isChatPage || isAgentPage || isMainDashboard) {
+    if (isLoginPage || isChatPage || isAgentPage) {
         return (
             <ToastProvider>
                 {children}
@@ -24,11 +23,11 @@ export default function AppWrapper({ children }: { children: React.ReactNode }) 
 
     return (
         <ToastProvider>
-            <Sidebar />
-            <div className="lg:ml-60 min-h-screen">
-                <div className="p-6">
+            <div className="h-screen flex overflow-hidden bg-gray-50">
+                <Sidebar />
+                <main className="flex-1 overflow-y-auto min-w-0">
                     {children}
-                </div>
+                </main>
             </div>
         </ToastProvider>
     );

@@ -1728,6 +1728,50 @@ async def fetch_agent_handoff_context(call_id: str, payload: Dict[str, Any]) -> 
         return {"success": False, "error": str(e)}
 
 
+def _resolve_builtin_base_id(builtin_id: str, entry: Optional[Dict[str, Any]] = None) -> str:
+    payload = entry if isinstance(entry, dict) else {}
+    explicit = str(payload.get("_base_id") or "").strip()
+    if explicit:
+        return explicit
+    normalized_name = _normalize_tool_name(str(payload.get("name") or ""))
+    if (
+        builtin_id == "builtin_transfer_call"
+        or builtin_id.startswith("builtin_transfer_call_")
+        or builtin_id.startswith("builtin_call_transfer_")
+        or normalized_name in {"call_transfer", "transfer_call"}
+    ):
+        return "builtin_transfer_call"
+    return builtin_id
+
+
+def _iter_enabled_builtin_entries(
+    builtin_funcs: Dict[str, Any],
+    base_id: str,
+) -> List[tuple[str, Dict[str, Any]]]:
+    matches: List[tuple[str, Dict[str, Any]]] = []
+    for builtin_id, raw_entry in (builtin_funcs or {}).items():
+        if not isinstance(raw_entry, dict) or not raw_entry.get("enabled"):
+            continue
+        if _resolve_builtin_base_id(str(builtin_id), raw_entry) != base_id:
+            continue
+        matches.append((str(builtin_id), raw_entry))
+    return matches
+
+
+def _build_unique_runtime_tool_name(
+    raw_name: str,
+    fallback_name: str,
+    existing_names: set[str],
+) -> str:
+    base_name = _normalize_tool_name(raw_name) or _normalize_tool_name(fallback_name) or fallback_name
+    candidate = base_name
+    suffix = 2
+    while candidate in existing_names:
+        candidate = f"{base_name}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 def merge_builtin_functions_into_runtime(
     functions: List[Dict[str, Any]],
     config: Dict[str, Any],
@@ -1755,67 +1799,15 @@ def merge_builtin_functions_into_runtime(
         # Do not add any more transfer tools
         return runtime_functions
 
-    has_transfer_tool = any(_is_transfer_tool(f) for f in runtime_functions)
-    
-    # Support multiple transfer targets if provided as a list in custom_params
-    multi_transfer = custom_params.get("builtin_multi_transfer", [])
-    if isinstance(multi_transfer, list):
-        for target in multi_transfer:
-            target_name = _normalize_tool_name(target.get("name", ""))
-            if not target_name or target_name in existing_names:
-                continue
-            
-            target_phone = str(target.get("phone_number", "")).strip()
-            target_desc = str(target.get("description", "")).strip() or f"Transfer the call to the {target.get('name')} team."
-            
-            target_speak_during, target_speak_after = _normalize_tool_speech_flags(
-                target.get('speak_during_execution', True),
-                target.get('speak_after_execution', False),
-                fallback_after=False,
-            )
-            
-            runtime_functions.append({
-                'name': target_name,
-                'description': target_desc,
-                'url': 'builtin://transfer_call',
-                'method': 'SYSTEM',
-                'system_type': 'transfer_call',
-                'system_config': {
-                    'phone_number': target_phone,
-                },
-                'parameters_schema': {
-                    'type': 'object',
-                    'properties': {
-                        'phone_number': {
-                            'type': 'string',
-                            'description': 'Optional override.'
-                        }
-                    },
-                    'required': []
-                },
-                'phone_number': target_phone,
-                'speak_during_execution': target_speak_during,
-                'speak_after_execution': target_speak_after,
-            })
-            existing_names.add(target_name)
-            logger.info(f"Added multiple builtin transfer tool: {target_name} -> {target_phone}")
-
-    for key, transfer_entry in builtin_funcs.items():
-        if not key.startswith('builtin_transfer_call') or not transfer_entry.get('enabled'):
-            continue
-            
+    for key, transfer_entry in _iter_enabled_builtin_entries(builtin_funcs, "builtin_transfer_call"):
         transfer_cfg = transfer_entry.get('config', {})
         phone_number = transfer_cfg.get('phone_number', '')
-        
-        # Use the name from the entry if available, otherwise use canonical name
-        # If it's the primary one, use canonical, if it's a suffix one, keep unique name
-        raw_name = transfer_entry.get('name', CANONICAL_TRANSFER_TOOL_NAME)
-        transfer_name = _normalize_tool_name(raw_name)
-        
-        if transfer_name in existing_names:
-            # If name collides, append a unique suffix
-            import time
-            transfer_name = f"{transfer_name}_{int(time.time() * 1000) % 1000}"
+        raw_name = (
+            transfer_entry.get('display_name')
+            or transfer_entry.get('name')
+            or CANONICAL_TRANSFER_TOOL_NAME
+        )
+        transfer_name = _build_unique_runtime_tool_name(raw_name, CANONICAL_TRANSFER_TOOL_NAME, existing_names)
 
         transfer_speak_during, transfer_speak_after = _normalize_tool_speech_flags(
             transfer_entry.get('speak_during_execution', True),
@@ -1854,8 +1846,6 @@ def merge_builtin_functions_into_runtime(
         existing_names.add(transfer_name)
         logger.info(f"Added builtin transfer tool from functions: {transfer_name} -> {phone_number}")
 
-        existing_names.update({"transfer_call", "call_transfer"})
-
     if builtin_funcs.get('builtin_end_call', {}).get('enabled') and "end_call" not in existing_names:
         end_entry = builtin_funcs['builtin_end_call']
         end_speak_during, end_speak_after = _normalize_tool_speech_flags(
@@ -1874,6 +1864,88 @@ def merge_builtin_functions_into_runtime(
         })
         logger.info("Added builtin end_call function")
         existing_names.add("end_call")
+
+    if builtin_funcs.get('builtin_check_availability', {}).get('enabled') and "check_availability_cal" not in existing_names:
+        availability_entry = builtin_funcs['builtin_check_availability']
+        availability_speak_during, availability_speak_after = _normalize_tool_speech_flags(
+            availability_entry.get('speak_during_execution', False),
+            availability_entry.get('speak_after_execution', True),
+            fallback_after=True,
+        )
+        runtime_functions.append({
+            'name': 'check_availability_cal',
+            'description': availability_entry.get('description', 'Check calendar availability on Cal.com.'),
+            'url': 'builtin://check_availability',
+            'method': 'SYSTEM',
+            'system_type': 'check_availability',
+            'parameters_schema': {
+                'type': 'object',
+                'properties': {
+                    'start_date': {
+                        'type': 'string',
+                        'description': 'Start date for availability check (YYYY-MM-DD)'
+                    },
+                    'end_date': {
+                        'type': 'string',
+                        'description': 'End date for availability check (YYYY-MM-DD)'
+                    },
+                    'timezone': {
+                        'type': 'string',
+                        'description': 'Timezone for the slots (e.g., America/Los_Angeles)'
+                    },
+                },
+                'required': ['start_date', 'end_date'],
+            },
+            'speak_during_execution': availability_speak_during,
+            'speak_after_execution': availability_speak_after,
+        })
+        logger.info("Added builtin check_availability_cal function")
+        existing_names.add("check_availability_cal")
+
+    if builtin_funcs.get('builtin_book_meeting', {}).get('enabled') and "book_appointment_cal" not in existing_names:
+        booking_entry = builtin_funcs['builtin_book_meeting']
+        booking_speak_during, booking_speak_after = _normalize_tool_speech_flags(
+            booking_entry.get('speak_during_execution', False),
+            booking_entry.get('speak_after_execution', True),
+            fallback_after=True,
+        )
+        runtime_functions.append({
+            'name': 'book_appointment_cal',
+            'description': booking_entry.get('description', 'Book an appointment on Cal.com.'),
+            'url': 'builtin://book_meeting',
+            'method': 'SYSTEM',
+            'system_type': 'book_meeting',
+            'parameters_schema': {
+                'type': 'object',
+                'properties': {
+                    'start_time': {
+                        'type': 'string',
+                        'description': 'Meeting start time (ISO 8601 format)'
+                    },
+                    'attendee_name': {
+                        'type': 'string',
+                        'description': 'Name of the person booking the meeting'
+                    },
+                    'attendee_email': {
+                        'type': 'string',
+                        'description': 'Email address of the person booking the meeting'
+                    },
+                    'attendee_timezone': {
+                        'type': 'string',
+                        'description': 'Timezone of the attendee (e.g., America/Los_Angeles)'
+                    },
+                    'notes': {
+                        'type': 'string',
+                        'description': 'Optional notes or reason for the meeting'
+                    },
+                },
+                'required': ['start_time', 'attendee_name', 'attendee_email'],
+            },
+            'speak_during_execution': booking_speak_during,
+            'speak_after_execution': booking_speak_after,
+        })
+        logger.info("Added builtin book_appointment_cal function")
+        existing_names.add("book_appointment_cal")
 
     return runtime_functions
 
@@ -3512,6 +3584,32 @@ class DynamicPropertyAgent(Agent):
                         func_cfg,
                         speech_mode,
                     )
+                elif (
+                    system_type == "check_availability"
+                    or url == "builtin://check_availability"
+                    or normalized_name == "check_availability_cal"
+                ):
+                    if hasattr(self, "call_id") and self.call_id:
+                        result = await report_builtin_action(
+                            self.call_id,
+                            "check_availability",
+                            payload,
+                        )
+                    else:
+                        result = {{"success": False, "error": "Missing call_id"}}
+                elif (
+                    system_type == "book_meeting"
+                    or url == "builtin://book_meeting"
+                    or normalized_name == "book_appointment_cal"
+                ):
+                    if hasattr(self, "call_id") and self.call_id:
+                        result = await report_builtin_action(
+                            self.call_id,
+                            "book_meeting",
+                            payload,
+                        )
+                    else:
+                        result = {{"success": False, "error": "Missing call_id"}}
                 elif normalized_name == "end_call":
                     if hasattr(self, "call_id") and self.call_id:
                         result = await report_builtin_action(

@@ -151,7 +151,7 @@ export default function AnalyticsPage() {
         fetchAnalytics();
     };
 
-    const maxCalls = Math.max(...dailyStats.map(d => d.calls), 1);
+    const maxCalls = Math.max(...(dailyStats || []).map(d => d?.calls || 0), 1);
 
     return (
         <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>

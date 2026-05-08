@@ -423,7 +423,7 @@ export default function PhoneNumbersPage() {
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                                                 >
                                                     <option value={0}>-- Select Agent --</option>
-                                                    {agents.map((agent) => (
+                                                    {Array.isArray(agents) && agents.map((agent) => (
                                                         <option key={agent.id} value={agent.id}>{agent.name}</option>
                                                     ))}
                                                 </select>
@@ -440,7 +440,7 @@ export default function PhoneNumbersPage() {
                                                     className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                                                 >
                                                     <option value={0}>-- Select Agent --</option>
-                                                    {agents.map((agent) => (
+                                                    {Array.isArray(agents) && agents.map((agent) => (
                                                         <option key={agent.id} value={agent.id}>{agent.name}</option>
                                                     ))}
                                                 </select>
@@ -517,7 +517,7 @@ export default function PhoneNumbersPage() {
                                 </div>
                             ) : (
                                 <div className="space-y-4">
-                                    {phoneNumbers.map((pn) => (
+                                    {Array.isArray(phoneNumbers) && phoneNumbers.map((pn) => (
                                         <div key={pn.id} className="bg-white rounded-xl border border-gray-200 p-6">
                                             <div className="flex items-start justify-between">
                                                 <div className="flex items-center gap-4">

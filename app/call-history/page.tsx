@@ -449,14 +449,14 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
                 <div className="px-6 py-4">
                     {activeTab === 'transcript' && (
                         <div className="space-y-3">
-                            {handoffs.length > 0 && (
+                            {handoffs?.length > 0 && (
                                 <div className="rounded-xl border border-violet-200 bg-violet-50 p-4">
                                     <div className="mb-3 flex items-center gap-2">
                                         <ArrowRightLeft className="h-4 w-4 text-violet-600" />
                                         <h4 className="text-sm font-semibold text-violet-900">Agent Handoffs</h4>
                                     </div>
                                     <div className="space-y-3">
-                                        {handoffs.map((handoff, index) => {
+                                        {Array.isArray(handoffs) && handoffs.map((handoff, index) => {
                                             const memoryKeys = Object.entries(handoff.caller_memory || {})
                                                 .filter(([, value]) => value !== null && value !== '')
                                                 .map(([key]) => key);
@@ -489,14 +489,14 @@ function CallDetailPanel({ callId, onClose }: { callId: string; onClose: () => v
                                     </div>
                                 </div>
                             )}
-                            {transcript.length === 0 ? (
+                            {transcript?.length === 0 ? (
                                 <div className="text-center py-8">
                                     <MessageSquare className="w-10 h-10 text-gray-300 mx-auto mb-2" />
                                     <p className="text-gray-500 text-sm">No transcript available</p>
                                     <p className="text-gray-400 text-xs mt-1">Transcripts are stored when a call is made</p>
                                 </div>
                             ) : (
-                                transcript.map((entry, i) => {
+                                Array.isArray(transcript) && transcript.map((entry, i) => {
                                     const isAgentMessage = isAgentTranscriptRole(entry.role);
                                     const isUserMessage = isUserTranscriptRole(entry.role);
                                     if (!isAgentMessage && !isUserMessage) {
@@ -901,7 +901,7 @@ export default function CallHistoryPage() {
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-gray-50">
-                                    {filteredCalls.map(call => (
+                                    {Array.isArray(filteredCalls) && filteredCalls.map(call => (
                                         <tr
                                             key={call.call_id}
                                             className="hover:bg-violet-50/30 transition-colors cursor-pointer group"

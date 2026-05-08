@@ -2819,9 +2819,13 @@ def _load_agent_runtime_functions(agent: AgentModel, db: Session) -> List[Dict[s
 
     custom_params = ensure_custom_params(agent.custom_params)
     builtin_cfg = custom_params.get("builtin_functions", {})
+    existing_builtin_names = {
+        _normalize_tool_name(entry.get("name", ""))
+        for entry in runtime_functions
+        if entry.get("name")
+    }
 
-    transfer_cfg = builtin_cfg.get("builtin_transfer_call", {})
-    if transfer_cfg.get("enabled"):
+    for _, transfer_cfg in _iter_enabled_builtin_entries(builtin_cfg, "builtin_transfer_call"):
         transfer_phone = str((transfer_cfg.get("config") or {}).get("phone_number", "")).strip()
         transfer_speak_during, transfer_speak_after = _normalize_tool_speech_flags(
             transfer_cfg.get("speak_during_execution", True),
@@ -2830,9 +2834,14 @@ def _load_agent_runtime_functions(agent: AgentModel, db: Session) -> List[Dict[s
         )
         if not transfer_speak_during and not transfer_speak_after:
             transfer_speak_during, transfer_speak_after = True, False
+        transfer_name = _build_unique_runtime_tool_name(
+            str(transfer_cfg.get("display_name") or transfer_cfg.get("name") or "call_transfer"),
+            "call_transfer",
+            existing_builtin_names,
+        )
         runtime_functions.append(
             {
-                "name": "call_transfer",
+                "name": transfer_name,
                 "description": (
                     "Use ONLY when the user explicitly asks to transfer/escalate/connect to a human agent. "
                     "Do not call this for regular Q&A."
@@ -2860,6 +2869,7 @@ def _load_agent_runtime_functions(agent: AgentModel, db: Session) -> List[Dict[s
                 "speak_after_execution": transfer_speak_after,
             }
         )
+        existing_builtin_names.add(transfer_name)
 
     end_call_cfg = builtin_cfg.get("builtin_end_call", {})
     if end_call_cfg.get("enabled"):
@@ -2883,6 +2893,95 @@ def _load_agent_runtime_functions(agent: AgentModel, db: Session) -> List[Dict[s
                 "speak_after_execution": end_speak_after,
             }
         )
+        existing_builtin_names.add("end_call")
+
+    availability_cfg = builtin_cfg.get("builtin_check_availability", {})
+    if availability_cfg.get("enabled") and "check_availability_cal" not in existing_builtin_names:
+        availability_speak_during, availability_speak_after = _normalize_tool_speech_flags(
+            availability_cfg.get("speak_during_execution", False),
+            availability_cfg.get("speak_after_execution", True),
+            fallback_after=True,
+        )
+        runtime_functions.append(
+            {
+                "name": "check_availability_cal",
+                "description": "Check calendar availability on Cal.com.",
+                "url": "builtin://check_availability",
+                "method": "SYSTEM",
+                "timeout_ms": 15000,
+                "headers": {},
+                "query_params": {},
+                "parameters_schema": {
+                    "type": "object",
+                    "properties": {
+                        "start_date": {
+                            "type": "string",
+                            "description": "Start date for availability check (YYYY-MM-DD)",
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "description": "End date for availability check (YYYY-MM-DD)",
+                        },
+                        "timezone": {
+                            "type": "string",
+                            "description": "Timezone for the slots (e.g., America/Los_Angeles)",
+                        },
+                    },
+                    "required": ["start_date", "end_date"],
+                },
+                "speak_during_execution": availability_speak_during,
+                "speak_after_execution": availability_speak_after,
+            }
+        )
+        existing_builtin_names.add("check_availability_cal")
+
+    booking_cfg = builtin_cfg.get("builtin_book_meeting", {})
+    if booking_cfg.get("enabled") and "book_appointment_cal" not in existing_builtin_names:
+        booking_speak_during, booking_speak_after = _normalize_tool_speech_flags(
+            booking_cfg.get("speak_during_execution", False),
+            booking_cfg.get("speak_after_execution", True),
+            fallback_after=True,
+        )
+        runtime_functions.append(
+            {
+                "name": "book_appointment_cal",
+                "description": "Book an appointment on Cal.com.",
+                "url": "builtin://book_meeting",
+                "method": "SYSTEM",
+                "timeout_ms": 20000,
+                "headers": {},
+                "query_params": {},
+                "parameters_schema": {
+                    "type": "object",
+                    "properties": {
+                        "start_time": {
+                            "type": "string",
+                            "description": "Meeting start time (ISO 8601 format)",
+                        },
+                        "attendee_name": {
+                            "type": "string",
+                            "description": "Name of the person booking the meeting",
+                        },
+                        "attendee_email": {
+                            "type": "string",
+                            "description": "Email address of the person booking the meeting",
+                        },
+                        "attendee_timezone": {
+                            "type": "string",
+                            "description": "Timezone of the attendee (e.g., America/Los_Angeles)",
+                        },
+                        "notes": {
+                            "type": "string",
+                            "description": "Optional notes or reason for the meeting",
+                        },
+                    },
+                    "required": ["start_time", "attendee_name", "attendee_email"],
+                },
+                "speak_during_execution": booking_speak_during,
+                "speak_after_execution": booking_speak_after,
+            }
+        )
+        existing_builtin_names.add("book_appointment_cal")
 
     return runtime_functions
 
@@ -2922,6 +3021,70 @@ def _to_openai_tool_definitions(runtime_functions: List[Dict[str, Any]]) -> List
 
 def _normalize_tool_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", (value or "").strip().lower()).strip("_")
+
+
+BUILTIN_FUNCTION_DEFAULTS: Dict[str, Dict[str, str]] = {
+    "builtin_end_call": {
+        "name": "end_call",
+        "display_name": "End Call",
+    },
+    "builtin_transfer_call": {
+        "name": "call_transfer",
+        "display_name": "Call Transfer",
+    },
+    "builtin_check_availability": {
+        "name": "check_availability_cal",
+        "display_name": "Check Calendar Availability (Cal.com)",
+    },
+    "builtin_book_meeting": {
+        "name": "book_appointment_cal",
+        "display_name": "Book on the Calendar (Cal.com)",
+    },
+}
+
+
+def _resolve_builtin_base_id(builtin_id: str, entry: Optional[Dict[str, Any]] = None) -> str:
+    payload = entry if isinstance(entry, dict) else {}
+    explicit = str(payload.get("_base_id") or "").strip()
+    if explicit:
+        return explicit
+    normalized_name = _normalize_tool_name(str(payload.get("name") or ""))
+    if (
+        builtin_id == "builtin_transfer_call"
+        or builtin_id.startswith("builtin_transfer_call_")
+        or builtin_id.startswith("builtin_call_transfer_")
+        or normalized_name in {"call_transfer", "transfer_call"}
+    ):
+        return "builtin_transfer_call"
+    return builtin_id
+
+
+def _iter_enabled_builtin_entries(
+    builtin_funcs: Dict[str, Any],
+    base_id: str,
+) -> List[tuple[str, Dict[str, Any]]]:
+    matches: List[tuple[str, Dict[str, Any]]] = []
+    for builtin_id, raw_entry in (builtin_funcs or {}).items():
+        if not isinstance(raw_entry, dict) or not raw_entry.get("enabled"):
+            continue
+        if _resolve_builtin_base_id(str(builtin_id), raw_entry) != base_id:
+            continue
+        matches.append((str(builtin_id), raw_entry))
+    return matches
+
+
+def _build_unique_runtime_tool_name(
+    raw_name: str,
+    fallback_name: str,
+    existing_names: set[str],
+) -> str:
+    base_name = _normalize_tool_name(raw_name) or _normalize_tool_name(fallback_name) or fallback_name
+    candidate = base_name
+    suffix = 2
+    while candidate in existing_names:
+        candidate = f"{base_name}_{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _tool_aliases(tool_name: str) -> List[str]:
@@ -4118,7 +4281,7 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
             "message": f"Agent transfer initiated to {target_payload.get('name')}",
         }
     
-    elif action_type == "check_availability":
+    elif action_type in ("check_availability", "check_availability_cal"):
         import httpx
         
         username = params.get("username")
@@ -4179,7 +4342,7 @@ async def execute_builtin_action(call_id: str, action: dict, db: Session = Depen
             except httpx.HTTPError as e:
                 raise HTTPException(status_code=400, detail=f"Cal.com availability check failed: {str(e)}")
     
-    elif action_type == "book_meeting":
+    elif action_type in ("book_meeting", "book_appointment_cal"):
         import httpx
         
         start_time = params.get("start_time")
@@ -4460,7 +4623,7 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
                 "required": ["start_date", "end_date"]
             },
             "variables": {},
-            "speak_during_execution": True,
+            "speak_during_execution": False,
             "speak_after_execution": True,
             "is_builtin": True,
             "created_at": datetime.utcnow(),
@@ -4504,7 +4667,7 @@ async def get_builtin_functions(agent_id: int, db: Session = Depends(get_databas
                 "required": ["start_time", "attendee_name", "attendee_email"]
             },
             "variables": {},
-            "speak_during_execution": True,
+            "speak_during_execution": False,
             "speak_after_execution": True,
             "is_builtin": True,
             "created_at": datetime.utcnow(),
@@ -4530,22 +4693,24 @@ async def save_builtin_functions(agent_id: int, config: dict, db: Session = Depe
         enabled = bool(raw_value.get("enabled"))
         raw_cfg = raw_value.get("config")
         cfg = dict(raw_cfg) if isinstance(raw_cfg, dict) else {}
+        base_id = _resolve_builtin_base_id(builtin_id, raw_value)
+        defaults = BUILTIN_FUNCTION_DEFAULTS.get(base_id, {})
 
-        if builtin_id == "builtin_transfer_call":
+        if base_id == "builtin_transfer_call":
             default_during, default_after = True, False
             if enabled:
                 phone_number = str(cfg.get("phone_number", "")).strip()
                 if not phone_number:
                     raise HTTPException(status_code=400, detail="Transfer call requires config.phone_number")
                 cfg["phone_number"] = phone_number
-        elif builtin_id == "builtin_end_call":
+        elif base_id == "builtin_end_call":
             default_during, default_after = False, True
-        elif builtin_id in ("builtin_check_availability", "builtin_book_meeting"):
-            default_during, default_after = True, True
+        elif base_id in ("builtin_check_availability", "builtin_book_meeting"):
+            default_during, default_after = False, True
             if enabled:
                 api_key = str(cfg.get("api_key", "")).strip()
                 if not api_key and not os.getenv("CAL_API_KEY"):
-                    raise HTTPException(status_code=400, detail=f"{builtin_id} requires config.api_key or CAL_API_KEY environment variable")
+                    raise HTTPException(status_code=400, detail=f"{base_id} requires config.api_key or CAL_API_KEY environment variable")
                 if api_key:
                     cfg["api_key"] = api_key
         else:
@@ -4556,9 +4721,18 @@ async def save_builtin_functions(agent_id: int, config: dict, db: Session = Depe
             raw_value.get("speak_after_execution", default_after),
         )
 
+        name = str(raw_value.get("name") or defaults.get("name") or "").strip() or defaults.get("name") or ""
+        raw_display_name = raw_value.get("display_name")
+        display_name = str(raw_display_name).strip() if raw_display_name is not None else ""
+        if not display_name:
+            display_name = defaults.get("display_name") or name
+
         normalized_config[builtin_id] = {
             "enabled": enabled,
             "config": cfg,
+            "name": name,
+            "display_name": display_name,
+            "_base_id": base_id,
             "speak_during_execution": speak_during,
             "speak_after_execution": speak_after,
         }

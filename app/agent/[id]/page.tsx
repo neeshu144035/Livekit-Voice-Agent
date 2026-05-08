@@ -86,6 +86,7 @@ interface SimpleAgentOption {
 interface BuiltinFunctionDefinition {
     id: string;
     name: string;
+    display_name?: string | null;
     description?: string | null;
     speak_during_execution?: boolean;
     speak_after_execution?: boolean;
@@ -96,6 +97,9 @@ type BuiltinFunctionState = {
     config?: Record<string, any>;
     speak_during_execution?: boolean;
     speak_after_execution?: boolean;
+    name?: string;
+    display_name?: string | null;
+    _base_id?: string | null;
 };
 
 type BuiltinFunctionsState = Record<string, BuiltinFunctionState>;
@@ -373,6 +377,7 @@ export default function AgentDetailPage() {
     const [showBuiltinConfigModal, setShowBuiltinConfigModal] = useState(false);
     const [selectedBuiltinFunctionId, setSelectedBuiltinFunctionId] = useState<string | null>(null);
     const [builtinDraftConfig, setBuiltinDraftConfig] = useState<BuiltinFunctionState | null>(null);
+    const [builtinConfigMode, setBuiltinConfigMode] = useState<'add' | 'edit'>('edit');
     const [simpleAgents, setSimpleAgents] = useState<SimpleAgentOption[]>([]);
 
     const agentId = params.id as string;
@@ -417,16 +422,76 @@ export default function AgentDetailPage() {
         return { speak_during_execution: false, speak_after_execution: true };
     };
 
+    const normalizeBuiltinConfigValue = (builtinId: string, rawConfig: any) => {
+        const config = rawConfig && typeof rawConfig === 'object' ? { ...rawConfig } : {};
+        const isTransferBuiltin = builtinId === 'builtin_transfer_call'
+            || builtinId.startsWith('builtin_transfer_call_')
+            || builtinId.startsWith('builtin_call_transfer_');
+        const isCalBuiltin = builtinId === 'builtin_check_availability'
+            || builtinId === 'builtin_book_meeting';
+
+        if (isTransferBuiltin) {
+            return {
+                ...config,
+                phone_number: String(config.phone_number || '').trim(),
+            };
+        }
+
+        if (!isCalBuiltin) {
+            return config;
+        }
+
+        const normalizedConfig = { ...config };
+        const apiKey = String(config.api_key || '').trim();
+        const username = String(config.username || config.default_username || '').trim();
+        const eventTypeId = String(config.event_type_id || config.eventTypeId || '').trim();
+        const timezone = String(config.timezone || '').trim();
+
+        if (apiKey) {
+            normalizedConfig.api_key = apiKey;
+        } else {
+            delete normalizedConfig.api_key;
+        }
+
+        if (username) {
+            normalizedConfig.username = username;
+            normalizedConfig.default_username = username;
+        } else {
+            delete normalizedConfig.username;
+            delete normalizedConfig.default_username;
+        }
+
+        if (eventTypeId) {
+            normalizedConfig.event_type_id = eventTypeId;
+            normalizedConfig.eventTypeId = eventTypeId;
+        } else {
+            delete normalizedConfig.event_type_id;
+            delete normalizedConfig.eventTypeId;
+        }
+
+        if (timezone) {
+            normalizedConfig.timezone = timezone;
+        } else {
+            delete normalizedConfig.timezone;
+        }
+
+        return normalizedConfig;
+    };
+
     const normalizeBuiltinFunctionsConfig = (raw: any): BuiltinFunctionsState => {
         if (!raw || typeof raw !== 'object') return {};
         const normalized: BuiltinFunctionsState = {};
         for (const [id, value] of Object.entries(raw)) {
             if (!value || typeof value !== 'object') continue;
             const entry = value as any;
+            const baseId = String(entry._base_id || id).trim();
             const speechFlags = normalizeBuiltinSpeechFlags(entry);
             normalized[id] = {
                 enabled: Boolean(entry.enabled),
-                config: entry.config && typeof entry.config === 'object' ? entry.config : {},
+                config: normalizeBuiltinConfigValue(baseId, entry.config),
+                name: typeof entry.name === 'string' ? entry.name : undefined,
+                display_name: typeof entry.display_name === 'string' ? entry.display_name : undefined,
+                _base_id: typeof entry._base_id === 'string' ? entry._base_id : undefined,
                 ...speechFlags,
             };
         }
@@ -443,6 +508,99 @@ export default function AgentDetailPage() {
 
         return cleaned.replace(/\b\w/g, (char) => char.toUpperCase());
     };
+
+    const normalizeBuiltinToolName = (value?: string | null) =>
+        String(value || '')
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '_')
+            .replace(/^_+|_+$/g, '');
+
+    const isTransferBuiltinId = (funcId: string) =>
+        funcId === 'builtin_transfer_call'
+        || funcId.startsWith('builtin_transfer_call_')
+        || funcId.startsWith('builtin_call_transfer_');
+
+    const getBuiltinBaseId = (funcId: string, entry?: BuiltinFunctionState | null) => {
+        const explicitBaseId = String(entry?._base_id || '').trim();
+        if (explicitBaseId) return explicitBaseId;
+        if (builtinFunctions.some((func) => func.id === funcId)) return funcId;
+        const normalizedName = normalizeBuiltinToolName(entry?.name);
+        if (isTransferBuiltinId(funcId) || normalizedName === 'call_transfer' || normalizedName === 'transfer_call') {
+            return 'builtin_transfer_call';
+        }
+        return funcId;
+    };
+
+    const getBuiltinDefinitionForEntry = (funcId: string, entry?: BuiltinFunctionState | null) => {
+        const baseId = getBuiltinBaseId(funcId, entry);
+        return builtinFunctions.find((func) => func.id === baseId)
+            || builtinFunctions.find((func) => normalizeBuiltinToolName(func.name) === normalizeBuiltinToolName(entry?.name));
+    };
+
+    const getBuiltinDisplayName = (funcId: string, entry?: BuiltinFunctionState | null) => {
+        const explicitDisplayName = String(entry?.display_name || '').trim();
+        if (explicitDisplayName) return explicitDisplayName;
+        const func = getBuiltinDefinitionForEntry(funcId, entry);
+        return String(func?.display_name || '').trim()
+            || formatBuiltinFunctionName(entry?.name || func?.name || funcId);
+    };
+
+    const createBuiltinDraftState = (
+        funcId: string,
+        definition?: BuiltinFunctionDefinition | null,
+        existing?: BuiltinFunctionState | null,
+    ): BuiltinFunctionState => ({
+        enabled: existing?.enabled ?? true,
+        config: existing?.config && typeof existing.config === 'object' ? { ...existing.config } : {},
+        name: existing?.name || definition?.name,
+        display_name: existing?.display_name ?? definition?.display_name ?? formatBuiltinFunctionName(existing?.name || definition?.name || funcId),
+        _base_id: getBuiltinBaseId(funcId, existing || undefined) || definition?.id || funcId,
+        ...normalizeBuiltinSpeechFlags({
+            speak_during_execution: existing?.speak_during_execution ?? definition?.speak_during_execution,
+            speak_after_execution: existing?.speak_after_execution ?? definition?.speak_after_execution,
+        }),
+    });
+
+    const isSingleInstanceBuiltin = (definition?: BuiltinFunctionDefinition | null) =>
+        normalizeBuiltinToolName(definition?.name) !== 'call_transfer';
+
+    const isBuiltinConfigured = (definition?: BuiltinFunctionDefinition | null) => {
+        if (!definition) return false;
+        return Object.entries(allBuiltinFunctions).some(([funcId, entry]) =>
+            Boolean(entry?.enabled) && getBuiltinBaseId(funcId, entry) === definition.id
+        );
+    };
+
+    const openNewBuiltinDraft = (definition: BuiltinFunctionDefinition) => {
+        const isTransferBuiltin = normalizeBuiltinToolName(definition.name) === 'call_transfer';
+        const draftId = isTransferBuiltin
+            ? `builtin_transfer_call_${Date.now()}`
+            : definition.id;
+        const existing = !isTransferBuiltin ? allBuiltinFunctions[definition.id] : undefined;
+        setBuiltinConfigMode('add');
+        setSelectedBuiltinFunctionId(draftId);
+        setBuiltinDraftConfig(createBuiltinDraftState(draftId, definition, existing));
+        setShowFunctionSelector(false);
+        setShowBuiltinConfigModal(true);
+    };
+
+    const selectedBuiltinDefinition = selectedBuiltinFunctionId
+        ? getBuiltinDefinitionForEntry(selectedBuiltinFunctionId, builtinDraftConfig)
+        : null;
+    const selectedBuiltinBaseId = selectedBuiltinFunctionId
+        ? getBuiltinBaseId(selectedBuiltinFunctionId, builtinDraftConfig)
+        : '';
+    const selectedBuiltinName = normalizeBuiltinToolName(
+        builtinDraftConfig?.name || selectedBuiltinDefinition?.name || '',
+    );
+    const selectedBuiltinIsTransfer = selectedBuiltinBaseId === 'builtin_transfer_call'
+        || selectedBuiltinName === 'call_transfer'
+        || selectedBuiltinName === 'transfer_call';
+    const selectedBuiltinIsCal = selectedBuiltinBaseId === 'builtin_check_availability'
+        || selectedBuiltinBaseId === 'builtin_book_meeting'
+        || selectedBuiltinName === 'check_availability_cal'
+        || selectedBuiltinName === 'book_appointment_cal';
 
     const isAgentTransferFunction = (func?: Function | AgentTransferFunctionData | null) =>
         Boolean(func && (((func as Function).system_type || '').toLowerCase() === 'agent_transfer' || func.url === 'builtin://agent_transfer'));
@@ -496,17 +654,11 @@ export default function AgentDetailPage() {
     };
 
     const openBuiltinConfigModal = (funcId: string) => {
-        const func = builtinFunctions.find((entry) => entry.id === funcId);
         const existing = allBuiltinFunctions[funcId] || {};
+        const func = getBuiltinDefinitionForEntry(funcId, existing);
+        setBuiltinConfigMode('edit');
         setSelectedBuiltinFunctionId(funcId);
-        setBuiltinDraftConfig({
-            enabled: existing.enabled ?? true,
-            config: existing.config && typeof existing.config === 'object' ? { ...existing.config } : {},
-            ...normalizeBuiltinSpeechFlags({
-                speak_during_execution: existing.speak_during_execution ?? func?.speak_during_execution,
-                speak_after_execution: existing.speak_after_execution ?? func?.speak_after_execution,
-            }),
-        });
+        setBuiltinDraftConfig(createBuiltinDraftState(funcId, func, existing));
         setShowBuiltinConfigModal(true);
     };
 
@@ -514,6 +666,7 @@ export default function AgentDetailPage() {
         setShowBuiltinConfigModal(false);
         setSelectedBuiltinFunctionId(null);
         setBuiltinDraftConfig(null);
+        setBuiltinConfigMode('edit');
     };
 
     const fetchBuiltinFunctionsConfig = async () => {
@@ -751,19 +904,45 @@ export default function AgentDetailPage() {
         const configToSave = normalizeBuiltinFunctionsConfig(configOverride ?? allBuiltinFunctions);
         const normalizedToSave: BuiltinFunctionsState = {};
         for (const [id, entry] of Object.entries(configToSave)) {
+            const func = getBuiltinDefinitionForEntry(id, entry);
+            const baseId = getBuiltinBaseId(id, entry);
             normalizedToSave[id] = {
                 enabled: Boolean(entry.enabled),
-                config: entry.config && typeof entry.config === 'object' ? entry.config : {},
+                config: normalizeBuiltinConfigValue(baseId, entry.config),
+                name: entry.name || func?.name,
+                display_name: entry.display_name ?? func?.display_name ?? formatBuiltinFunctionName(entry.name || func?.name || id),
+                _base_id: baseId,
                 ...normalizeBuiltinSpeechFlags(entry),
             };
         }
         console.log('Saving builtin functions:', configToSave);
 
         // Validate transfer function has phone number if enabled
-        if (normalizedToSave['builtin_transfer_call']?.enabled) {
-            if (!normalizedToSave['builtin_transfer_call']?.config?.phone_number || normalizedToSave['builtin_transfer_call']?.config.phone_number.trim() === '') {
+        for (const [id, entry] of Object.entries(normalizedToSave)) {
+            if (!entry?.enabled) continue;
+            if (getBuiltinBaseId(id, entry) !== 'builtin_transfer_call') continue;
+            if (!entry?.config?.phone_number || String(entry.config.phone_number).trim() === '') {
                 if (!silent) showToast('Please enter a phone number for transfer function', 'error');
-                return;
+                return false;
+            }
+        }
+
+        for (const [id, entry] of Object.entries(normalizedToSave)) {
+            if (!entry?.enabled) continue;
+            const baseId = getBuiltinBaseId(id, entry);
+            if (baseId !== 'builtin_check_availability' && baseId !== 'builtin_book_meeting') continue;
+
+            const username = String(entry.config?.username || entry.config?.default_username || '').trim();
+            const eventTypeId = String(entry.config?.event_type_id || entry.config?.eventTypeId || '').trim();
+
+            if (!username) {
+                if (!silent) showToast('Please enter the Cal.com username', 'error');
+                return false;
+            }
+
+            if (!eventTypeId) {
+                if (!silent) showToast('Please enter the Cal.com event type ID', 'error');
+                return false;
             }
         }
 
@@ -788,9 +967,11 @@ export default function AgentDetailPage() {
             setBuiltinSaved(true);
             
             setTimeout(() => setBuiltinSaved(false), 3000);
+            return true;
         } catch (err: any) {
             console.error('Failed to save builtin functions:', err);
             if (!silent) showToast(err.response?.data?.detail || 'Failed to save builtin functions', 'error');
+            return false;
         } finally {
             setBuiltinSaving(false);
         }
@@ -818,13 +999,17 @@ export default function AgentDetailPage() {
                 config: builtinDraftConfig.config && typeof builtinDraftConfig.config === 'object'
                     ? builtinDraftConfig.config
                     : {},
+                name: builtinDraftConfig.name,
+                display_name: builtinDraftConfig.display_name,
+                _base_id: builtinDraftConfig._base_id || getBuiltinBaseId(selectedBuiltinFunctionId, builtinDraftConfig),
                 ...normalizeBuiltinSpeechFlags(builtinDraftConfig),
             },
         };
 
-        setAllBuiltinFunctions(next);
-        await handleSaveBuiltinFunctions(next);
-        closeBuiltinConfigModal();
+        const saved = await handleSaveBuiltinFunctions(next);
+        if (saved) {
+            closeBuiltinConfigModal();
+        }
     };
 
     const applyPersistedAgent = (persisted: Agent) => {
@@ -1078,9 +1263,9 @@ export default function AgentDetailPage() {
     }
 
     return (
-        <div className="min-h-screen bg-gray-50" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
+        <div className="h-screen bg-gray-50 flex flex-col overflow-hidden" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
             {/* Main Content - full screen for agent editing */}
-            <main className="overflow-hidden">
+            <main className="flex-1 flex flex-col min-h-0">
                 {/* Header */}
                 <div className="border-b border-gray-200 bg-white">
                     <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between px-4 sm:px-6 py-3 sm:h-16 gap-3">
@@ -1167,7 +1352,7 @@ export default function AgentDetailPage() {
                 </div>
 
                 {/* Main Content - 3 Column Layout */}
-                <div className="flex h-[calc(100vh-64px)] overflow-hidden">
+                <div className="flex-1 flex overflow-hidden">
 
                     {/* Left Column - Prompt Editor (45%) */}
                     <div className="flex min-h-0 min-w-0 w-[45%] flex-col border-r border-gray-200 bg-white">
@@ -1230,7 +1415,7 @@ export default function AgentDetailPage() {
                                                     ? 'Select an xAI voice'
                                                     : 'Select a voice'}
                                         </option>
-{ttsVoices.map(voice => (
+{(ttsVoices || []).map(voice => (
                                                 <option key={voice.id} value={voice.id}>
                                                     {voice.label}
                                                     {voice.category ? ` [${voice.category}]` : ''}
@@ -1257,7 +1442,7 @@ export default function AgentDetailPage() {
                                             <option value="">
                                                 {selectedTtsProvider === 'elevenlabs' ? 'Select an ElevenLabs model' : 'Select an xAI model'}
                                             </option>
-                                            {visibleProviderModels.map(model => (
+                                            {(visibleProviderModels || []).map(model => (
                                                 <option key={model.id} value={model.id}>
                                                     {model.name}
                                                     {selectedTtsProvider === 'elevenlabs'
@@ -1285,7 +1470,7 @@ export default function AgentDetailPage() {
                                         onChange={(e) => setSelectedLanguage(e.target.value)}
                                         className="w-full appearance-none px-3 py-2 pr-8 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200 focus:outline-none cursor-pointer"
                                     >
-                                        {providerLanguageOptions.map(lang => (
+                                        {(providerLanguageOptions || []).map(lang => (
                                             <option key={lang.value} value={lang.value}>
                                                 {lang.flag} {lang.label}
                                             </option>
@@ -1534,8 +1719,8 @@ export default function AgentDetailPage() {
 
                                                             {/* Selected Built-in Functions */}
                                                             {Object.entries(allBuiltinFunctions).map(([funcId, config]: [string, any]) => {
-                                                                const func = builtinFunctions.find(f => f.id === funcId);
-                                                                if (!func || !config?.enabled) return null;
+                                                                if (!config?.enabled) return null;
+                                                                const func = getBuiltinDefinitionForEntry(funcId, config);
                                                                 return (
                                                                     <div key={funcId} className="flex items-center justify-between bg-gray-50 rounded-lg p-3">
                                                                         <div className="flex items-center gap-3">
@@ -1543,7 +1728,7 @@ export default function AgentDetailPage() {
                                                                                 BI
                                                                             </div>
                                                                             <span className="text-sm font-medium text-gray-900">
-                                                                                {formatBuiltinFunctionName(func.name)}
+                                                                                {getBuiltinDisplayName(funcId, config)}
                                                                             </span>
                                                                         </div>
                                                                         <div className="flex items-center gap-2">
@@ -1575,7 +1760,7 @@ export default function AgentDetailPage() {
                                                             })}
 
                                                             {/* Custom Functions */}
-                                                            {functions.map((func) => {
+                                                            {(functions || []).map((func) => {
                                                                 const agentTransfer = isAgentTransferFunction(func);
                                                                 const callTransfer = isCallTransferFunction(func);
                                                                 return (
@@ -1596,9 +1781,9 @@ export default function AgentDetailPage() {
                                                                                 <div className="flex items-center gap-2">
                                                                                     <span className="truncate text-sm font-medium text-gray-900">
                                                                                         {callTransfer
-                                                                                            ? func.name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+                                                                                            ? String(func.name || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
                                                                                             : agentTransfer
-                                                                                            ? func.name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+                                                                                            ? String(func.name || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
                                                                                             : func.name}
                                                                                     </span>
                                                                                     {agentTransfer && (
@@ -1820,35 +2005,31 @@ export default function AgentDetailPage() {
                 />
 
                 {showBuiltinConfigModal && selectedBuiltinFunctionId && builtinDraftConfig && (
-                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-                        <div className="mx-4 w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl">
-                            <div className="mb-5 flex items-start justify-between gap-4">
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4 py-6">
+                        <div
+                            role="dialog"
+                            aria-modal="true"
+                            className="flex w-full max-w-2xl max-h-full flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
+                        >
+                            <div className="flex items-start justify-between gap-4 border-b border-gray-200 px-6 py-5">
                                 <div>
                                     <h3 className="text-lg font-semibold text-gray-900">
-                                        Configure {builtinDraftConfig?.display_name || formatBuiltinFunctionName(builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name) || 'Tool'}
+                                        Configure {getBuiltinDisplayName(selectedBuiltinFunctionId, builtinDraftConfig)}
                                     </h3>
                                     <p className="mt-1 text-sm text-gray-500">
                                         Configure the built-in function settings.
                                     </p>
                                 </div>
                                 <button
-                                    onClick={() => {
-                                        const baseId = builtinDraftConfig?._base_id || selectedBuiltinFunctionId;
-                                        if (baseId !== selectedBuiltinFunctionId) {
-                                            const next = { ...allBuiltinFunctions };
-                                            delete next[selectedBuiltinFunctionId];
-                                            setAllBuiltinFunctions(next);
-                                            void handleSaveBuiltinFunctions(next, true);
-                                        }
-                                        closeBuiltinConfigModal();
-                                    }}
+                                    onClick={closeBuiltinConfigModal}
                                     className="rounded-lg p-1.5 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600"
                                 >
                                     <X className="h-5 w-5" />
                                 </button>
                             </div>
 
-                            <div className="space-y-4">
+                            <div className="flex-1 overflow-y-auto px-6 py-5">
+                                <div className="space-y-4">
                                 <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                     <label className="mb-2 block text-sm font-medium text-gray-700">
                                         Tool Name
@@ -1857,7 +2038,7 @@ export default function AgentDetailPage() {
                                         type="text"
                                         autoComplete="off"
                                         placeholder="e.g., Sales Transfer, Support Transfer"
-                                        value={builtinDraftConfig?.display_name || ''}
+                                        value={builtinDraftConfig.display_name || ''}
                                         onChange={(e) => {
                                             const nextValue = e.target.value;
                                             setBuiltinDraftConfig((prev) => prev ? ({
@@ -1872,12 +2053,6 @@ export default function AgentDetailPage() {
                                     </p>
                                 </div>
 
-                                <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
-                                    <label className="mb-2 block text-sm font-medium text-gray-700">
-                                        Tool Speech Mode
-                                    </label>
-
-                            <div className="space-y-4">
                                 <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                     <label className="mb-2 block text-sm font-medium text-gray-700">
                                         Tool Speech Mode
@@ -1899,9 +2074,7 @@ export default function AgentDetailPage() {
                                     </select>
                                 </div>
 
-                                {(builtinDraftConfig?.name === 'call_transfer' || 
-                                    builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'call_transfer' ||
-                                    builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'transfer_call') && (
+                                {selectedBuiltinIsTransfer && (
                                     <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                         <label className="mb-2 block text-sm font-medium text-gray-700">
                                             Transfer Phone Number
@@ -1927,8 +2100,7 @@ export default function AgentDetailPage() {
                                     </div>
                                 )}
 
-                                {(builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'check_availability' ||
-                                    builtinFunctions.find((func) => func.id === selectedBuiltinFunctionId)?.name === 'book_meeting') && (
+                                {selectedBuiltinIsCal && (
                                     <>
                                         <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                             <label className="mb-2 block text-sm font-medium text-gray-700">
@@ -1949,10 +2121,10 @@ export default function AgentDetailPage() {
                                                 className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 focus:border-blue-500 focus:outline-none"
                                             />
                                             <p className="mt-2 text-xs text-gray-500">
-                                                You can find the Event Type ID in your cal.com URL.
+                                                Optional if the backend already provides `CAL_API_KEY`.
                                             </p>
                                         </div>
-                                        
+
                                         <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
                                             <label className="mb-2 block text-sm font-medium text-gray-700">
                                                 Username (Cal.com)
@@ -2017,21 +2189,24 @@ export default function AgentDetailPage() {
                                         </div>
                                     </>
                                 )}
+                                </div>
                             </div>
 
-                            <div className="mt-6 flex items-center justify-end gap-3">
+                            <div className="flex items-center justify-end gap-3 border-t border-gray-200 px-6 py-4">
                                 <button
+                                    type="button"
                                     onClick={closeBuiltinConfigModal}
                                     className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50"
                                 >
                                     Cancel
                                 </button>
                                 <button
+                                    type="button"
                                     onClick={() => { void handleSaveBuiltinConfigModal(); }}
                                     className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700"
                                 >
                                     <Save className="h-4 w-4" />
-                                    Save Built-in Function
+                                    {builtinConfigMode === 'add' ? 'Add Built-in Function' : 'Save Built-in Function'}
                                 </button>
                             </div>
                         </div>
@@ -2058,45 +2233,15 @@ export default function AgentDetailPage() {
 
                             <div className="space-y-2">
                                 {/* Built-in Functions */}
-                                {builtinFunctions.filter(f => f.name !== 'transfer_call' && f.name !== 'end_call').map((func) => {
-                                    const isSelected = allBuiltinFunctions[func.id]?.enabled;
+                                {builtinFunctions.filter((func) => func && normalizeBuiltinToolName(func.name) !== 'call_transfer').map((func) => {
+                                    if (!func) return null;
+                                    const isSelected = isSingleInstanceBuiltin(func) && isBuiltinConfigured(func);
                                     const displayName = func.display_name || func.name;
                                     return (
                                         <button
                                             key={func.id}
                                             onClick={() => {
-                                                const newId = func.id + '_' + Date.now();
-                                                setAllBuiltinFunctions((prev: BuiltinFunctionsState) => {
-                                                    const existing = prev[func.id] || {};
-                                                    const next: BuiltinFunctionsState = {
-                                                        ...prev,
-                                                        [newId]: {
-                                                            enabled: true,
-                                                            config: existing.config || {},
-                                                            name: func.name,
-                                                            display_name: displayName,
-                                                            _base_id: func.id,
-                                                            ...normalizeBuiltinSpeechFlags({
-                                                                speak_during_execution: existing.speak_during_execution ?? func.speak_during_execution,
-                                                                speak_after_execution: existing.speak_after_execution ?? func.speak_after_execution,
-                                                            }),
-                                                        },
-                                                    };
-                                                    void handleSaveBuiltinFunctions(next, true);
-                                                    setSelectedBuiltinFunctionId(newId);
-                                                    setBuiltinDraftConfig({
-                                                        enabled: true,
-                                                        config: existing.config || {},
-                                                        name: func.name,
-                                                        display_name: displayName,
-                                                        ...normalizeBuiltinSpeechFlags({
-                                                            speak_during_execution: existing.speak_during_execution ?? func.speak_during_execution,
-                                                            speak_after_execution: existing.speak_after_execution ?? func.speak_after_execution,
-                                                        }),
-                                                    });
-                                                    setShowBuiltinConfigModal(true);
-                                                    return next;
-                                                });
+                                                openNewBuiltinDraft(func);
                                                 setBuiltinSaved(false);
                                             }}
                                             disabled={isSelected}
@@ -2126,34 +2271,12 @@ export default function AgentDetailPage() {
                                 {/* Call Transfer - Allow multiple with custom names */}
                                 <button
                                     onClick={() => {
-                                        const newId = 'builtin_call_transfer_' + Date.now();
-                                        const displayName = 'Call Transfer';
-                                        setAllBuiltinFunctions((prev: BuiltinFunctionsState) => {
-                                            const next: BuiltinFunctionsState = {
-                                                ...prev,
-                                                [newId]: {
-                                                    enabled: true,
-                                                    config: { phone_number: '' },
-                                                    name: 'call_transfer',
-                                                    display_name: displayName,
-                                                    _base_id: 'builtin_transfer_call',
-                                                    speak_during_execution: true,
-                                                    speak_after_execution: false,
-                                                },
-                                            };
-                                            void handleSaveBuiltinFunctions(next, true);
-                                            setSelectedBuiltinFunctionId(newId);
-                                            setBuiltinDraftConfig({
-                                                enabled: true,
-                                                config: { phone_number: '' },
-                                                name: 'call_transfer',
-                                                display_name: displayName,
-                                                speak_during_execution: true,
-                                                speak_after_execution: false,
-                                            });
-                                            setShowBuiltinConfigModal(true);
-                                            return next;
-                                        });
+                                        const transferBuiltin = builtinFunctions.find(
+                                            (func) => normalizeBuiltinToolName(func.name) === 'call_transfer',
+                                        );
+                                        if (transferBuiltin) {
+                                            openNewBuiltinDraft(transferBuiltin);
+                                        }
                                         setBuiltinSaved(false);
                                     }}
                                     className="w-full text-left p-3 rounded-lg border border-green-200 bg-green-50 hover:bg-green-100 transition-colors"
@@ -2167,7 +2290,7 @@ export default function AgentDetailPage() {
                                             <p className="text-xs text-gray-500">Transfer call to a phone number</p>
                                         </div>
                                     </div>
-                                </button>}
+                                </button>
 
                                 <button
                                     onClick={() => {
@@ -2184,25 +2307,6 @@ export default function AgentDetailPage() {
                                         <div>
                                             <p className="text-sm font-medium text-gray-900">Agent Transfer</p>
                                             <p className="text-xs text-gray-500">Create a named subagent handoff tool for phone calls</p>
-                                        </div>
-                                    </div>
-                                </button>
-
-                                <button
-                                    onClick={() => {
-                                        setShowFunctionSelector(false);
-                                        setSelectedCallTransferFunction(null);
-                                        setShowCallTransferModal(true);
-                                    }}
-                                    className="w-full text-left p-3 rounded-lg border border-green-200 bg-green-50 hover:bg-green-100 transition-colors"
-                                >
-                                    <div className="flex items-center gap-3">
-                                        <div className="w-8 h-8 rounded-full bg-green-500 flex items-center justify-center">
-                                            <PhoneForwarded className="w-4 h-4 text-white" />
-                                        </div>
-                                        <div>
-                                            <p className="text-sm font-medium text-gray-900">Call Transfer</p>
-                                            <p className="text-xs text-gray-500">Create a named PSTN handoff tool for phone calls</p>
                                         </div>
                                     </div>
                                 </button>

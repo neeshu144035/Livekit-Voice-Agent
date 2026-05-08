@@ -3,8 +3,8 @@ module.exports = {
     {
       name: 'frontend',
       script: 'npm',
-      args: 'start',
-      cwd: '/home/ubuntu/livekit-dashboard',
+      cwd: '/var/www/html',
+      args: 'start -- -p 3001',
       interpreter: 'none',
       watch: false,
       autorestart: true
